@@ -24,7 +24,8 @@ use crate::pillbox::Pillbox;
 
 use super::session::{
     disk_preflight, guest_launch_preamble, provision_vault_ca, run_foreground_attached,
-    rust_tls_ca_env, CaLifetime, OwnedPath, PendingVm, RemoveOnDrop, ATTACH_PORT, FORWARD_PORT,
+    rust_tls_ca_env, CaLifetime, KillUnlessExited, OwnedPath, PendingVm, RemoveOnDrop, ATTACH_PORT,
+    FORWARD_PORT,
 };
 use super::{
     boot, krun_cache_dir, materialize_rootfs, shell_quote, EgressSpec, Share, VmSpec, VsockAttach,
@@ -98,7 +99,9 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result
     // The login VM must stay Foreground: a reparented VM's CommitGuard scrubs every
     // share on an abandoned launch, and this VM's creds share is the user's real auth home.
     // No swap pairs: the login holds no credential to swap, it mints one.
-    let outcome = run_foreground_attached(&mut vm, &[], egress_log.as_deref(), &mut ())?;
+    // A login that ends any way but the guest's exit kills its VM: nothing outlives it.
+    let outcome =
+        run_foreground_attached(&mut vm, &[], egress_log.as_deref(), &mut KillUnlessExited)?;
     match outcome {
         pump::Outcome::Exited(code) => Ok(code),
         pump::Outcome::Detached | pump::Outcome::Disconnected => {

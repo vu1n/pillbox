@@ -27,7 +27,7 @@ use crate::agents::{AgentSpec, GUEST_HOME};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::sandbox::exec_channel;
-use crate::sandbox::{SandboxSpawn, SandboxTarget};
+use crate::sandbox::{Destroyed, ExecChannel, SandboxSpawn, SandboxTarget};
 use crate::sandboxes::{self, Sandbox};
 
 use super::session::{
@@ -267,26 +267,28 @@ fn launch(
     let guest_workspace = prepared.guest_workspace;
     let sock = prepared.vm.sock.clone();
     let spawned = spawn_reparented(prepared.vm, &record_path, &prepared.swap_pairs)?;
-    spawned.commit("sandbox spawn", |child, handle| {
-        wait_exec_ready(&sock, &guest_workspace, EXEC_READY_TIMEOUT, || {
-            child.try_wait().context("poll the sandbox VMM")
-        })?;
-        let record = Sandbox {
-            id: id.to_string(),
-            backend: sandboxes::BACKEND_LIBKRUN.into(),
-            backend_ref: serde_json::to_string(handle).context("encode libkrun handle")?,
-            image: crate::docker::resolve_runner_image(resolved).0,
-            agent: agent.map(|spec| spec.id.to_string()),
-            workspace: req.workspace.display().to_string(),
-            workspace_clone: Some(handle.workspace.clone()),
-            guest_workspace: Some(guest_workspace.clone()),
-            label: req.label.clone(),
-            created_at: crate::session::now_rfc3339(),
-            status: "ready".into(),
-        };
-        sandboxes::write(resolved, &record)?;
-        Ok(record)
-    })
+    spawned
+        .commit("sandbox spawn", |child, handle| {
+            wait_exec_ready(&sock, &guest_workspace, EXEC_READY_TIMEOUT, || {
+                child.try_wait().context("poll the sandbox VMM")
+            })?;
+            let record = Sandbox {
+                id: id.to_string(),
+                backend: sandboxes::BACKEND_LIBKRUN.into(),
+                backend_ref: serde_json::to_string(handle).context("encode libkrun handle")?,
+                image: crate::docker::resolve_runner_image(resolved).0,
+                agent: agent.map(|spec| spec.id.to_string()),
+                workspace: req.workspace.display().to_string(),
+                workspace_clone: Some(handle.workspace.clone()),
+                guest_workspace: Some(guest_workspace.clone()),
+                label: req.label.clone(),
+                created_at: crate::session::now_rfc3339(),
+                status: "ready".into(),
+            };
+            sandboxes::write(resolved, &record)?;
+            Ok(record)
+        })
+        .map(|(record, _child)| record)
 }
 
 /// Poll the sandbox's exec channel until a `true` runs to exit 0 in the guest
@@ -340,11 +342,7 @@ struct LibkrunSandbox {
 }
 
 impl SandboxTarget for LibkrunSandbox {
-    fn exec(
-        &self,
-        argv: &[String],
-        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
-    ) -> Result<i32> {
+    fn open_exec(&self) -> Result<Box<dyn ExecChannel>> {
         let guest_workspace = self.guest_workspace.as_deref().ok_or_else(|| {
             PillboxError::config(
                 "sandbox exec",
@@ -359,15 +357,38 @@ impl SandboxTarget for LibkrunSandbox {
             )
             .with_next(format!("pillbox sandbox destroy {}", self.id))
         })?;
-        exec_channel::run_exec(stream, argv, Some(guest_workspace), |is_stderr, b| {
-            on_chunk(is_stderr, b)
-        })
+        Ok(Box::new(LibkrunExec {
+            stream,
+            guest_workspace: guest_workspace.to_string(),
+        }))
     }
 
-    fn destroy(&self, resolved: &Pillbox) -> Result<()> {
+    fn destroy(&self, resolved: &Pillbox) -> Result<Destroyed> {
         // The record goes only once the VM is confirmed down and its files removed.
         teardown_handle(&self.handle)?;
-        sandboxes::delete(resolved, &self.id)
+        sandboxes::delete(resolved, &self.id)?;
+        Ok(Destroyed::TornDown)
+    }
+}
+
+/// A dialed libkrun exec channel and the guest cwd its command runs in.
+struct LibkrunExec {
+    stream: UnixStream,
+    guest_workspace: String,
+}
+
+impl ExecChannel for LibkrunExec {
+    fn run(
+        self: Box<Self>,
+        argv: &[String],
+        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32> {
+        exec_channel::run_exec(
+            self.stream,
+            argv,
+            Some(&self.guest_workspace),
+            |is_stderr, b| on_chunk(is_stderr, b),
+        )
     }
 }
 

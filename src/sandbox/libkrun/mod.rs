@@ -383,6 +383,14 @@ pub(crate) fn vmm_child_main() -> ! {
     }
 }
 
+/// The host-only env a reparented VMM's [`CommitGuard`] is armed with: set by
+/// `session::arm_commit_guard`, read and cleared by [`CommitGuard::from_env`].
+pub(super) const COMMIT_OWNER_PID: &str = "PILLBOX_COMMIT_OWNER_PID";
+pub(super) const COMMIT_RECORD: &str = "PILLBOX_COMMIT_RECORD";
+pub(super) const COMMIT_DEADLINE: &str = "PILLBOX_COMMIT_DEADLINE";
+/// The host home: the VMM's own `HOME` is the guest's.
+pub(super) const COMMIT_HOME: &str = "PILLBOX_COMMIT_HOME";
+
 /// One of three states the [`CommitGuard`] watcher resolves each poll. Split out as
 /// a pure function so the (otherwise process-killing) decision is unit-testable.
 #[derive(Debug, PartialEq, Eq)]
@@ -437,15 +445,15 @@ impl CommitGuard {
     /// them. ALWAYS clears the vars (even on a partial set) so they never forward
     /// into the guest env at `krun_set_exec`.
     fn from_env(spec: &VmSpec, spec_path: &str) -> Option<Self> {
-        let owner = std::env::var("PILLBOX_COMMIT_OWNER_PID").ok();
-        let record = std::env::var("PILLBOX_COMMIT_RECORD").ok();
-        let deadline = std::env::var("PILLBOX_COMMIT_DEADLINE").ok();
-        let home = std::env::var_os("PILLBOX_COMMIT_HOME");
+        let owner = std::env::var(COMMIT_OWNER_PID).ok();
+        let record = std::env::var(COMMIT_RECORD).ok();
+        let deadline = std::env::var(COMMIT_DEADLINE).ok();
+        let home = std::env::var_os(COMMIT_HOME);
         for k in [
-            "PILLBOX_COMMIT_OWNER_PID",
-            "PILLBOX_COMMIT_RECORD",
-            "PILLBOX_COMMIT_DEADLINE",
-            "PILLBOX_COMMIT_HOME",
+            COMMIT_OWNER_PID,
+            COMMIT_RECORD,
+            COMMIT_DEADLINE,
+            COMMIT_HOME,
         ] {
             std::env::remove_var(k);
         }
@@ -1802,22 +1810,47 @@ mod tests {
     }
 
     #[test]
-    fn the_commit_guard_takes_the_host_home_from_its_own_env_var_and_clears_it() {
+    fn a_reparented_vmm_command_arms_the_commit_guard_and_the_child_clears_it() {
         crate::test_util::with_isolated_home("commit-guard-env", || {
+            let home = std::env::var_os("HOME").unwrap();
+            let record = std::path::Path::new("/r/record.toml");
+            let cmd = super::session::vmm_command_for(
+                std::path::Path::new("/bin/pillbox"),
+                std::path::Path::new("/s/spec.json"),
+                super::session::VmmTether::Reparented { record },
+            );
+            let names = [
+                super::COMMIT_OWNER_PID,
+                super::COMMIT_RECORD,
+                super::COMMIT_DEADLINE,
+                super::COMMIT_HOME,
+            ];
+            // Replay the command's commit env as the child sees it.
+            for (k, v) in cmd.get_envs() {
+                if let (Some(k), Some(v)) = (k.to_str(), v) {
+                    if names.contains(&k) {
+                        std::env::set_var(k, v);
+                    }
+                }
+            }
             let spec: super::VmSpec = serde_json::from_str(
                 r#"{"rootfs":"/r/vm-x/rootfs","vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null}"#,
             )
             .unwrap();
-            std::env::set_var("PILLBOX_COMMIT_OWNER_PID", "1");
-            std::env::set_var("PILLBOX_COMMIT_RECORD", "/r/record.toml");
-            std::env::set_var("PILLBOX_COMMIT_DEADLINE", "5");
-            std::env::set_var("PILLBOX_COMMIT_HOME", "/host/home");
-            let guard = super::CommitGuard::from_env(&spec, "/s").unwrap();
+            let guard = super::CommitGuard::from_env(&spec, "/s/spec.json")
+                .expect("every commit var reached the child");
+            assert_eq!(guard.owner_pid, std::process::id() as i32);
+            assert_eq!(guard.record_path, record);
             assert_eq!(
                 guard.rootfs,
-                Some(("/r/vm-x/rootfs".into(), "/host/home".into()))
+                Some(("/r/vm-x/rootfs".into(), std::path::PathBuf::from(home)))
             );
-            assert!(std::env::var_os("PILLBOX_COMMIT_HOME").is_none());
+            for name in names {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} would reach the guest"
+                );
+            }
         });
     }
 }

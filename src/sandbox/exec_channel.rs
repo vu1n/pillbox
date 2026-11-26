@@ -8,9 +8,10 @@
 //! Wire: `[tag:u8][len:u32 BE][payload]`, read and written by `attach::frame`'s
 //! shared codec (with this channel's own cap and a strict tag set). The host
 //! sends one `Request` (JSON `{argv, cwd}`); the guest answers with any number of
-//! `Stdout`/`Stderr` chunks, then exactly one `Exit(i32 BE)`, or a single
-//! `Error(utf8)` when the command could not be started. One connection carries one
-//! command; concurrent commands use concurrent connections.
+//! `Stdout`/`Stderr` chunks, then exactly one `Exit(i32 BE)` — also for a command
+//! that could not be started (127/126, the reason on `Stderr`). A single
+//! `Error(utf8)` instead answers only a malformed request. One connection carries
+//! one command; concurrent commands use concurrent connections.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -56,7 +57,8 @@ pub(crate) enum ExecFrame {
     Stderr(Vec<u8>),
     /// Guest → host, last frame: the exit code (128+signo for a signal death).
     Exit(i32),
-    /// Guest → host, instead of any output: the command could not be started.
+    /// Guest → host, instead of any output: the request itself was unusable
+    /// (empty argv). A command that can't be started is an `Exit`, not this.
     Error(String),
 }
 
@@ -144,7 +146,7 @@ pub(crate) fn run_exec<S: Read + Write>(
             Some(ExecFrame::Stdout(b)) => on_chunk(false, &b)?,
             Some(ExecFrame::Stderr(b)) => on_chunk(true, &b)?,
             Some(ExecFrame::Exit(code)) => return Ok(code),
-            Some(ExecFrame::Error(msg)) => bail!("sandbox could not start `{}`: {msg}", argv[0]),
+            Some(ExecFrame::Error(msg)) => bail!("sandbox refused the exec request: {msg}"),
             Some(ExecFrame::Request(_)) => bail!("exec channel: unexpected Request from the guest"),
             None => bail!("exec channel closed before the command's exit code arrived"),
         }
@@ -155,14 +157,15 @@ pub(crate) fn run_exec<S: Read + Write>(
 ///
 /// Reads the `Request` and spawns its argv in a new process group (stdin empty,
 /// stdout/stderr piped). Until the command's own process exits, it relays both
-/// pipes as frames and watches the host end: if the host closes the stream (or a
-/// frame write fails), it SIGKILLs the whole process group and returns an error.
-/// Once the command's own process exits, it relays the output already buffered in
-/// the pipes and sends `Exit` without waiting for pipe EOF, so a backgrounded
-/// descendant still holding them (`sh -c 'server &'`) does not hold the exchange
-/// open. Such descendants keep running after `Exit`; anything they write later is
-/// read and discarded by a detached thread until they close the pipes. A spawn
-/// failure is answered with `Error`.
+/// pipes as frames, at most one chunk per pipe per wake-up, and watches the host
+/// end: if the host closes the stream (or a frame write fails), it SIGKILLs the
+/// whole process group and returns an error. Once the command's own process
+/// exits, it relays only the bytes buffered in the pipes at that moment and sends
+/// `Exit` without waiting for pipe EOF, so a backgrounded descendant still holding
+/// them (`sh -c 'server &'`, even a fast writer like `yes &`) does not hold the
+/// exchange open. Such descendants keep running after `Exit`; anything they write
+/// later is read and discarded by a detached thread until they close the pipes. A
+/// command that can't be started gets a shell-style `Exit` (see [`spawn_failure`]).
 // Its caller, `exec-host`, is Linux-only (the libkrun guest).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
@@ -178,6 +181,8 @@ pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
         ExecFrame::Error("empty argv".into()).encode(&mut stream)?;
         return Ok(());
     };
+    // Set up before the spawn, so a failure here never strands a running command.
+    let (exited, mut exited_tx) = UnixStream::pair().context("exec exit notifier")?;
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -190,17 +195,27 @@ pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            ExecFrame::Error(e.to_string()).encode(&mut stream)?;
+            let (code, reason) = spawn_failure(program, req.cwd.as_deref(), &e);
+            ExecFrame::Stderr(format!("pillbox exec: {reason}\n").into_bytes())
+                .encode(&mut stream)?;
+            ExecFrame::Exit(code).encode(&mut stream)?;
             return Ok(());
         }
     };
     let group = child.id() as libc::pid_t;
-    let mut pipes: Vec<OutPipe> = vec![
-        OutPipe::new(child.stdout.take().expect("stdout is piped"), false)?,
-        OutPipe::new(child.stderr.take().expect("stderr is piped"), true)?,
-    ];
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let pipes =
+        OutPipe::new(stdout, false).and_then(|out| Ok(vec![out, OutPipe::new(stderr, true)?]));
+    let mut pipes = match pipes {
+        Ok(pipes) => pipes,
+        Err(e) => {
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     // The waiter reaps the command and wakes the poll loop through `exited`.
-    let (exited, mut exited_tx) = UnixStream::pair().context("exec exit notifier")?;
     let waiter = std::thread::spawn(move || {
         let status = child.wait();
         let _ = exited_tx.write_all(&[1]);
@@ -224,7 +239,7 @@ pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
                 }
                 for (pipe, readable) in pipes.iter_mut().zip(ready) {
                     if readable {
-                        if let Err(e) = pipe.relay_available(&mut stream) {
+                        if let Err(e) = pipe.relay_chunk(&mut stream, CHUNK_BYTES) {
                             kill_group(waiter);
                             return Err(e).context("relay exec output");
                         }
@@ -241,10 +256,13 @@ pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
             }
         }
     }
-    // The command's own process is gone: relay what it left in the pipes.
+    // The command's own process is gone: relay what the pipes held at this moment,
+    // not what a background writer keeps adding.
     for pipe in &mut pipes {
-        pipe.relay_available(&mut stream)
-            .context("relay exec output")?;
+        if let Err(e) = pipe.relay_buffered(&mut stream) {
+            kill_group(waiter);
+            return Err(e).context("relay exec output");
+        }
     }
     let status = waiter
         .join()
@@ -288,12 +306,16 @@ impl OutPipe {
         })
     }
 
-    /// Relay every byte readable right now as frames; stops at "would block" or EOF.
-    fn relay_available(&mut self, stream: &mut impl Write) -> io::Result<()> {
-        let mut buf = vec![0u8; CHUNK_BYTES];
-        while self.open {
-            match self.file.read(&mut buf) {
-                Ok(0) => self.open = false,
+    /// One read of at most `max` bytes, relayed as one frame. Returns the bytes
+    /// relayed: 0 at EOF (the pipe is then closed) or when nothing is readable.
+    fn relay_chunk(&mut self, stream: &mut impl Write, max: usize) -> io::Result<usize> {
+        let mut buf = vec![0u8; max.min(CHUNK_BYTES)];
+        loop {
+            return match self.file.read(&mut buf) {
+                Ok(0) => {
+                    self.open = false;
+                    Ok(0)
+                }
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
                     let frame = if self.is_stderr {
@@ -302,10 +324,28 @@ impl OutPipe {
                         ExecFrame::Stdout(chunk)
                     };
                     frame.encode(stream)?;
+                    Ok(n)
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            };
+        }
+    }
+
+    /// Relay the bytes buffered in the pipe now (`FIONREAD`), and no more.
+    fn relay_buffered(&mut self, stream: &mut impl Write) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let mut buffered: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one c_int through a valid pointer.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut buffered) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut left = usize::try_from(buffered).unwrap_or(0);
+        while left > 0 && self.open {
+            match self.relay_chunk(stream, left)? {
+                0 => break,
+                n => left -= n,
             }
         }
         Ok(())
@@ -402,6 +442,21 @@ fn host_gone(stream: &mut UnixStream) -> bool {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return true,
         }
+    }
+}
+
+/// The shell-style exit code and reason for a command that could not be started:
+/// 127 when the program isn't found, 126 when it can't be run (permission denied,
+/// not an executable, or an unusable `cwd`).
+fn spawn_failure(program: &str, cwd: Option<&str>, e: &io::Error) -> (i32, String) {
+    // The child chdirs before exec, so a bad cwd fails the spawn with the same errno as
+    // a missing program; tell them apart by looking at the cwd.
+    if let Some(cwd) = cwd.filter(|cwd| !std::path::Path::new(cwd).is_dir()) {
+        return (126, format!("cwd `{cwd}` is not a usable directory: {e}"));
+    }
+    match e.kind() {
+        io::ErrorKind::NotFound => (127, format!("{program}: command not found")),
+        _ => (126, format!("{program}: cannot execute: {e}")),
     }
 }
 
@@ -532,11 +587,45 @@ mod tests {
     }
 
     #[test]
-    fn exec_channel_spawn_failure_is_an_error() {
-        let (code, out, err) = exec_over_pair(&["/nonexistent/pillbox-no-such-binary"], None);
-        let msg = code.unwrap_err().to_string();
-        assert!(msg.contains("could not start"), "got: {msg}");
-        assert!(out.is_empty() && err.is_empty());
+    fn a_command_that_cannot_start_exits_127_or_126_with_the_reason_on_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_exec = dir.path().join("data.txt");
+        std::fs::write(&not_exec, "not a program").unwrap();
+        let no_format = dir.path().join("garbage");
+        std::fs::write(&no_format, [0u8, 1, 2, 3]).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&no_format, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cases: [(&[&str], Option<&str>, i32, &str); 5] = [
+            (
+                &["/nonexistent/pillbox-no-such-binary"],
+                None,
+                127,
+                "command not found",
+            ),
+            (
+                &["pillbox-no-such-command-on-path"],
+                None,
+                127,
+                "command not found",
+            ),
+            (&[not_exec.to_str().unwrap()], None, 126, "cannot execute"),
+            (&[no_format.to_str().unwrap()], None, 126, "cannot execute"),
+            (
+                &["true"],
+                Some("/nonexistent/pillbox-cwd"),
+                126,
+                "not a usable directory",
+            ),
+        ];
+        for (argv, cwd, want, reason) in cases {
+            let (code, out, err) = exec_over_pair(argv, cwd);
+            assert_eq!(code.unwrap(), want, "{argv:?} in {cwd:?}");
+            assert!(out.is_empty());
+            let err = String::from_utf8(err).unwrap();
+            assert!(err.contains(reason), "{argv:?}: {err}");
+        }
     }
 
     /// Poll until `path` holds a pid (the command wrote it), bounded.
@@ -590,6 +679,22 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(out, b"hi\n");
         assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn exit_arrives_promptly_even_while_a_background_writer_floods_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("yes");
+        let script = format!("yes & echo $! > '{}'", pidfile.display());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (code, _, _) = exec_over_pair(&["sh", "-c", &script], None);
+            let _ = done_tx.send(code.map_err(|e| e.to_string()));
+        });
+        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let writer = read_pid(&pidfile);
+        unsafe { libc::kill(writer, libc::SIGKILL) };
+        assert_eq!(outcome.expect("Exit never arrived").unwrap(), 0);
     }
 
     #[test]

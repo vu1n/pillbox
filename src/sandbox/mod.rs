@@ -139,6 +139,11 @@ pub(crate) struct SandboxSpawn {
 /// One live sandbox, addressed by its registry record (see [`sandbox_target`]) —
 /// what `sandbox exec`/`agent`/`destroy` drive without branching on the backend.
 pub(crate) trait SandboxTarget {
+    /// Open a channel for one command. Every refusal (a record pillbox can't
+    /// drive, a missing guest workspace, a VM that doesn't answer) happens here,
+    /// before anything is sent or reported as started.
+    fn open_exec(&self) -> Result<Box<dyn ExecChannel>>;
+
     /// Run `argv` to completion in the sandbox's workspace, handing each output
     /// chunk to `on_chunk(is_stderr, bytes)` as it arrives (stdin is empty).
     /// Returns the command's exit code (128+signo when a signal killed it).
@@ -146,10 +151,32 @@ pub(crate) trait SandboxTarget {
         &self,
         argv: &[String],
         on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
-    ) -> Result<i32>;
+    ) -> Result<i32> {
+        self.open_exec()?.run(argv, on_chunk)
+    }
 
     /// Stop the sandbox, release its artifacts, and delete its record.
-    fn destroy(&self, resolved: &Pillbox) -> Result<()>;
+    fn destroy(&self, resolved: &Pillbox) -> Result<Destroyed>;
+}
+
+/// What [`SandboxTarget::destroy`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Destroyed {
+    /// The sandbox was stopped and its files removed, then its record.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only libkrun sandboxes run
+    TornDown,
+    /// Only the record was dropped: nothing it ran was torn down.
+    RecordDropped,
+}
+
+/// One opened exec channel ([`SandboxTarget::open_exec`]), good for one command.
+pub(crate) trait ExecChannel {
+    /// Run `argv` as [`SandboxTarget::exec`] describes.
+    fn run(
+        self: Box<Self>,
+        argv: &[String],
+        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32>;
 }
 
 /// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
@@ -207,11 +234,7 @@ struct RecordOnly {
 }
 
 impl SandboxTarget for RecordOnly {
-    fn exec(
-        &self,
-        _argv: &[String],
-        _on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
-    ) -> Result<i32> {
+    fn open_exec(&self) -> Result<Box<dyn ExecChannel>> {
         Err(PillboxError::usage(
             "sandbox exec",
             format!(
@@ -223,13 +246,13 @@ impl SandboxTarget for RecordOnly {
         .into())
     }
 
-    fn destroy(&self, resolved: &Pillbox) -> Result<()> {
+    fn destroy(&self, resolved: &Pillbox) -> Result<Destroyed> {
         crate::sandboxes::delete(resolved, &self.record.id)?;
         eprintln!(
             "pillbox: sandbox `{}` {}: dropped its record; {}",
             self.record.id, self.why, self.left
         );
-        Ok(())
+        Ok(Destroyed::RecordDropped)
     }
 }
 
@@ -477,7 +500,8 @@ mod tests {
             let g = crate::pillbox::global();
             for record in undrivable_records() {
                 crate::sandboxes::write(&g, &record).unwrap();
-                sandbox_target(&record).unwrap().destroy(&g).unwrap();
+                let destroyed = sandbox_target(&record).unwrap().destroy(&g).unwrap();
+                assert_eq!(destroyed, Destroyed::RecordDropped);
                 assert!(
                     crate::sandboxes::resolve(&g, &record.id).is_err(),
                     "{} record survived destroy",

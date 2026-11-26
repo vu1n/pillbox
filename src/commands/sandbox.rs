@@ -28,7 +28,7 @@ use crate::contract::{
 };
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::{sandbox_target, select_backend, SandboxSpawn, SandboxTarget};
+use crate::sandbox::{sandbox_target, select_backend, Destroyed, SandboxSpawn, SandboxTarget};
 use crate::sandboxes::{self, Sandbox};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SandboxAction) -> Result<()> {
@@ -287,10 +287,12 @@ fn emit_exec_events(
     target: &dyn SandboxTarget,
     argv: &[String],
 ) -> Result<()> {
+    // A refusal, a dead socket included, fails before exec_started: a started exec always ends in exec_exit or a channel error.
+    let channel = target.open_exec()?;
     emitter.emit(Payload::ExecStarted(ExecStarted {
         argv: argv.to_vec(),
     }))?;
-    let code = target.exec(argv, &mut |is_stderr, bytes| {
+    let code = channel.run(argv, &mut |is_stderr, bytes| {
         let stream = if is_stderr {
             StdStream::Stderr
         } else {
@@ -323,8 +325,14 @@ fn exec_passthrough(target: &dyn SandboxTarget, argv: &[String]) -> Result<()> {
 
 fn destroy(resolved: &Pillbox, id: &str) -> Result<()> {
     let record = sandboxes::resolve(resolved, id)?;
-    sandbox_target(&record)?.destroy(resolved)?;
-    eprintln!("pillbox: ✓ sandbox {} destroyed", record.id);
+    match sandbox_target(&record)?.destroy(resolved)? {
+        Destroyed::TornDown => eprintln!("pillbox: ✓ sandbox {} destroyed", record.id),
+        // The target already said what it left behind.
+        Destroyed::RecordDropped => eprintln!(
+            "pillbox: sandbox {} record dropped; nothing was torn down",
+            record.id
+        ),
+    }
     Ok(())
 }
 
@@ -409,10 +417,19 @@ mod tests {
     }
 
     /// A sandbox that answers every exec with fixed chunks and an exit code.
+    #[derive(Clone)]
     struct FakeTarget(Vec<(bool, &'static [u8])>, i32);
     impl SandboxTarget for FakeTarget {
-        fn exec(
-            &self,
+        fn open_exec(&self) -> Result<Box<dyn crate::sandbox::ExecChannel>> {
+            Ok(Box::new(self.clone()))
+        }
+        fn destroy(&self, _resolved: &Pillbox) -> Result<Destroyed> {
+            Ok(Destroyed::TornDown)
+        }
+    }
+    impl crate::sandbox::ExecChannel for FakeTarget {
+        fn run(
+            self: Box<Self>,
             _argv: &[String],
             on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
         ) -> Result<i32> {
@@ -421,9 +438,32 @@ mod tests {
             }
             Ok(self.1)
         }
-        fn destroy(&self, _resolved: &Pillbox) -> Result<()> {
-            Ok(())
+    }
+
+    /// A sandbox whose exec channel can't be opened (a dead VM, a record-only target).
+    struct RefusingTarget;
+    impl SandboxTarget for RefusingTarget {
+        fn open_exec(&self) -> Result<Box<dyn crate::sandbox::ExecChannel>> {
+            anyhow::bail!("can't reach sandbox")
         }
+        fn destroy(&self, _resolved: &Pillbox) -> Result<Destroyed> {
+            Ok(Destroyed::RecordDropped)
+        }
+    }
+
+    #[test]
+    fn exec_json_emits_nothing_when_the_target_refuses_before_the_command_starts() {
+        let collected = Rc::new(RefCell::new(Vec::new()));
+        let emitter = EventEmitter::new(
+            Box::new(CollectSink(collected.clone())),
+            "sb-test".into(),
+            Correlation::Exec("ex1".into()),
+        );
+        assert!(emit_exec_events(emitter, &RefusingTarget, &["sh".into()]).is_err());
+        assert!(
+            collected.borrow().is_empty(),
+            "exec_started before a refusal"
+        );
     }
 
     #[test]

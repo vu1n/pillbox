@@ -16,6 +16,9 @@ tests:
   - "src/sandbox/libkrun/sandbox_vm.rs:libkrun_record_round_trips_to_a_target_and_destroy_removes_files_then_record"
   - "src/sandbox/exec_channel.rs:exec_channel_serve_and_run_deliver_both_streams_and_exit_code"
   - "src/sandbox/exec_channel.rs:exec_channel_kills_a_quiet_command_when_the_host_disconnects"
+  - "src/sandbox/exec_channel.rs:exit_arrives_promptly_even_while_a_background_writer_floods_stdout"
+  - "src/sandbox/exec_channel.rs:a_command_that_cannot_start_exits_127_or_126_with_the_reason_on_stderr"
+  - "src/commands/sandbox.rs:exec_json_emits_nothing_when_the_target_refuses_before_the_command_starts"
   - "src/sandbox/exec_channel.rs:exec_channel_exits_when_the_command_does_even_if_a_background_child_holds_stdout"
   - "src/sandbox/libkrun/sandbox_vm.rs:spawn_refuses_agents_that_are_not_env_forked_or_drivable_before_any_launch"
   - "src/sandbox/mod.rs:destroying_a_record_it_cannot_drive_drops_it_and_succeeds"
@@ -55,11 +58,17 @@ destroy drops the record, names what was left (`docker rm -f <container>`), and 
 - Exec channel: framed request (argv, cwd = guest workspace) and stdout/stderr/exit
   frames over vsock port 1026, one connection per command (the codec is
   `attach::frame::{read_frame,write_frame}` with a 16 MiB cap). The command runs in its
-  own process group: if the host closes the connection, the guest kills the group. Exit
-  is sent when the command itself exits; a background child still holding stdout keeps
-  running, and its later output is discarded.
-- Destroy: the same `teardown_handle` as `session rm` on libkrun, then the record. A
-  record pillbox can't drive is just dropped (see above).
+  own process group: if the host closes the connection, the guest kills the group. Output
+  is relayed one chunk per pipe per wake-up, so the command's exit is never starved. Exit
+  is sent when the command itself exits, after only what the pipes held at that moment;
+  a background child still holding stdout keeps running, and its later output is
+  discarded. A command that can't start exits 127 (not found) or 126 (not executable,
+  permission denied, unusable cwd) with the reason on stderr, so `exec --json` always
+  ends in `exec_exit`. The target dials the channel before `exec_started` is emitted, so
+  a refusal or dead VM fails with no events.
+- Destroy: the same `teardown_handle` as `session rm` on libkrun, then the record, and
+  `✓ sandbox … destroyed`. A record pillbox can't drive is just dropped (see above), and
+  the CLI says the record was dropped and nothing was torn down.
 - Agent exit code: plain `sandbox agent` exits with the turn's outcome; `--json` exits 0
   only when `run_finished` already carries it (a harness failure it didn't report, or no
   `run_finished` at all, exits non-zero).
@@ -107,8 +116,10 @@ readiness wait, exec over a real exec-channel server, and destroy.
 - `--image` is a usage error: the rootfs is the pillbox's runner image
   (`[runner] image` / `PILLBOX_RUNNER_IMAGE`).
 - An agent sandbox hands the home and workspace to uid 1000 with `chown -R` at boot.
-  On macOS a read-only host file may refuse that (a warning on the VM console); it stays
-  readable but not writable to the agent.
+  On macOS a read-only host file may refuse that. The boot script's warning goes nowhere
+  you can see: a sandbox VMM is reparented with its console on `/dev/null`. Spawn still
+  succeeds, and the file stays readable but not writable to the agent; the first sign is
+  a permission error from a command that writes it.
 - `--agent cursor`/`pi` are refused: they aren't vault-capable, so their real key would
   sit in the guest. Add one only once it is env-forked and has a stdout adapter.
 - `spawn` waits up to 120 s for the exec channel; a slow boot over a large workspace

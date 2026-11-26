@@ -230,9 +230,25 @@ pub(super) trait ForegroundHooks {
     fn attached(&mut self) {}
     /// The VMM is confirmed stopped; its files are removed next.
     fn stopped(&mut self) {}
+    /// Whether the pump ending with `outcome` leaves a VMM to kill before the
+    /// wait. A failed attach or pump always kills; by default an `Ok` outcome
+    /// waits for the VMM to exit on its own.
+    fn kill_after(&self, _outcome: &pump::Outcome) -> bool {
+        false
+    }
 }
 
 impl ForegroundHooks for () {}
+
+/// Hooks for a foreground VM that has nothing to outlive its terminal (`auth
+/// login`): any end but the guest's own exit kills the VMM before the wait.
+pub(super) struct KillUnlessExited;
+
+impl ForegroundHooks for KillUnlessExited {
+    fn kill_after(&self, outcome: &pump::Outcome) -> bool {
+        !matches!(outcome, pump::Outcome::Exited(_))
+    }
+}
 
 /// The foreground attach-and-reap cycle shared by `run` and `auth login`: bind
 /// `vm.sock`, boot `vm` supervised by this CLI, wait for the guest pty-host to
@@ -264,7 +280,7 @@ pub(super) fn run_foreground_attached(
         let write_half = stream.try_clone().context("clone attach stream")?;
         pump::attach_terminal(stream, write_half, false)
     });
-    if outcome.is_err() {
+    if kill_before_wait(&outcome, hooks) {
         // A VMM still up after a failed attach or pump would never exit on its own.
         // (Killing one that already exited leaves its exit status intact.)
         let _ = child.kill();
@@ -284,6 +300,15 @@ pub(super) fn run_foreground_attached(
         }
     }
     outcome
+}
+
+/// Whether [`run_foreground_attached`] kills the VMM before reaping it: always on
+/// a failed attach or pump, else as the caller's [`ForegroundHooks::kill_after`] says.
+fn kill_before_wait(outcome: &Result<pump::Outcome>, hooks: &dyn ForegroundHooks) -> bool {
+    match outcome {
+        Err(_) => true,
+        Ok(outcome) => hooks.kill_after(outcome),
+    }
 }
 
 /// Removes a path (a socket) when dropped, on every exit path.
@@ -460,14 +485,17 @@ pub(super) struct SpawnedVm {
 impl SpawnedVm {
     /// Run the launch's commit step `f`; on its error, kill the VMM and tear its
     /// files down ([`abandon_launch`]) before returning the error. On success the
-    /// VMM keeps running, owned by the record `f` wrote.
+    /// VMM keeps running, owned by the record `f` wrote; its `Child` comes back
+    /// with `f`'s value for a caller that must still be able to stop it.
     pub(super) fn commit<T>(
         mut self,
         verb: &'static str,
         f: impl FnOnce(&mut std::process::Child, &LibkrunHandle) -> Result<T>,
-    ) -> Result<T> {
-        f(&mut self.child, &self.handle)
-            .map_err(|e| abandon_launch(verb, &mut self.child, &self.handle, e))
+    ) -> Result<(T, std::process::Child)> {
+        match f(&mut self.child, &self.handle) {
+            Ok(value) => Ok((value, self.child)),
+            Err(e) => Err(abandon_launch(verb, &mut self.child, &self.handle, e)),
+        }
     }
 }
 
@@ -1160,24 +1188,6 @@ pub(super) fn agent_launch_creds(
     })
 }
 
-fn commit_detached_session(
-    resolved: &Pillbox,
-    session: &crate::session::Session,
-    child: std::process::Child,
-    handle: &LibkrunHandle,
-) -> Result<std::process::Child> {
-    if let Err(error) = crate::session::write(resolved, session) {
-        super::repository::stop_spawned_vmm(child)
-            .with_context(|| format!("detached session commit failed: {error:#}"))?;
-        if let Some(rootfs) = &handle.rootfs {
-            super::rootfs::remove_stopped_root(Path::new(rootfs))
-                .with_context(|| format!("detached session commit failed: {error:#}"))?;
-        }
-        return Err(error);
-    }
-    Ok(child)
-}
-
 /// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
 /// reparented to init), hand it the reals on stdin, record the session, return.
 /// No pump and no teardown (the clones + spec persist for the running VM;
@@ -1194,27 +1204,31 @@ fn run_detached(
     mut startup: StartupTimer,
 ) -> Result<()> {
     let record = crate::session::record_path(resolved, session_id);
-    let SpawnedVm { child, handle } = spawn_reparented(launch.vm, &record, &launch.swap_pairs)?;
+    let spawned = spawn_reparented(launch.vm, &record, &launch.swap_pairs)?;
     startup.mark("vmm_spawn");
 
-    let session = crate::session::Session {
-        id: session_id.to_string(),
-        label: opts.label.clone(),
-        backend: crate::session::BACKEND_LIBKRUN.to_string(),
-        sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
-        pty_pid: 0,
-        agent_id: spec.id.to_string(),
-        started_at: crate::session::now_rfc3339(),
-        attached_pid: None,
-        base_snapshot: None,
-        result_snapshot: None,
-        expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
-        guest_cwd: launch.guest_workspace,
-        placement: crate::session::Placement::Local,
-        server: None,
-        requested_execution: None,
-    };
-    let child = commit_detached_session(resolved, &session, child, &handle)?;
+    let guest_cwd = launch.guest_workspace;
+    let (session, child) = spawned.commit("run", |_child, handle| {
+        let session = crate::session::Session {
+            id: session_id.to_string(),
+            label: opts.label.clone(),
+            backend: crate::session::BACKEND_LIBKRUN.to_string(),
+            sandbox_id: serde_json::to_string(handle).context("encode libkrun handle")?,
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: crate::session::now_rfc3339(),
+            attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
+            expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+            guest_cwd,
+            placement: crate::session::Placement::Local,
+            server: None,
+            requested_execution: None,
+        };
+        crate::session::write(resolved, &session)?;
+        Ok(session)
+    })?;
     let startup_metrics = startup.finish("session_record");
     crate::events::emit_session_event(
         resolved,
@@ -1417,7 +1431,7 @@ fn launch_server_vm(
     // Bring-up over the forward; a failure tears the VM down rather than leaking
     // it + the clones. The success path leaves the child running, reparented;
     // `kill_session` reaps that one by spec path.
-    let session = spawned.commit("run", |_child, handle| {
+    let (session, _child) = spawned.commit("run", |_child, handle| {
         let agent_session_id = (launch.bringup)(&http)?;
         startup.mark("server_ready");
         let session = crate::session::Session {
@@ -2808,13 +2822,13 @@ const COMMIT_DEADLINE_SECS: u64 = 600;
 /// [`VmmTether::Reparented`] spawns arm it; foreground/grader VMMs are reaped via
 /// `child.wait` and need no guard.
 fn arm_commit_guard(cmd: &mut Command, record_path: &Path) {
-    cmd.env("PILLBOX_COMMIT_OWNER_PID", std::process::id().to_string())
-        .env("PILLBOX_COMMIT_RECORD", record_path)
-        .env("PILLBOX_COMMIT_DEADLINE", COMMIT_DEADLINE_SECS.to_string());
+    cmd.env(super::COMMIT_OWNER_PID, std::process::id().to_string())
+        .env(super::COMMIT_RECORD, record_path)
+        .env(super::COMMIT_DEADLINE, COMMIT_DEADLINE_SECS.to_string());
     // The VMM's own HOME is the guest's, so its self-destruct needs the host home to
     // find (and only then remove) the owned private rootfs.
     if let Some(home) = std::env::var_os("HOME") {
-        cmd.env("PILLBOX_COMMIT_HOME", home);
+        cmd.env(super::COMMIT_HOME, home);
     }
 }
 
@@ -3420,40 +3434,63 @@ mod tests {
     }
 
     #[test]
-    fn failed_detached_commit_stops_child_and_removes_owned_root() {
-        let fixture = tempfile::tempdir().unwrap();
-        let blocked = fixture.path().join("not-a-directory");
-        std::fs::write(&blocked, "block record creation").unwrap();
-        let resolved = Pillbox {
-            scope: crate::pillbox::Scope::Global,
-            state_dir: blocked,
-            meta: None,
-        };
-        let base = fixture.path().join("base");
-        std::fs::create_dir(&base).unwrap();
-        let mut root =
-            super::super::rootfs::PrivateRootfs::fork(&base, &fixture.path().join("runtimes"))
-                .unwrap();
-        let path = root.to_path_buf();
-        let mut command = Command::new("/bin/sleep");
-        command.arg("30");
-        vmm_own_process_group(&mut command);
-        let child = command.spawn().unwrap();
-        let group = child.id() as i32;
-        root.preserve();
-        let handle = LibkrunHandle {
-            sock: String::new(),
-            pid: group,
-            creds: String::new(),
-            workspace: String::new(),
-            spec: String::new(),
-            rootfs: Some(path.to_string_lossy().into_owned()),
-        };
-        assert!(
-            commit_detached_session(&resolved, &Session::test_fixture(), child, &handle).is_err()
-        );
-        assert!(!super::super::repository::group_exists(group).unwrap());
-        assert!(!path.exists());
+    fn a_failed_commit_kills_the_vmm_and_removes_every_file_it_was_handed() {
+        crate::test_util::with_isolated_home("failed-commit", || {
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let krun =
+                super::super::rootfs_backing::RootfsBacking::krun_dir_for_home(&home).unwrap();
+            let root = krun.join("vm-rootfs/vm-failed/rootfs");
+            std::fs::create_dir_all(root.join("etc")).unwrap();
+            let [sock, spec, creds, workspace] =
+                ["vm.sock", "spec.json", "creds", "ws"].map(|n| home.join(n));
+            std::fs::write(&sock, b"").unwrap();
+            std::fs::write(&spec, b"{}").unwrap();
+            std::fs::create_dir(&creds).unwrap();
+            std::fs::create_dir(&workspace).unwrap();
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            vmm_own_process_group(&mut command);
+            let child = command.spawn().unwrap();
+            let group = child.id() as i32;
+            let spawned = SpawnedVm {
+                child,
+                handle: LibkrunHandle {
+                    sock: sock.to_string_lossy().into_owned(),
+                    pid: group,
+                    creds: creds.to_string_lossy().into_owned(),
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    spec: spec.to_string_lossy().into_owned(),
+                    rootfs: Some(root.to_string_lossy().into_owned()),
+                },
+            };
+            let committed = spawned.commit("run", |_child, _handle| -> Result<()> {
+                anyhow::bail!("session write failed")
+            });
+            assert!(committed.is_err());
+            assert!(!super::super::repository::group_exists(group).unwrap());
+            for p in [&sock, &spec, &creds, &workspace, &root] {
+                assert!(!p.exists(), "{} survived a failed commit", p.display());
+            }
+        });
+    }
+
+    #[test]
+    fn only_a_caller_that_asks_kills_the_vmm_after_a_clean_pump_end() {
+        let failed: Result<pump::Outcome> = Err(anyhow::anyhow!("attach timed out"));
+        assert!(kill_before_wait(&failed, &()));
+        for outcome in [pump::Outcome::Detached, pump::Outcome::Disconnected] {
+            assert!(
+                !kill_before_wait(&Ok(outcome), &()),
+                "run waits for its VMM"
+            );
+        }
+        for outcome in [pump::Outcome::Detached, pump::Outcome::Disconnected] {
+            assert!(kill_before_wait(&Ok(outcome), &KillUnlessExited));
+        }
+        assert!(!kill_before_wait(
+            &Ok(pump::Outcome::Exited(0)),
+            &KillUnlessExited
+        ));
     }
 
     #[test]

@@ -16,6 +16,7 @@ tests:
   - "tests/checkpoint.rs:unpack_restores_directory_modes_under_a_narrow_umask"
   - "crates/packet/src/tests.rs"
   - "crates/packet/tests/golden.rs:packet_from_29d5306_unpacks_and_repacks_byte_identical"
+  - "crates/packet/tests/cli.rs:pack_and_unpack_print_versioned_json_and_exit_by_category"
 ---
 
 # Portable session packets

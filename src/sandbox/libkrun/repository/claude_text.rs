@@ -122,7 +122,7 @@ fn prepare_guest(
     fs::create_dir(&auth_dir)?;
     crate::paths::ensure_mode_0700(&auth_dir)?;
     write_private_file(
-        &auth_dir.join(".credentials.json"),
+        &home.join(pillbox_credentials::CLAUDE),
         &input.credentials.guest_auth,
     )?;
     write_private_file(

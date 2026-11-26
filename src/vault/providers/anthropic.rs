@@ -42,7 +42,7 @@ const CONSOLE_HOST: &str = "console.anthropic.com";
 /// endpoint can be rejected locally instead of reaching the provider.
 const PLATFORM_HOST: &str = "platform.claude.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
-const CREDS_PATH: &str = ".claude/.credentials.json";
+const CREDS_PATH: &str = pillbox_credentials::CLAUDE.path();
 const OAUTH_CLIENT_ID: &str = "claude_code";
 const OAUTH_ENDPOINT: &str = "https://platform.claude.com/oauth/token";
 const FALLBACK_EXPIRES_IN_SECS: u64 = 3600;

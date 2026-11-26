@@ -78,9 +78,7 @@ fn is_credential(tree: Tree, name: &str) -> bool {
         .any(|p| basename(p) == Some(name))
         || (tree == Tree::Harness
             && pillbox_credentials::AGENT_CREDENTIALS.iter().any(|p| {
-                let Some(sentinel) = basename(p.path()) else {
-                    return false;
-                };
+                let sentinel = p.file_name();
                 name == sentinel
                     || SQLITE_SIDECARS
                         .iter()

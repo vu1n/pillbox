@@ -17,6 +17,11 @@ impl AgentCredential {
     pub const fn path(self) -> &'static str {
         self.0
     }
+
+    /// The file's own name, e.g. `auth.json` for [`CODEX`].
+    pub fn file_name(self) -> &'static str {
+        self.0.rsplit('/').next().unwrap_or(self.0)
+    }
 }
 
 impl AsRef<Path> for AgentCredential {

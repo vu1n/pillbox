@@ -10,8 +10,8 @@
 //! **Built on the existing primitives, not a rebuild.** Each cell is the same
 //! `run --detach --json` → `session send` → `session wait-idle` → `session
 //! score` chain dispatch and the bash eval rig (`scripts/eval/*`) already use —
-//! driven by self-exec'ing the pillbox binary (the documented `--json`
-//! contracts). The genuinely-new bits are the **declarative spec** and the
+//! driven in-process through the typed session calls (`commands::run::start`,
+//! `session::send`, `stream::wait_idle`, `session::score`). The genuinely-new bits are the **declarative spec** and the
 //! **variant × trial matrix**. The variance statistics are NOT reimplemented:
 //! `eval` emits JSONL in the exact `{task, cond, trial, score, cost}` schema
 //! `scripts/eval/paired-stats.py` consumes, so the σ̂ / paired-lift CI is one
@@ -20,19 +20,23 @@
 //! Spec format is **TOML** (matches `pillbox.toml`; the #71 sketch was YAML, but
 //! TOML avoids a new dep and is the repo convention). Grading is libkrun-only in
 //! v1 — like [`crate::commands::dispatch`], it scores each run's *live* workspace
-//! clone via `session info --json` → `.session.workspace`; a docker path (pull-
+//! clone via `session::workspace_of`; a docker path (pull-
 //! then-score) is the same deferred resolution dispatch notes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::agents::{McpAttachment, RunOpts};
+use crate::commands::session::{self, stream, ScoreRequest};
+use crate::commands::{self};
 use crate::contract::Scored;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::sandbox::Started;
 
 /// Default per-turn idle cap (seconds) — generous; an agent turn runs minutes.
 /// The monolithic-truncation lesson (docs/optimization-gate.md): too small a cap
@@ -354,24 +358,54 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
-// ── the live runner (subprocess self-exec) ───────────────────────────────────
+// ── the live runner (typed in-process session calls) ────────────────────────
 
-// NOTE: the run→drive→grade subprocess chain mirrors dispatch's `CliDriver`. A
-// shared `SessionRunner` seam (factoring fork/wait-idle/grade out of both) is a
-// clean behavior-preserving follow-up; kept eval-local here so #71 doesn't
-// refactor just-landed dispatch on its way in.
-struct Runner {
-    exe: PathBuf,
+struct Runner<'a> {
+    resolved: &'a Pillbox,
 }
 
-impl Runner {
-    fn new(_resolved: &Pillbox) -> Result<Self> {
-        let exe = std::env::current_exe().context("locate the pillbox binary")?;
-        Ok(Self { exe })
+/// The `run --detach` options a (spec, variant) pair asks for — the same
+/// RunOpts the CLI's `run` flags build, so an eval cell starts exactly what the
+/// equivalent `pillbox run --detach` would.
+fn run_opts(spec: &EvalSpec, v: &Variant) -> Result<RunOpts> {
+    Ok(RunOpts {
+        workspace: spec.workspace.as_ref().map(PathBuf::from),
+        name: None,
+        mounts: Vec::new(),
+        withs: Vec::new(),
+        env_bundles: Vec::new(),
+        env_files: Vec::new(),
+        vault: false,
+        memory: v.memory,
+        memory_briefed: Vec::new(), // commands::run::start fills this from the kypp briefing
+        mcps: v
+            .mcp
+            .iter()
+            .map(|m| McpAttachment::parse(m))
+            .collect::<Result<_>>()?,
+        mcp_tokens: Vec::new(),
+        args: Vec::new(),
+        detach: true,
+        label: None,
+        json: false,
+        ttl_seconds: None,
+        from_bookmark: spec.from_bookmark.clone(), // validate() rejects workspace + bookmark together
+        model: v.model.clone(),
+        profile: None,
+        reasoning_effort: None,
+        temperature: v.temperature,
+        egress_allow: Vec::new(),
+        egress_deny: false,
+    })
+}
+
+impl<'a> Runner<'a> {
+    fn new(resolved: &'a Pillbox) -> Result<Self> {
+        Ok(Self { resolved })
     }
 
     /// Run one (variant, trial): start a session, drive the prompt, grade its
-    /// live workspace. Any subprocess error becomes an `errored` cell (score 0)
+    /// live workspace. Any error becomes an `errored` cell (score 0)
     /// — one bad cell never aborts the matrix (the other cells still run).
     fn run_cell(&self, spec: &EvalSpec, v: &Variant, prompt: &str, trial: u32) -> Cell {
         match self.run_cell_inner(spec, v, prompt) {
@@ -404,108 +438,66 @@ impl Runner {
     ) -> Result<(String, Scored)> {
         let session = self.start_session(spec, v)?;
         // Drive the prompt as turn 1, then block until idle (bounded by budget).
-        self.status(&[
-            "session".into(),
-            "send".into(),
-            session.clone(),
-            prompt.into(),
-        ])?;
-        self.status(&[
-            "session".into(),
-            "wait-idle".into(),
-            session.clone(),
-            "--timeout".into(),
-            spec.max_seconds().to_string(),
-        ])?;
+        session::send(self.resolved, &session, prompt)?;
+        let idle = stream::wait_idle(
+            self.resolved,
+            &session,
+            Some(Duration::from_secs(spec.max_seconds())),
+            None,
+        )?;
+        if !idle {
+            bail!(
+                "session {session} not idle within {}s (--max-seconds)",
+                spec.max_seconds()
+            );
+        }
         let grade = self.grade(&session, spec)?;
         Ok((session, grade))
     }
 
-    /// `run --detach --json` with the variant's config → the new session id.
+    /// Start a detached session with the variant's config → the new session id.
     fn start_session(&self, spec: &EvalSpec, v: &Variant) -> Result<String> {
-        let mut args = vec!["run".into(), "--detach".into(), "--json".into()];
-        match (&spec.workspace, &spec.from_bookmark) {
-            (Some(w), _) => args.extend(["--workspace".into(), w.clone()]),
-            (_, Some(b)) => args.extend(["--from-bookmark".into(), b.clone()]),
-            _ => {} // cwd default
-        }
         // A variant's agent overrides the spec default.
-        if let Some(a) = v.agent.as_ref().or(spec.agent.as_ref()) {
-            args.extend(["--agent".into(), a.clone()]);
+        let agent = v.agent.as_ref().or(spec.agent.as_ref());
+        match commands::run::start(self.resolved, agent.map(String::as_str), run_opts(spec, v)?)? {
+            Started::Detached(s) => Ok(s.id),
+            Started::StructuredFinished {
+                session, exit_code, ..
+            } if exit_code != 0 => {
+                bail!(
+                    "session {} exited {exit_code} before the prompt",
+                    session.id
+                )
+            }
+            Started::StructuredFinished { session, .. }
+            | Started::ServerReady { session, .. }
+            | Started::ManagedFinished(session) => Ok(session.id),
+            Started::Foreground => bail!("`run` started a foreground session, not a detached one"),
         }
-        if let Some(m) = &v.model {
-            args.extend(["--model".into(), m.clone()]);
-        }
-        if let Some(t) = v.temperature {
-            args.extend(["--temperature".into(), t.to_string()]);
-        }
-        if v.memory {
-            args.push("--memory".into());
-        }
-        for m in &v.mcp {
-            args.extend(["--mcp".into(), m.clone()]);
-        }
-        let out = self.capture(&args)?;
-        let val: serde_json::Value =
-            serde_json::from_str(&out).with_context(|| format!("parse `run --json`: {out:?}"))?;
-        val["session"]["id"]
-            .as_str()
-            .map(str::to_string)
-            .context("`run --json` had no session.id")
     }
 
     /// Grade the run's live workspace clone in place (libkrun-only, like
-    /// dispatch): `session info --json` → `.session.workspace`, then `session
-    /// score --workspace … --json` → the parsed verdict.
+    /// dispatch), on the host (no `--in-sandbox`), no grader egress.
     fn grade(&self, id: &str, spec: &EvalSpec) -> Result<Scored> {
-        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
-        let iv: serde_json::Value = serde_json::from_str(&info)
-            .with_context(|| format!("parse `session info`: {info:?}"))?;
-        let ws = iv["session"]["workspace"]
-            .as_str()
-            .context("`session info --json` had no session.workspace (libkrun-only today)")?
-            .to_string();
-        let mut args = vec![
-            "session".into(),
-            "score".into(),
-            id.into(),
-            "--workspace".into(),
-            ws,
-            "--json".into(),
-        ];
-        match (&spec.verify.cmd, &spec.verify.rubric) {
-            (Some(c), _) => args.extend(["--cmd".into(), c.clone()]),
-            (_, Some(r)) => args.extend(["--rubric".into(), r.to_string_lossy().into_owned()]),
+        let session = crate::session::resolve(self.resolved, id)?;
+        let ws = session::workspace_of(&session)
+            .context("no live session workspace (libkrun-only today)")?;
+        let (cmd, rubric) = match (&spec.verify.cmd, &spec.verify.rubric) {
+            (Some(c), _) => (Some(c.as_str()), None),
+            (_, Some(r)) => (None, Some(r.as_path())),
             _ => bail!("no verifier (validate() should have caught this)"),
-        }
-        let out = self.capture(&args)?;
-        // The `score --json` envelope deserializes into `Scored` (extra
-        // version/session/seq keys ignored) — a wire-contract change is a compile
-        // error, not a silent default.
-        serde_json::from_str(&out).with_context(|| format!("parse `score --json`: {out:?}"))
-    }
-
-    /// Run a subcommand, require success, return stdout.
-    fn capture(&self, args: &[String]) -> Result<String> {
-        let out = Command::new(&self.exe)
-            .args(args)
-            .output()
-            .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
-        if !out.status.success() {
-            bail!(
-                "`pillbox {}` failed ({}): {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    /// Run a subcommand for its exit status only; its stdout banner is discarded
-    /// so eval's own `--json` stays pure.
-    fn status(&self, args: &[String]) -> Result<()> {
-        self.capture(args).map(|_| ())
+        };
+        let outcome = session::score(
+            self.resolved,
+            id,
+            &ScoreRequest {
+                cmd,
+                rubric,
+                workspace: Some(&ws),
+                ..Default::default()
+            },
+        )?;
+        Ok(outcome.scored)
     }
 }
 
@@ -517,6 +509,49 @@ mod tests {
         let spec: EvalSpec = toml::from_str(s)?;
         spec.validate()?;
         Ok(spec)
+    }
+
+    #[test]
+    fn run_opts_mirror_the_cli_flags_a_variant_implies() {
+        let spec = parse(
+            r#"
+            name = "t"
+            prompt = "p"
+            from_bookmark = "base"
+            [verify]
+            cmd = "true"
+            [[variants]]
+            name = "a"
+            model = "p/m"
+            temperature = 0.0
+            memory = true
+            mcp = ["docs=https://x.example/mcp"]
+            "#,
+        )
+        .unwrap();
+        let o = run_opts(&spec, &spec.resolved_variants()[0]).unwrap();
+        assert!(o.detach && o.memory && !o.json && !o.vault);
+        assert_eq!(o.from_bookmark.as_deref(), Some("base"));
+        assert!(o.workspace.is_none());
+        assert_eq!(o.model.as_deref(), Some("p/m"));
+        assert_eq!(o.temperature, Some(0.0));
+        assert_eq!(o.mcps.len(), 1);
+        assert!(o.args.is_empty());
+    }
+
+    #[test]
+    fn run_opts_carries_the_workspace_and_rejects_a_bad_mcp() {
+        let spec =
+            parse("name = \"t\"\nprompt = \"p\"\nworkspace = \"/w\"\n[verify]\ncmd = \"true\"\n")
+                .unwrap();
+        let v = spec.resolved_variants()[0].clone();
+        let o = run_opts(&spec, &v).unwrap();
+        assert_eq!(o.workspace, Some(PathBuf::from("/w")));
+        let bad = Variant {
+            mcp: vec!["nourl".into()],
+            ..v
+        };
+        assert!(run_opts(&spec, &bad).is_err());
     }
 
     #[test]

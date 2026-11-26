@@ -11,9 +11,11 @@ every run with the same verifier, and emits a machine-readable comparison plus a
 ## What it is (and isn't)
 
 It's the spec-driven, first-class front-end over primitives pillbox already has —
-each cell is the same `run --detach --json` → `session send` → `session
-wait-idle` → `session score` chain `dispatch` and the bash eval rig
-(`scripts/eval/*`) use. The new bits are the **declarative spec** and the
+each cell is the same run → send → wait-idle → score chain `dispatch` and the
+bash eval rig (`scripts/eval/*`) use, driven in-process through the typed
+session calls (`commands::run::start`, `session::send`, `stream::wait_idle`,
+`session::workspace_of`, `session::score`) rather than by self-exec'ing the
+binary. The new bits are the **declarative spec** and the
 **variant × trial matrix**.
 
 It does **not** reimplement the variance statistics: `eval` emits records in the
@@ -122,7 +124,7 @@ The hard-won lessons the σ̂ campaigns paid for (see
 ## Limits (v1)
 
 - **libkrun-only grading** — like `dispatch`, `eval` scores each run's *live*
-  workspace clone (`session info --json` → `.session.workspace`), which only
+  workspace clone (`session::workspace_of`), which only
   libkrun sessions populate. A docker path (pull-then-score) is the same deferred
   resolution noted in [dispatch.md](./dispatch.md).
 - **`cost` is 0** in the records — usage capture is an additive follow-up; it's
@@ -131,7 +133,7 @@ The hard-won lessons the σ̂ campaigns paid for (see
   the agent's own scaffold bounds turns).
 - A live end-to-end **smoke** (mirroring `scripts/smoke/dispatch.sh`) is the
   follow-up that exercises the run loop on real VMs; the loop reuses dispatch's
-  live-proven run→drive→grade subprocess chain, and the spec/validation/summary
+  same run→drive→grade chain (now the typed in-process calls), and the spec/validation/summary
   are unit + CLI tested.
 
 ## Relationship to other verbs

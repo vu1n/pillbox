@@ -336,8 +336,6 @@ pub(crate) struct ServedRunProfile {
 }
 
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
-// Reported limits must name at least one limit; the schema says so to match the Deserialize below.
-#[cfg_attr(feature = "contract-schema", schemars(extend("minProperties" = 1)))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EffectiveRuntimeLimits {

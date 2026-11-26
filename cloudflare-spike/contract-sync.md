@@ -63,8 +63,8 @@ Both npm scripts run `scripts/gen-contract.mjs`, which holds the json2ts options
 ## What the TS types do not check
 
 The types carry shapes only. Rust's hand-written decode checks (for example
-`EffectiveRuntimeLimits` must name at least one limit; the schema records it as
-`minProperties`, which json2ts does not render) and integer ranges (`u64` becomes
+a reported `EffectiveRuntimeLimits` must name at least one limit, a rule
+only its hand-written `Deserialize` holds) and integer ranges (`u64` becomes
 `number`) are enforced when Rust reads the event, not by `tsc`.
 
 The `Payload` union is closed: a TS producer can emit only what `contract.rs`

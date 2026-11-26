@@ -857,8 +857,9 @@ fn commit_detached_session(
     Ok(child)
 }
 
-/// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
-/// reparented to init), hand it the reals on stdin, record the session, return.
+/// Start the microVM detached: spawn the VMM child so it outlives the caller (a
+/// waiter thread reaps it while the caller lives; init after), hand it the reals
+/// on stdin, record the session, return.
 /// No pump and no teardown (the clones + spec persist for the running VM;
 /// `kill_session` scrubs them). Codex starts one reparented transcript tailer
 /// after the record commits so repeated read commands never replay its rollout
@@ -953,8 +954,9 @@ fn run_detached(
             .with_context(|| format!("detached transcript tailer failed: {e:#}"))?;
         return Err(e).context("start detached session transcript tailer");
     }
-    // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
-    // init and keeps running.
+    // Don't wait: the child (VM + egress + MITM, with the vault) keeps running;
+    // a waiter thread reaps it if it exits while this process lives.
+    crate::sandbox::reap_detached(child);
     Ok(Started::Detached(session))
 }
 
@@ -1238,6 +1240,7 @@ fn launch_server_vm(
         }
     };
 
+    crate::sandbox::reap_detached(child);
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
     Ok(Started::ServerReady {
@@ -1866,6 +1869,7 @@ fn spawn_session_tailer(
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if crate::commands::session::detached_tailer_alive(resolved, session) {
+            crate::sandbox::reap_detached(child);
             return Ok(());
         }
         if let Some(status) = child

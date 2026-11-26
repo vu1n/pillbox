@@ -19,6 +19,7 @@ tests:
   - "src/sandbox/libkrun/boot.rs:boot_channel_binds_share_to_exec_and_writes_script"
   - "src/sandbox/libkrun/mod.rs:rootfs_tar_extraction_preserves_sticky_world_writable_mode"
   - "src/commands/run.rs:json_envelope_is_the_same_for_every_lifecycle"
+  - "src/sandbox/mod.rs:reap_detached_leaves_no_zombie"
   - "scripts/smoke/libkrun.sh"
 ---
 
@@ -45,4 +46,5 @@ With the macOS libkrun toolchain, runner image and agent auth prepared, build/si
 - GitHub macOS CI compiles/links and runs non-VM tests; it cannot prove HVF boot.
 - Fresh OCI exports still need Docker as image plumbing. That does not make the deprecated Docker execution backend a maintained alternative.
 - A rebuild can replace the signed binary; use the build/sign script before a manual VM run.
+- `run::start` also runs inside long-lived callers (dispatch, eval): a detached `__krun-vmm` or `__session-tailer` child must go to `sandbox::reap_detached`, never be dropped, or its exit leaves a zombie that signal-0 probes read as alive.
 - The egress fence logs its DNS and TLS decisions to `PILLBOX_KRUN_EGRESS_LOG`, else to a per-run file under `~/.pillbox/krun/egress/` (pruned after 14 days, capped at 4 MiB). A foreground run prints the hosts it refused when it ends; a shared `PILLBOX_KRUN_EGRESS_LOG` gets no summary, since it mixes runs.

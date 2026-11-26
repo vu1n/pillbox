@@ -34,6 +34,24 @@ use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
 use crate::session::{Backend, Session};
 
+/// Hand a detached child (a VMM or §0 tailer that outlives its launch call) to a
+/// waiter thread. The launch may run inside a long-lived caller (dispatch, eval),
+/// where a dropped `Child` that exits would stay a zombie of that caller.
+// A detached child is reaped by a waiter thread, so a dead child never reads as alive to signal-0 probes.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) fn reap_detached(mut child: std::process::Child) {
+    let reaper = std::thread::Builder::new()
+        .name(format!("reap-{}", child.id()))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    if let Err(error) = reaper {
+        eprintln!(
+            "pillbox: warning: could not start a reaper thread for a detached child: {error}"
+        );
+    }
+}
+
 /// What a backend can do — **declared, not chased**. The plane queries this to
 /// decide whether a verb is available on the current substrate, instead of
 /// discovering a `bail!("docker only")` buried in a command. Default = all
@@ -300,6 +318,22 @@ mod tests {
             BACKEND_DOCKER // docker is the long-lived-exec family
         } else {
             "libkrun"
+        }
+    }
+
+    #[test]
+    fn reap_detached_leaves_no_zombie() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        reap_detached(child);
+        // An unreaped exited child would keep answering signal-0 as a zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited detached child {pid} still answers signal-0 (zombie)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

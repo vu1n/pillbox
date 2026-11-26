@@ -20,6 +20,10 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
   `tool_policy` must be `deny_all` (HTTP 400 `unsupported_policy` otherwise). The
   D1 allowance is the cost breaker. A managed preview deployment now needs a new
   Pillbox-recorded burn-in, which does not exist yet.
+- Managed execution no longer admits the execution transport label
+  `cloudflare-service-binding`, which described only the deleted private RPC
+  caller. A public request carrying it now gets `unsupported_execution`, and no
+  in-repo client sends it.
 - Rename `docs/huddles-codex-execution.md` to `docs/codex-execution.md`.
 - `pillbox dispatch` grades every worker on a copy of its workspace inside the
   grader microVM, never on the host and never in the live tree. Tests, test

@@ -47,7 +47,7 @@ cd cloudflare-spike
 npm ci
 npm test
 npx tsc --noEmit
-python3 check-contract-parity.py
+npm run check:contract
 ../scripts/smoke/cf.sh
 ```
 

@@ -192,8 +192,8 @@ enum Command {
         memory: bool,
         /// Attach a shared MCP server to the sandbox. NAME is the
         /// identifier the agent sees in its tool list; URL must be
-        /// http:// or https://. A microVM reaches a server on the host's
-        /// loopback (localhost / 127.0.0.1 / [::1]:PORT, forwarded to the
+        /// http:// or https://. A microVM reaches an http:// server on the
+        /// host's loopback (localhost / 127.0.0.1:PORT, forwarded to the
         /// guest at the gateway) or an https:// URL on port 443 with a DNS
         /// host name, which joins its egress allowlist. Repeatable.
         #[arg(long = "mcp", value_name = "NAME=URL")]

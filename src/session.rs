@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_legacy_session_record_of_each_kind_loads_with_its_substrate_and_output_keys() {
-        let lk = r#"{"sock":"/tmp/x.sock","pid":1,"creds":"/tmp/c","workspace":"/tmp/w","spec":"/tmp/s.json","rootfs":null}"#;
+        let lk = r#"{"sock":"/tmp/x.sock","pid":1,"creds":"/tmp/c","workspace":"/tmp/w","spec":"/tmp/s.json"}"#;
         let mg =
             r#"{"endpoint":"https://w.example.workers.dev","execution_session_id":"abc123def456"}"#;
         for (backend, handle, extra, placement) in [
@@ -771,6 +771,7 @@ mod tests {
     fn the_substrate_table_precedes_the_server_table_and_round_trips() {
         let mut s = Session::test_fixture();
         s.substrate = Substrate::Managed(crate::sandbox::managed::ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.example.workers.dev".into(),
             execution_session_id: s.id.clone(),
         });

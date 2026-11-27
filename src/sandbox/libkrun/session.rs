@@ -487,6 +487,7 @@ impl PendingVm {
     /// The handle a record stores to find and tear this VM down later.
     pub(super) fn handle(&self, pid: i32) -> LibkrunHandle {
         LibkrunHandle {
+            extra: Default::default(),
             sock: self.sock.to_string_lossy().into_owned(),
             pid,
             creds: self.boot_share.to_string_lossy().into_owned(),
@@ -1220,7 +1221,7 @@ enum McpRoute {
 }
 
 /// Route one `--mcp` URL.
-// External MCP must be https://<dns-name>[:443] (the fence resolves allowlisted names and terminates only 443); host-loopback MCP is forwarded.
+// External MCP must be https://<dns-name>[:443] (the fence resolves allowlisted names and terminates only 443); http host-loopback MCP is forwarded.
 fn mcp_route(mcp: &crate::agents::McpAttachment) -> Result<McpRoute> {
     let refuse = |why: &str| -> anyhow::Error {
         PillboxError::usage(
@@ -1228,7 +1229,7 @@ fn mcp_route(mcp: &crate::agents::McpAttachment) -> Result<McpRoute> {
             format!(
                 "--mcp `{}` URL `{}` {why}; a microVM reaches an MCP server only at \
                  https://<dns-name>[:443]/… or on the host's loopback \
-                 (http(s)://localhost|127.0.0.1|[::1]:PORT/…)",
+                 (http://localhost|127.0.0.1:PORT/…)",
                 mcp.name, mcp.url
             ),
         )
@@ -1263,17 +1264,23 @@ fn mcp_route(mcp: &crate::agents::McpAttachment) -> Result<McpRoute> {
     if host.is_empty() {
         return Err(refuse("has no host"));
     }
-    if matches!(
-        host.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "[::1]"
-    ) {
-        let port = port
-            .or(match scheme {
-                "http" => Some(80),
-                "https" => Some(443),
-                _ => None,
-            })
-            .ok_or_else(|| refuse("is not http(s)"))?;
+    let host_lower = host.to_ascii_lowercase();
+    // The forward dials the host's 127.0.0.1 only.
+    if host_lower == "[::1]" {
+        return Err(refuse(
+            "names the host's IPv6 loopback, but the forward reaches the host's 127.0.0.1; \
+             bind the server there and use localhost or 127.0.0.1",
+        ));
+    }
+    if matches!(host_lower.as_str(), "localhost" | "127.0.0.1") {
+        // The guest reaches the host as the gateway address, which no loopback server's certificate names.
+        if scheme != "http" {
+            return Err(refuse(
+                "is not http on the host's loopback: the guest reaches the host as the gateway \
+                 address so the server's certificate won't match; serve it over http on loopback",
+            ));
+        }
+        let port = port.unwrap_or(80);
         // The gateway's own DNS and TLS listeners own these ports.
         if port == egress::DNS_PORT || port == 443 {
             return Err(refuse("uses a port the microVM gateway reserves (53, 443)"));
@@ -3588,6 +3595,7 @@ mod tests {
     fn libkrun_pty_session() -> Session {
         let mut s = Session::test_fixture();
         s.substrate = crate::sandbox::Substrate::Libkrun(Some(LibkrunHandle {
+            extra: Default::default(),
             sock: "/nonexistent/pillbox-test-attach.sock".to_string(),
             pid: 0,
             creds: "/nonexistent/pillbox-test-creds".to_string(),
@@ -3672,6 +3680,7 @@ mod tests {
             let spawned = SpawnedVm {
                 child,
                 handle: LibkrunHandle {
+                    extra: Default::default(),
                     sock: sock.to_string_lossy().into_owned(),
                     pid: group,
                     creds: creds.to_string_lossy().into_owned(),
@@ -4274,7 +4283,9 @@ mod tests {
             ("https://[2001:db8::1]/mcp", "IP address"),
             ("https://mem0.localhost/mcp", "loopback host other than"),
             ("http://127.5.5.5:7777/mcp", "is not https"),
-            ("https://localhost/mcp", "reserves"),
+            ("https://localhost/mcp", "certificate won't match"),
+            ("https://127.0.0.1:8443/mcp", "serve it over http"),
+            ("http://[::1]:9000/mcp/", "127.0.0.1"),
             ("http://localhost:53/", "reserves"),
             ("http://localhost:0/", "invalid port"),
         ] {
@@ -4297,16 +4308,11 @@ mod tests {
                 format!("http://{gw}:7777/mcp?x=1"),
             ),
             ("http://127.0.0.1:8000", 8000, format!("http://{gw}:8000")),
-            (
-                "http://[::1]:9000/mcp/",
-                9000,
-                format!("http://{gw}:9000/mcp/"),
-            ),
             ("http://LOCALHOST/", 80, format!("http://{gw}:80/")),
             (
-                "https://u:p@localhost:8443/m",
+                "http://u:p@localhost:8443/m",
                 8443,
-                format!("https://u:p@{gw}:8443/m"),
+                format!("http://u:p@{gw}:8443/m"),
             ),
         ] {
             assert_eq!(

@@ -230,6 +230,7 @@ impl ManagedBackend {
         //    execution session id + (later) the result handle — NEVER the creds or password,
         //    which are re-resolved from env via `workspace()` on every run.
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: endpoint.clone(),
             execution_session_id: session_id.clone(),
         };
@@ -473,6 +474,9 @@ pub(crate) struct ManagedHandle {
     /// retired gateway client without preserving gateway semantics.
     #[serde(alias = "do_session_id")]
     pub(crate) execution_session_id: String,
+    // Fields a newer pillbox wrote are kept, so rewriting the record never drops them.
+    #[serde(flatten)]
+    pub(crate) extra: toml::Table,
 }
 
 impl ManagedHandle {
@@ -1641,6 +1645,7 @@ mod tests {
     #[test]
     fn managed_handle_round_trips_through_the_substrate() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "abc123def456".into(),
         };
@@ -1655,6 +1660,7 @@ mod tests {
     #[test]
     fn managed_handle_rejects_record_and_origin_mismatch() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "def456abc123".into(),
         };
@@ -1664,6 +1670,7 @@ mod tests {
         assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
 
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://other.workers.dev".into(),
             execution_session_id: session.id.clone(),
         };
@@ -1694,6 +1701,7 @@ mod tests {
     #[test]
     fn unsupported_verbs_reject_with_clear_errors() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "sess-do".into(),
         };
@@ -1794,6 +1802,7 @@ mod tests {
     #[test]
     fn persisted_record_excludes_creds_and_password() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "sess-do".into(),
         };

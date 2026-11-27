@@ -92,7 +92,7 @@ impl SubstrateKind {
 /// persistent attach socket (libkrun-bound for the guest's listen) to reattach to,
 /// the VMM child PID, and the CoW clones + spec file to scrub on teardown. The
 /// detached child + these artifacts outlive the launching CLI.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LibkrunHandle {
     /// Host unix socket libkrun binds for the guest's listening vsock port.
     pub(crate) sock: String,
@@ -105,8 +105,12 @@ pub(crate) struct LibkrunHandle {
     /// Persisted VmSpec path: the unique attribution key teardown reaps by.
     pub(crate) spec: String,
     /// Private rootfs clone, removed once the VMM is confirmed stopped.
-    #[serde(default)]
+    // Absent stays absent: a handle written without `rootfs` reads back and echoes the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rootfs: Option<String>,
+    // Fields a newer pillbox wrote are kept, so rewriting the record never drops them.
+    #[serde(flatten)]
+    pub(crate) extra: toml::Table,
 }
 
 /// What a record runs on, with the handle that finds it again.
@@ -117,8 +121,9 @@ pub(crate) enum Substrate {
     Libkrun(Option<LibkrunHandle>),
     /// A managed-tier session.
     Managed(ManagedHandle),
-    /// A record left by a removed or unknown backend (docker, e2b, …), or with an
-    /// undecodable handle: listable and removable, never driven.
+    /// A record left by a removed or unknown backend (docker, e2b, …), with an
+    /// undecodable handle, or on a substrate this pillbox doesn't know (written by
+    /// a newer one): listable and removable, never driven.
     Retired {
         /// The backend label the record was written with.
         backend: String,
@@ -126,6 +131,8 @@ pub(crate) enum Substrate {
         handle: String,
         /// Why pillbox can't drive it, completing "it can't be driven: …".
         why: String,
+        /// The `[substrate]` table of a kind this pillbox doesn't know, kept verbatim.
+        stored: Option<toml::Table>,
     },
 }
 
@@ -185,28 +192,47 @@ impl Substrate {
         }
     }
 
-    /// Decode a stored substrate: a `[substrate]` table's `kind` and its other fields.
-    fn decode(kind: &str, fields: serde_json::Map<String, serde_json::Value>) -> Self {
-        match kind {
-            "retired" => {
-                let text = |key: &str| {
-                    fields
-                        .get(key)
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                };
-                Self::Retired {
-                    backend: text("backend"),
-                    handle: text("handle"),
-                    why: text("why"),
-                }
-            }
-            LEGACY_LIBKRUN if fields.is_empty() => Self::Libkrun(None),
-            _ => {
-                let raw = serde_json::Value::Object(fields).to_string();
-                Self::from_legacy(kind, &raw)
-            }
+    /// Decode a stored `[substrate]` table.
+    fn decode(table: toml::Table) -> Self {
+        let text = |key: &str| {
+            table
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let kind = text("kind");
+        let mut fields = table.clone();
+        fields.remove("kind");
+        let retired = |why: String| Self::Retired {
+            backend: kind.clone(),
+            handle: serde_json::to_string(&fields).unwrap_or_default(),
+            why,
+            stored: None,
+        };
+        match kind.as_str() {
+            "retired" => Self::Retired {
+                backend: text("backend"),
+                handle: text("handle"),
+                why: text("why"),
+                stored: None,
+            },
+            STORED_LIBKRUN if fields.is_empty() => Self::Libkrun(None),
+            STORED_LIBKRUN => match toml::Value::Table(fields.clone()).try_into() {
+                Ok(handle) => Self::Libkrun(Some(handle)),
+                Err(e) => retired(format!("its libkrun handle can't be decoded ({e})")),
+            },
+            STORED_MANAGED => match toml::Value::Table(fields.clone()).try_into() {
+                Ok(handle) => Self::Managed(handle),
+                Err(e) => retired(format!("its managed handle can't be decoded ({e})")),
+            },
+            // A kind this pillbox doesn't know is kept verbatim, so writing the record back never destroys it.
+            _ => Self::Retired {
+                handle: serde_json::to_string(&fields).unwrap_or_default(),
+                why: format!("this pillbox doesn't know the `{kind}` substrate"),
+                backend: kind.clone(),
+                stored: Some(table),
+            },
         }
     }
 
@@ -218,6 +244,7 @@ impl Substrate {
             backend: backend.to_string(),
             handle: handle.to_string(),
             why,
+            stored: None,
         };
         match backend {
             LEGACY_LIBKRUN if handle.is_empty() => Self::Libkrun(None),
@@ -239,6 +266,9 @@ impl Substrate {
 const LEGACY_DOCKER: &str = "docker";
 const LEGACY_LIBKRUN: &str = "libkrun";
 const LEGACY_MANAGED: &str = "managed";
+/// The `kind`s a `[substrate]` table is written with.
+const STORED_LIBKRUN: &str = "libkrun";
+const STORED_MANAGED: &str = "managed";
 
 /// Rewrite a pre-substrate record (no `[substrate]` table) into the current shape:
 /// its `backend` + `handle_key` (`sandbox_id` for a session, `backend_ref` for a
@@ -286,9 +316,14 @@ impl Serialize for Substrate {
             },
             Self::Managed(handle) => Stored::Managed(handle),
             Self::Retired {
+                stored: Some(table),
+                ..
+            } => return table.serialize(serializer),
+            Self::Retired {
                 backend,
                 handle,
                 why,
+                stored: None,
             } => Stored::Retired {
                 backend,
                 handle,
@@ -301,14 +336,7 @@ impl Serialize for Substrate {
 
 impl<'de> Deserialize<'de> for Substrate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Raw {
-            kind: String,
-            #[serde(flatten)]
-            fields: serde_json::Map<String, serde_json::Value>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        Ok(Self::decode(&raw.kind, raw.fields))
+        Ok(Self::decode(toml::Table::deserialize(deserializer)?))
     }
 }
 
@@ -331,6 +359,7 @@ impl std::fmt::Display for Substrate {
                 backend,
                 handle,
                 why,
+                ..
             } => write!(f, "retired `{backend}` record, handle `{handle}` ({why})"),
         }
     }
@@ -346,6 +375,7 @@ mod tests {
 
     fn lk() -> LibkrunHandle {
         LibkrunHandle {
+            extra: Default::default(),
             sock: "/tmp/x.sock".into(),
             pid: 1,
             creds: "/tmp/c".into(),
@@ -357,6 +387,7 @@ mod tests {
 
     fn mg() -> ManagedHandle {
         ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.example.workers.dev".into(),
             execution_session_id: "aaaaaaaaaaa3".into(),
         }
@@ -414,6 +445,7 @@ mod tests {
                     backend: b,
                     handle,
                     why,
+                    ..
                 } => {
                     assert_eq!((b.as_str(), handle.as_str()), (backend, "container-abc"));
                     assert!(why.contains("can't be decoded"), "{why}");
@@ -454,6 +486,55 @@ mod tests {
         assert!(text.contains("sock = \"/tmp/x.sock\""), "{text}");
     }
 
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Rec {
+        id: String,
+        substrate: Substrate,
+    }
+
+    #[test]
+    fn a_substrate_of_an_unknown_kind_is_kept_verbatim() {
+        let text = "id = \"x\"\n\n[substrate]\ndisk = \"/q/d.img\"\nkind = \"qemu\"\npid = 7\n";
+        let record: Rec = toml::from_str(text).unwrap();
+        assert_eq!(record.substrate.kind(), None);
+        assert_eq!(record.substrate.label(), "qemu");
+        assert!(record
+            .substrate
+            .to_string()
+            .contains("doesn't know the `qemu` substrate"));
+        assert_eq!(toml::to_string(&record).unwrap(), text);
+    }
+
+    #[test]
+    fn a_managed_handle_written_with_do_session_id_still_decodes() {
+        let text = "id = \"x\"\n\n[substrate]\ndo_session_id = \"aaaaaaaaaaa3\"\nendpoint = \"https://w.example.workers.dev\"\nkind = \"managed\"\n";
+        let record: Rec = toml::from_str(text).unwrap();
+        assert_eq!(record.substrate, Substrate::Managed(mg()));
+    }
+
+    #[test]
+    fn a_handle_field_from_a_newer_pillbox_survives_a_rewrite() {
+        for kind in ["libkrun", "managed"] {
+            let fields = match kind {
+                "libkrun" => "creds = \"/tmp/c\"\npid = 1\nsock = \"/tmp/x.sock\"\nspec = \"/tmp/s.json\"\nworkspace = \"/tmp/w\"\n",
+                _ => "endpoint = \"https://w.example.workers.dev\"\nexecution_session_id = \"aaaaaaaaaaa3\"\n",
+            };
+            let text = format!("id = \"x\"\n\n[substrate]\n{fields}future_field = \"keep me\"\nkind = \"{kind}\"\n");
+            let mut record: Rec = toml::from_str(&text).unwrap();
+            assert_eq!(
+                record.substrate.kind().map(SubstrateKind::label),
+                Some(kind)
+            );
+            // A read-modify-write, like `mark_attached`.
+            record.id = "y".into();
+            let written = toml::to_string(&record).unwrap();
+            assert!(written.contains("future_field = \"keep me\""), "{written}");
+            let want: toml::Table =
+                toml::from_str(&text.replacen("id = \"x\"", "id = \"y\"", 1)).unwrap();
+            assert_eq!(toml::from_str::<toml::Table>(&written).unwrap(), want);
+        }
+    }
+
     #[test]
     fn derived_keys_match_the_pre_substrate_output() {
         let libkrun = Substrate::Libkrun(Some(lk()));
@@ -461,8 +542,8 @@ mod tests {
             (libkrun.label(), libkrun.placement()),
             ("libkrun", Some("local"))
         );
-        // The handle's JSON, as the record wrote it before (`rootfs` included).
-        assert_eq!(libkrun.handle_text(), LK.replace('}', r#","rootfs":null}"#));
+        // The handle's JSON, as the record wrote it before (no `rootfs` key when it had none).
+        assert_eq!(libkrun.handle_text(), LK);
         let managed = Substrate::Managed(mg());
         assert_eq!(
             (managed.label(), managed.placement()),

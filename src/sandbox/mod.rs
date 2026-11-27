@@ -713,6 +713,7 @@ mod tests {
     fn live_session_dispatches_managed_to_the_execution_runtime() {
         let mut s = Session::test_fixture();
         s.substrate = Substrate::Managed(managed::ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.example.workers.dev".into(),
             execution_session_id: s.id.clone(),
         });
@@ -746,6 +747,7 @@ mod tests {
             .into_iter()
             .map(|backend| sandbox_record(Substrate::from_legacy(backend, "container-abc")))
             .chain([sandbox_record(Substrate::Managed(managed::ManagedHandle {
+                extra: Default::default(),
                 endpoint: "https://w.example.workers.dev".into(),
                 execution_session_id: "abcdef012345".into(),
             }))])

@@ -1715,6 +1715,7 @@ mod tests {
         use crate::sandbox::Substrate;
         let mut s = session::Session::test_fixture();
         let managed = Substrate::Managed(crate::sandbox::managed::ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.example.workers.dev".into(),
             execution_session_id: s.id.clone(),
         });

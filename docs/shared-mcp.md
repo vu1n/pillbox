@@ -44,8 +44,8 @@ then `pillbox run --mcp code-explore=http://localhost:8123`.
 --mcp NAME=URL                  Repeatable. Adds a shared MCP server.
                                 NAME: identifier shown to the agent
                                       ([A-Za-z][A-Za-z0-9_-]*).
-                                URL: http(s):// on the host's loopback
-                                (localhost / 127.0.0.1 / [::1]:PORT), or
+                                URL: http:// on the host's loopback
+                                (localhost / 127.0.0.1:PORT), or
                                 https://<dns-name>[:443]/… for a remote
                                 server.
 
@@ -88,10 +88,15 @@ The guest's `localhost` is not the host's, and the microVM's only network path
 is the egress gateway (`10.0.2.2`). Each URL is routed one of two ways; anything
 else is a usage error:
 
-- **Host loopback** — `http(s)://localhost|127.0.0.1|[::1]:PORT/…`. The gateway
+- **Host loopback** — `http://localhost|127.0.0.1:PORT/…`. The gateway
   forwards `10.0.2.2:PORT` to the host's `127.0.0.1:PORT`, and the agent is
-  given the URL rewritten to `10.0.2.2:PORT`. Ports 53 and 443 are refused: the
-  gateway's own DNS and TLS listeners own them.
+  given the URL rewritten to `10.0.2.2:PORT`. Refused on this route:
+  - `https://` — the guest reaches the host as the gateway address, so the
+    server's certificate (issued for `localhost`) won't match. Serve it over
+    http on loopback; the traffic never leaves the host.
+  - `[::1]` — the forward reaches the host's `127.0.0.1`. Bind the server there
+    and use `localhost` or `127.0.0.1`.
+  - Ports 53 and 443 — the gateway's own DNS and TLS listeners own them.
 - **Remote** — `https://<dns-name>[:443]/…`. The host name joins the run's
   egress allowlist, so the fence resolves it and the gateway's TLS leg carries
   it. Plain `http://`, a port other than 443, an IP address, or another

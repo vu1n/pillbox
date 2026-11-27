@@ -675,6 +675,7 @@ mod tests {
         let spec = dir.join("pillbox-krun-spec-test.json");
         std::fs::write(&spec, "{}").unwrap();
         LibkrunHandle {
+            extra: Default::default(),
             sock: dir.join("exec.sock").to_string_lossy().into_owned(),
             pid: 0,
             creds: creds.to_string_lossy().into_owned(),

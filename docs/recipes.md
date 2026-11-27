@@ -113,17 +113,18 @@ with `--name`).
 
 ## Multi-repo workspace
 
+The microVM shares exactly one host directory, the workspace (`--mount` is
+refused). Put the repos side by side under one directory and make that the
+workspace:
+
 ```sh
-cd ~/work/primary
-pillbox run \
-  --name primary \
-  --mount ~/work/lib-a:/workspace/lib-a \
-  --mount ~/work/lib-b:/workspace/lib-b \
-  --env stage
+# ~/work/stack/{primary,lib-a,lib-b}
+pillbox run --workspace ~/work/stack --name stack --env stage
 ```
 
-Inside the sandbox: `/workspace/primary`, `/workspace/lib-a`,
-`/workspace/lib-b`, all writable. The agent starts in `primary`.
+Inside the sandbox: `/workspace/stack/primary`, `/workspace/stack/lib-a`,
+`/workspace/stack/lib-b`, in the run's copy-on-write clone of `~/work/stack`.
+The agent starts in `/workspace/stack`.
 
 ## Reading a stored secret out for another tool
 

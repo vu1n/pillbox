@@ -820,19 +820,21 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
       sets `VsockAttach.listen` when `opts.detach`; `pty-host --vsock-listen`
       (`attach/host.rs`) binds `AF_VSOCK`/`VMADDR_CID_ANY` and serves an accept
       loop (a dropped client doesn't kill the live agent).
-    - **`run_detached`** persists the `VmSpec` tempfile (the child reads it *after*
+    - **`launch_detached`** persists the `VmSpec` tempfile (the child reads it *after*
       the parent returns), spawns the `__krun-vmm` child with null stdio (don't
       wait — it is a `sandbox::DetachedChild`, whose waiter thread reaps it if it exits while
       a long-lived caller such as dispatch lives; it reparents to init once the
       caller exits), pipes the real creds to its stdin (the
-      env-fork channel, unchanged), and writes a `Session` whose `sandbox_id` is a
-      JSON `LibkrunHandle { sock, pid, creds, workspace, spec }`. No cleanup on
-      return — the child owns the VM.
+      env-fork channel, unchanged), and writes a `Session` whose `[substrate]`
+      table is `kind = "libkrun"` plus the handle's fields (`sock`, `pid`,
+      `creds`, `workspace`, `spec`, and `rootfs` when it owns one). JSON output
+      reports that handle as `sandbox_id`. No cleanup on return — the child owns
+      the VM.
     - **`reattach`** decodes the handle, `UnixStream::connect`s the persistent
       sock, and runs the normal `pump::attach_terminal` (detach-enabled). **`kill_
       session`** `SIGKILL`s `handle.pid` + scrubs the sock/spec/creds/workspace
-      clones + drops the record. Dispatched from `commands/session.rs`
-      (`Backend::Libkrun` arms, cfg-gated).
+      clones + drops the record. `commands/session` reaches both through
+      `sandbox::live_session`, which picks the session's substrate.
     - **Live-verified** (`pillbox-runner:l6`): `run --detach` returned immediately
       with a live VMM child; `session list` showed `running/detached`; `session
       attach` connected over the port2-listen sock and rendered claude's UI **with

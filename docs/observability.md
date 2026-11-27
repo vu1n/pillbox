@@ -120,13 +120,10 @@ record, so `pillbox session events --json` is the baseline measurement surface.
   `session transcript` by hand — when an OTLP traces endpoint is
   configured, every `pillbox run` spawns this tailer automatically
   (alongside a whole-chat *conversation* synthesizer that feeds
-  Workshop's Overview). For the Docker backend the agent's `$HOME` is
-  bind-mounted to a host path, so the tailer runs **host-side** against
-  that path. For the libkrun microVM the guest tails its own filesystem
-  and streams the rendered §0 events back to the host over the vsock
-  channel; the host exporter ships them. Either way the collector is
-  reached from the host, so a local `localhost:5899` Workshop works
-  without any tunnel.
+  Workshop's Overview). The microVM's `$HOME` is the run's home clone, a
+  host directory the guest mounts, so the tailer runs **host-side** against
+  the transcript the agent writes there. The collector is reached from the
+  host, so a local `localhost:5899` Workshop works without any tunnel.
 
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel

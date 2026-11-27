@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_legacy_sandbox_record_migrates_to_its_substrate_and_rewrites_new() {
-        let lk = r#"{"sock":"/s","pid":7,"creds":"/c","workspace":"/w","spec":"/p","rootfs":null}"#;
+        let lk = r#"{"sock":"/s","pid":7,"creds":"/c","workspace":"/w","spec":"/p"}"#;
         for (backend, handle) in [("docker", "container-abc"), ("libkrun", lk), ("e2b", "x")] {
             let raw = format!(
                 "id = \"abcdef012345\"\nbackend = \"{backend}\"\nbackend_ref = '{handle}'\n\

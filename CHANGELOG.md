@@ -23,10 +23,26 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
   left behind and never runs `docker` for it), but every other verb refuses it.
   JSON output keeps the `backend`, `placement` and `sandbox_id` keys.
 - `--mcp`/`--mcp-token` work on the libkrun microVM for claude, codex and
-  opencode: a server on the host's loopback is forwarded to the guest at the
-  gateway, and a remote server must be `https://<dns-name>` on port 443 (its name
-  joins the egress allowlist). Other agents and the managed tier refuse `--mcp`
-  instead of ignoring it.
+  opencode: an `http://` server on the host's loopback (`localhost` /
+  `127.0.0.1`) is forwarded to the guest at the gateway, and a remote server must
+  be `https://<dns-name>` on port 443 (its name joins the egress allowlist).
+  `https://` or `[::1]` on loopback is refused. Other agents and the managed tier
+  refuse `--mcp` instead of ignoring it.
+- **Downgrade breaks record listing:** a session or sandbox record written by
+  this version (any new record, or an old one this version rewrote) can't be
+  read by an older pillbox, so its `session list` / `sandbox list` fail until
+  those records are removed. A record whose `[substrate]` kind this version
+  doesn't know (written by a newer pillbox) is listed and removable, and is
+  written back unchanged; handle fields it doesn't know are kept too.
+- An unrecognized `PILLBOX_BACKEND` value now exits 2 instead of being ignored;
+  the valid values are unset, `libkrun` and `managed`.
+- A legacy docker record reports `placement: null` in JSON output.
+- JSON `sandbox_id` for a pre-existing record is re-serialized from the decoded handle: a managed handle stored with `do_session_id` reports `execution_session_id`, and a libkrun handle stored with `"rootfs":null` reports no `rootfs` key.
+- `session info` text shows one `substrate:` line instead of `backend:` and
+  `sandbox_id:` lines.
+- `pillbox sidecar` no longer answers 401 to bearer requests on provider hosts:
+  it holds no credentials and forwards them; provider OAuth token endpoints stay
+  refused (403).
 - `run --mount` and a preset `mount` are refused (exit 2) before anything
   launches, on every caller (CLI, presets, dispatch, eval): the microVM takes no
   extra host mounts, and since the Docker backend went nothing honored them.

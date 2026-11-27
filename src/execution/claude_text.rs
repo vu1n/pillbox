@@ -473,13 +473,14 @@ mod tests {
     #[test]
     fn missing_credential_fails_without_configuring_access() {
         let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join(".claude/.credentials.json");
         assert!(credentials(
-            &temp.path().join("missing.json"),
+            &missing,
             "invocation-1",
             Instant::now() + Duration::from_secs(2)
         )
         .is_err());
-        assert!(!temp.path().join("missing.json").exists());
+        assert!(!missing.exists());
     }
 
     #[test]

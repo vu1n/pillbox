@@ -1077,6 +1077,40 @@ fn cstr(s: &str) -> CString {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_home_whose_credential_is_hard_linked_still_stubs_in_its_clone() {
+        use std::os::unix::fs::MetadataExt;
+        crate::test_util::with_isolated_home("libkrun-hard-linked-creds", || {
+            let src = tempfile::tempdir().unwrap();
+            let home = src.path().join("home");
+            let creds = home.join(crate::agents::CLAUDE.cred_sentinel.path());
+            std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+            let real =
+                r#"{"claudeAiOauth":{"accessToken":"real-access","refreshToken":"real-refresh"}}"#;
+            std::fs::write(&creds, real).unwrap();
+            std::fs::hard_link(&creds, src.path().join("backup.json")).unwrap();
+            assert_eq!(std::fs::metadata(&creds).unwrap().nlink(), 2);
+
+            let (clone, pairs, access_stub) = super::stub_oauth_creds(
+                &home,
+                &crate::agents::CLAUDE,
+                &["api.anthropic.com".into()],
+            )
+            .expect("a hard-linked source credential still launches");
+            let cloned = clone.join(crate::agents::CLAUDE.cred_sentinel.path());
+            // The clone holds its own copy: one link, so the clone's hard-link refusal never fires.
+            assert_eq!(std::fs::metadata(&cloned).unwrap().nlink(), 1);
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].real, "real-access");
+            let text = std::fs::read_to_string(&cloned).unwrap();
+            assert!(!text.contains("real-access") && !text.contains("real-refresh"));
+            assert!(text.contains(access_stub.as_deref().unwrap()));
+            // The source home is untouched.
+            assert_eq!(std::fs::read_to_string(&creds).unwrap(), real);
+            std::fs::remove_dir_all(&clone).unwrap();
+        });
+    }
+
+    #[test]
     fn egress_refusals_lists_each_refused_name_once() {
         use super::egress::{deny_sni_line, nxdomain_line};
         let log = [

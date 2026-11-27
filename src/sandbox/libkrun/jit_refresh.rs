@@ -267,7 +267,8 @@ mod tests {
     #[test]
     fn arm_seeds_expiry_from_live_creds_and_matches_the_access_pair() {
         let dir = tempfile::tempdir().unwrap();
-        let creds_path = dir.path().join("creds.json");
+        let creds_path = dir.path().join(".claude/.credentials.json");
+        std::fs::create_dir_all(creds_path.parent().unwrap()).unwrap();
         let future_ms = now_unix_ms() + 8 * 60 * 60 * 1000;
         std::fs::write(
             &creds_path,
@@ -292,7 +293,8 @@ mod tests {
     #[test]
     fn arm_seeds_codex_expiry_from_access_jwt() {
         let dir = tempfile::tempdir().unwrap();
-        let creds_path = dir.path().join("auth.json");
+        let creds_path = dir.path().join(".codex/auth.json");
+        std::fs::create_dir_all(creds_path.parent().unwrap()).unwrap();
         let future_ms = ((now_unix_ms() + 8 * 60 * 60 * 1000) / 1000) * 1000;
         let access = codex_jwt(future_ms);
         std::fs::write(

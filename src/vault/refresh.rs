@@ -17,7 +17,7 @@
 //! owns only coordinated transport. The guest never receives a real refresh
 //! credential or a refresh response containing real tokens.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -113,8 +113,10 @@ fn pre_refresh_with_deadline(
     let Some(codec) = provider.oauth_codec() else {
         return Ok(None);
     };
+    let (home, creds) = home_and_creds(creds_path, agent_id)?;
     let store = TokenStore::new(
-        creds_path.to_path_buf(),
+        home,
+        creds,
         refresh_budget(deadline, PRE_REFRESH_LOCK_WAIT)?,
     );
     match store.begin(codec)? {
@@ -205,9 +207,36 @@ pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(S
 pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
     let provider = providers::provider_for(agent_id)?;
     let codec = provider.oauth_codec()?;
-    let text = std::fs::read_to_string(creds_path).ok()?;
-    let creds: Value = serde_json::from_str(&text).ok()?;
+    let (home, rel) = home_and_creds(creds_path, agent_id).ok()?;
+    let bytes = crate::guest_files::read(&home, rel).ok()??;
+    let creds: Value = serde_json::from_slice(&bytes).ok()?;
     codec.expiry_ms(&creds)
+}
+
+/// Split a creds path into the agent home and the agent's credential file under it.
+/// The home is the boundary the guest cannot move: everything below it is walked by
+/// fd and never through a link.
+fn home_and_creds(creds_path: &Path, agent_id: &str) -> Result<(PathBuf, &'static Path)> {
+    let rel = Path::new(
+        crate::agents::lookup("vault", agent_id)?
+            .cred_sentinel
+            .path(),
+    );
+    let home = creds_path
+        .ancestors()
+        .nth(rel.components().count())
+        .filter(|_| creds_path.ends_with(rel))
+        .ok_or_else(|| {
+            PillboxError::runtime(
+                "vault",
+                format!(
+                    "{} is not `{}` under an agent home",
+                    creds_path.display(),
+                    rel.display()
+                ),
+            )
+        })?;
+    Ok((home.to_path_buf(), rel))
 }
 
 /// We won the race: POST the refresh grant exactly once, then resolve the guard.
@@ -455,9 +484,13 @@ mod tests {
     fn bounded_refresh_lock_wait_obeys_the_invocation_deadline_without_sending() {
         use std::os::fd::AsRawFd;
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("missing.json");
-        let lock =
-            std::fs::File::create(temp.path().join("missing.json.pillbox-rotation.lock")).unwrap();
+        std::fs::create_dir(temp.path().join(".claude")).unwrap();
+        let path = temp.path().join(".claude/.credentials.json");
+        let lock = std::fs::File::create(
+            temp.path()
+                .join(".claude/.credentials.json.pillbox-rotation.lock"),
+        )
+        .unwrap();
         // SAFETY: flock only uses the live file descriptor and holds no Rust references.
         assert_eq!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -471,7 +504,7 @@ mod tests {
         assert!(!path.exists());
         assert!(!temp
             .path()
-            .join("missing.json.pillbox-rotation.json")
+            .join(".claude/.credentials.json.pillbox-rotation.json")
             .exists());
         assert_eq!(
             refresh_budget(None, REFRESH_HTTP_TIMEOUT).unwrap(),
@@ -813,7 +846,8 @@ mod tests {
     #[test]
     fn pre_refresh_coalesces_fresh_codex_without_network() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
+        std::fs::create_dir(dir.path().join(".codex")).unwrap();
+        let path = dir.path().join(".codex/auth.json");
         let creds = serde_json::json!({
             "tokens": {
                 "access_token": codex_jwt(unix_now_ms() + 24 * 60 * 60 * 1000),

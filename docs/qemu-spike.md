@@ -5,7 +5,7 @@ is cross-platform too (Mac/HVF + Linux/KVM — the "macOS-only" reading was just
 `clonefile` + a missing `make BLK=1 NET=1` flag), the only thing QEMU adds is
 running *without* hardware virt (TCG). And **QEMU in TCG (software emulation) is
 too slow** to be worth it. libkrun stays THE backend; the `SandboxBackend` /
-`LiveSession` seam stays open so QEMU (or docker, or another) can be added later
+`LiveSession` seam stays open so QEMU (or another microVM) can be added later
 if a no-hardware-virt target ever justifies it. The rest of this doc is the
 preserved analysis for that future revisit.
 

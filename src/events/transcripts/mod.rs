@@ -40,11 +40,11 @@ use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 mod claude;
 mod codex;
 mod contract_map;
-mod local;
+pub(crate) mod local;
 mod synth;
 mod tailer;
 
-pub(crate) use local::{spawn_attach_tailer, spawn_session_observability, TailerHandle};
+pub(crate) use local::TailerHandle;
 pub(crate) use tailer::{Tailer, TranscriptSource};
 
 /// Which agent harness wrote the transcript. Drives which per-line

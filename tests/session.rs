@@ -514,8 +514,8 @@ fn rm_unknown_session_errors() {
 #[test]
 fn rm_unsupported_backend_drops_orphaned_record() {
     // A pre-pivot remote session (e2b/ssh/remote-docker — backends since
-    // removed) must still be removable: we can't reach its sandbox, but
-    // `session rm` should drop the orphaned record with a warning, not error.
+    // removed) is a retired record: `session rm` drops it and says what it
+    // left behind, rather than erroring.
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
@@ -530,8 +530,64 @@ fn rm_unsupported_backend_drops_orphaned_record() {
     let out = run(home.path(), cwd.path(), &["session", "rm", "abcdef555555"]);
     assert_ok(&out, "session rm of unsupported-backend record");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("unsupported backend"), "got: {stderr}");
+    assert!(stderr.contains("retired `e2b` record"), "got: {stderr}");
+    assert!(stderr.contains("dropped its record"), "got: {stderr}");
     assert!(!record.exists(), "orphaned record should be dropped");
+}
+
+#[test]
+fn a_legacy_docker_session_lists_and_removes_without_running_docker() {
+    // A record the removed Docker backend left: listed with its backend, removed
+    // with the container named for manual cleanup — and pillbox never runs
+    // `docker` for it (a `docker` on PATH that records any call stays silent).
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    assert_ok(&run(home.path(), cwd.path(), &["init"]), "init");
+    let dir = home.path().join(".pillbox/global/sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("abcdef666666.toml");
+    fs::write(
+        &record,
+        "id = \"abcdef666666\"\nbackend = \"docker\"\nsandbox_id = \"0123456789ab\"\n\
+         pty_pid = 0\nagent_id = \"claude\"\nstarted_at = \"2026-05-21T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let bin = TempDir::new().unwrap();
+    let called = bin.path().join("docker-called");
+    let fake = bin.path().join("docker");
+    fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", called.display())).unwrap();
+    fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let env = [("PATH", path.as_str())];
+
+    let out = common::run_with_env(
+        home.path(),
+        cwd.path(),
+        &env,
+        &["session", "list", "--json"],
+    );
+    assert_ok(&out, "session list --json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json");
+    let session = &parsed["sessions"][0];
+    assert_eq!(session["backend"], "docker");
+    assert_eq!(session["sandbox_id"], "0123456789ab");
+    assert!(session["placement"].is_null(), "{session}");
+
+    let out = common::run_with_env(
+        home.path(),
+        cwd.path(),
+        &env,
+        &["session", "rm", "abcdef666666"],
+    );
+    assert_ok(&out, "session rm of a docker record");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("docker rm -f 0123456789ab"),
+        "got: {stderr}"
+    );
+    assert!(!record.exists(), "the docker record should be dropped");
+    assert!(!called.exists(), "pillbox ran docker for a retired record");
 }
 
 #[test]

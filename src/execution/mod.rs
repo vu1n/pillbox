@@ -1,31 +1,18 @@
 //! Bounded repository execution is a separate protocol from managed execution/2.
-#![cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod claude_text;
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod evidence;
 pub(crate) mod files;
+// Only the execution drivers that launch a libkrun microVM are gated on the substrate.
 #[cfg(feature = "libkrun")]
-pub(crate) mod local;
-#[cfg(any(feature = "libkrun", test))]
+pub(crate) mod microvm;
 pub(crate) mod native;
 pub(crate) mod opencode;
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod pi_text;
-#[cfg(feature = "libkrun")]
-pub(crate) mod probe;
 pub(crate) mod protocol;
 pub(crate) mod snapshot;
 pub(crate) mod store;
-#[cfg(feature = "libkrun")]
-pub(crate) mod text;
-#[cfg(feature = "libkrun")]
-pub(crate) mod text_opencode;
-#[cfg(feature = "libkrun")]
-pub(crate) mod text_v2;
 pub(crate) mod usage;
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod verifier;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -34,6 +21,32 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use files::{FileLimits, FileOperation, FilePolicy};
+
+/// A caller must not seal a terminal result when this marker is in the error
+/// chain: process ownership still needs recovery and sampling must not restart.
+#[derive(Debug)]
+pub(crate) struct TeardownUnconfirmed;
+
+impl std::fmt::Display for TeardownUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("owned execution teardown was not confirmed")
+    }
+}
+
+impl std::error::Error for TeardownUnconfirmed {}
+
+/// The project verifier probe ran and did not pass: `pillbox` exits 1 after
+/// printing its JSON record.
+#[derive(Debug)]
+pub(crate) struct ProbeExit;
+
+impl std::fmt::Display for ProbeExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("project verifier probe did not pass; see the JSON record")
+    }
+}
+
+impl std::error::Error for ProbeExit {}
 
 pub(crate) const CONTRACT_VERSION: &str = "pillbox.execution/3";
 pub(crate) const MANIFEST_VERSION: &str = "pillbox.repository/1";

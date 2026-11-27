@@ -10,10 +10,9 @@ use serde_json::{json, Value};
 
 use super::usage::TurnUsage;
 
+// The microVM launch half; the request resolution and frame parsing above it build everywhere.
 #[cfg(feature = "libkrun")]
-mod local;
-#[cfg(feature = "libkrun")]
-pub(crate) use local::execute;
+pub(crate) mod local;
 
 pub(crate) const ADAPTER_REVISION: &str = "pillbox/claude-text-v1";
 pub(crate) const PROVIDER_HOST: &str = "api.anthropic.com";
@@ -474,13 +473,14 @@ mod tests {
     #[test]
     fn missing_credential_fails_without_configuring_access() {
         let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join(".claude/.credentials.json");
         assert!(credentials(
-            &temp.path().join("missing.json"),
+            &missing,
             "invocation-1",
             Instant::now() + Duration::from_secs(2)
         )
         .is_err());
-        assert!(!temp.path().join("missing.json").exists());
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -646,7 +646,7 @@ mod tests {
     #[cfg(feature = "libkrun")]
     #[test]
     fn unconfirmed_teardown_marker_survives_reported_usage_context() {
-        use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
+        use crate::execution::TeardownUnconfirmed;
         let mut usage = None;
         let result = finish_native(Ok(fake(&frames("hello"), 32768)), &mut usage, || {
             Err(anyhow::Error::new(TeardownUnconfirmed))
@@ -654,14 +654,14 @@ mod tests {
         let error = result
             .err()
             .unwrap()
-            .context(super::super::text::FailedStage {
+            .context(crate::execution::microvm::text::FailedStage {
                 stage: "turn",
                 usage,
             });
         assert!(error.is::<TeardownUnconfirmed>());
         assert_eq!(
             error
-                .downcast_ref::<super::super::text::FailedStage>()
+                .downcast_ref::<crate::execution::microvm::text::FailedStage>()
                 .unwrap()
                 .usage
                 .as_ref()

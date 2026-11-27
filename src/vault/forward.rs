@@ -1,9 +1,9 @@
-//! SSRF-guarded forward connector for the docker vault broker.
+//! SSRF-guarded forward connector for the `pillbox sidecar` egress proxy.
 //!
 //! hudsucker's `with_rustls_connector` dials the real upstream through a default
 //! `HttpConnector` whose resolver returns every A/AAAA record — including a name
 //! that (host-side) resolves to cloud metadata (169.254.169.254), the LAN,
-//! `10.0.0.0/8`, or loopback. The docker backend has no network fence (unlike
+//! `10.0.0.0/8`, or loopback. The sidecar has no network fence (unlike
 //! libkrun, whose smoltcp DNS fence pins names to the gateway), so this forward
 //! leg is the only thing between a rebound or allowlisted-internal name and an
 //! SSRF. We rebuild the same rustls connector around a resolver that drops

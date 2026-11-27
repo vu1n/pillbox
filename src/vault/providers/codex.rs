@@ -21,8 +21,7 @@
 //! yet (pillbox task #26).
 //!
 //! Intercepted hosts:
-//!  - `chatgpt.com` (exact + any subdomain) — bearer-token swap on every
-//!    request.
+//!  - `chatgpt.com` (exact + any subdomain) — bearer-token release.
 //!  - `chat.openai.com` — same.
 //!  - `auth.openai.com` — `/oauth/token` is intercepted and rejected locally
 //!    (verified against `codex-rs/login/src/auth/manager.rs`:
@@ -31,24 +30,8 @@
 //! `api.openai.com` is **not** intercepted in v0.5 — that's the API-key
 //! path, deferred until the ApiKey vault track lands.
 
-use std::path::Path;
-
-use async_trait::async_trait;
-use hudsucker::{
-    hyper::{
-        header::{HeaderValue, AUTHORIZATION},
-        Request,
-    },
-    Body, RequestOrResponse,
-};
-
-use super::{
-    host_from_uri, mint_stub, oauth_rotation_forbidden, unauthorized, HostProxyOAuthStub,
-    OAuthCodec, OAuthRefreshRequest, Registry, SandboxData, VaultProvider,
-};
-#[cfg(feature = "libkrun")]
+use super::{mint_stub, HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest, VaultProvider};
 use super::{LibkrunOAuthStub, OAuthRelease};
-use crate::vault::server::ServerInner;
 use crate::vault::token_store::RefreshDecider;
 
 const PROVIDER_ID: &str = "codex";
@@ -58,7 +41,6 @@ const CHATGPT_HOST_DOT: &str = ".chatgpt.com";
 const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 const AUTH_OPENAI_HOST: &str = "auth.openai.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
-const CREDS_PATH: &str = pillbox_credentials::CODEX.path();
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 
@@ -70,7 +52,6 @@ pub(crate) const STUB_REFRESH_PREFIX: &str = "pb-codex-ort-";
 
 pub(crate) struct CodexProvider;
 
-#[async_trait]
 impl VaultProvider for CodexProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
@@ -90,49 +71,12 @@ impl VaultProvider for CodexProvider {
         &[CHATGPT_HOST, CHAT_OPENAI_HOST, AUTH_OPENAI_HOST]
     }
 
-    fn creds_path(&self) -> &'static Path {
-        Path::new(CREDS_PATH)
-    }
-
     fn oauth_codec(&self) -> Option<&dyn OAuthCodec> {
         Some(self)
     }
 
     fn is_oauth_token_endpoint(&self, host: &str, path: &str) -> bool {
         host == AUTH_OPENAI_HOST && path.ends_with(OAUTH_TOKEN_PATH_SUFFIX)
-    }
-
-    fn provision(
-        &self,
-        sandbox_id: &str,
-        real: &serde_json::Value,
-        registry: &mut Registry,
-    ) -> Result<String, String> {
-        let stub = self.host_proxy_stub(sandbox_id, real)?;
-        let stub_json = serde_json::to_string_pretty(&stub.credentials)
-            .map_err(|error| format!("serialize stub auth.json: {error}"))?;
-
-        registry.insert(
-            sandbox_id.to_string(),
-            SandboxData {
-                provider_id: PROVIDER_ID,
-                real: real.clone(),
-                stubs: stub.stubs,
-            },
-        );
-
-        Ok(stub_json)
-    }
-
-    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
-        let host = host_from_uri(&req).unwrap_or_default();
-        if self.is_oauth_token_endpoint(&host, req.uri().path()) {
-            return oauth_rotation_forbidden().into();
-        }
-        // chatgpt.com / chat.openai.com / subdomains all use a Bearer
-        // access token in the Authorization header for codex-cli's
-        // backend calls.
-        handle_bearer_request(req, server).await
     }
 }
 
@@ -282,15 +226,11 @@ impl OAuthCodec for CodexProvider {
             .get_mut("tokens")
             .and_then(|v| v.as_object_mut())
             .ok_or_else(|| "tokens block missing during stub build".to_string())?;
-        tokens.insert("access_token".into(), access.clone().into());
-        tokens.insert("refresh_token".into(), refresh.clone().into());
-        Ok(HostProxyOAuthStub {
-            credentials,
-            stubs: vec![access, refresh],
-        })
+        tokens.insert("access_token".into(), access.into());
+        tokens.insert("refresh_token".into(), refresh.into());
+        Ok(HostProxyOAuthStub { credentials })
     }
 
-    #[cfg(feature = "libkrun")]
     fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
         let Some(tokens) = real.get_mut("tokens").and_then(|v| v.as_object_mut()) else {
             return LibkrunOAuthStub {
@@ -334,7 +274,6 @@ impl OAuthCodec for CodexProvider {
     }
 }
 
-#[cfg(feature = "libkrun")]
 fn mint_libkrun_access_stub() -> String {
     use base64::Engine as _;
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
@@ -348,59 +287,6 @@ fn mint_libkrun_access_stub() -> String {
         uuid::Uuid::now_v7().simple()
     );
     format!("{header}.{payload}.{signature}")
-}
-
-/// Swap stub bearer access_token → real bearer access_token on the way
-/// out to chatgpt.com / chat.openai.com.
-async fn handle_bearer_request(req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
-    let (mut parts, body) = req.into_parts();
-
-    let Some(auth_value) = parts.headers.get(AUTHORIZATION).cloned() else {
-        // No Authorization header — let upstream return its own error.
-        return Request::from_parts(parts, body).into();
-    };
-    let Ok(auth_str) = auth_value.to_str() else {
-        return unauthorized("non-utf8 authorization").into();
-    };
-    let Some(stub) = auth_str.strip_prefix("Bearer ") else {
-        return unauthorized("non-bearer authorization").into();
-    };
-
-    // Only swap stubs minted by this provider. If the stub doesn't carry
-    // the codex prefix, it's not ours — pass it through unchanged so we
-    // don't accidentally 401 a future provider's traffic if hosts ever
-    // overlap.
-    if !stub.starts_with(STUB_ACCESS_PREFIX) {
-        return Request::from_parts(parts, body).into();
-    }
-
-    let real_access = {
-        let registry = server.registry_lock();
-        let sandbox_id = match registry.sandbox_for_stub(stub) {
-            Some(s) => s.to_string(),
-            None => return unauthorized("unknown codex stub access token").into(),
-        };
-        registry
-            .real(&sandbox_id)
-            .and_then(|v| v.pointer("/tokens/access_token"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    };
-
-    if let Some(real) = real_access {
-        let new_value = format!("Bearer {real}");
-        match HeaderValue::from_str(&new_value) {
-            Ok(hv) => {
-                parts.headers.insert(AUTHORIZATION, hv);
-            }
-            Err(error) => {
-                eprintln!("pillbox: vault: invalid real codex access token header: {error}");
-                return unauthorized("invalid real token").into();
-            }
-        }
-    }
-
-    Request::from_parts(parts, body).into()
 }
 
 #[cfg(test)]
@@ -432,13 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn provision_chatgpt_mode_mints_stubs_and_preserves_unknown_fields() {
-        let mut registry = Registry::new();
-        let stub_json = CodexProvider
-            .provision("sbx-xyz", &sample_chatgpt_real(), &mut registry)
-            .expect("provision");
-
-        let parsed: serde_json::Value = serde_json::from_str(&stub_json).unwrap();
+    fn host_proxy_stub_chatgpt_mode_mints_stubs_and_preserves_unknown_fields() {
+        let parsed = CodexProvider
+            .host_proxy_stub("sbx-xyz", &sample_chatgpt_real())
+            .expect("stub")
+            .credentials;
+        let stub_json = parsed.to_string();
         let tokens = parsed.get("tokens").unwrap().as_object().unwrap();
         let access = tokens.get("access_token").and_then(|v| v.as_str()).unwrap();
         let refresh = tokens
@@ -478,18 +363,13 @@ mod tests {
             parsed.get("auth_mode").and_then(|v| v.as_str()),
             Some("ChatGPT")
         );
-
-        // Registry knows about both stubs.
-        assert_eq!(registry.sandbox_for_stub(access), Some("sbx-xyz"));
-        assert_eq!(registry.sandbox_for_stub(refresh), Some("sbx-xyz"));
     }
 
     #[test]
-    fn provision_apikey_mode_is_rejected_with_clear_message() {
-        let mut registry = Registry::new();
-        let err = CodexProvider
-            .provision("sbx-1", &sample_apikey_real(), &mut registry)
-            .unwrap_err();
+    fn host_proxy_stub_apikey_mode_is_rejected_with_clear_message() {
+        let Err(err) = CodexProvider.host_proxy_stub("sbx-1", &sample_apikey_real()) else {
+            panic!("ApiKey-mode auth.json must be refused");
+        };
         assert!(
             err.contains("ApiKey mode") && err.contains("task #26"),
             "expected ApiKey + task #26 hint, got: {err}"
@@ -497,13 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn provision_rejects_non_jwt_access_token() {
-        let mut registry = Registry::new();
+    fn host_proxy_stub_rejects_non_jwt_access_token() {
         let mut bad = sample_chatgpt_real();
         bad["tokens"]["access_token"] = serde_json::Value::String("notajwt".into());
-        let err = CodexProvider
-            .provision("sbx", &bad, &mut registry)
-            .unwrap_err();
+        let Err(err) = CodexProvider.host_proxy_stub("sbx", &bad) else {
+            panic!("a non-JWT access token must be refused");
+        };
         assert!(err.contains("JWT"), "got: {err}");
     }
 
@@ -518,182 +397,5 @@ mod tests {
         assert!(!p.intercept("api.openai.com"));
         assert!(!p.intercept("api.anthropic.com"));
         assert!(!p.intercept("openai.com"));
-    }
-
-    #[test]
-    fn creds_path_is_codex_auth_json() {
-        assert_eq!(CodexProvider.creds_path(), Path::new(".codex/auth.json"));
-    }
-
-    // ── End-to-end request integration tests ────────────────────────
-
-    use crate::vault::providers::test_support::{
-        body_bytes, build_request, cleanup, expect_request, expect_response, fresh_server,
-        sample_codex_real,
-    };
-    use hudsucker::Body;
-
-    fn stubs_for_sandbox(
-        server: &crate::vault::server::Server,
-        sandbox_id: &str,
-    ) -> (String, String) {
-        let registry = server.registry_lock_for_test();
-        let stubs = registry.stubs_for(sandbox_id).unwrap().to_vec();
-        let access = stubs
-            .iter()
-            .find(|s| s.starts_with(STUB_ACCESS_PREFIX))
-            .cloned()
-            .expect("access stub present");
-        let refresh = stubs
-            .iter()
-            .find(|s| s.starts_with(STUB_REFRESH_PREFIX))
-            .cloned()
-            .expect("refresh stub present");
-        (access, refresh)
-    }
-
-    #[tokio::test]
-    async fn bearer_request_swaps_stub_to_real_access_token() {
-        let (server, dir) = fresh_server().await;
-        let _lease = server
-            .lease("codex", "sbx-cx", sample_codex_real())
-            .expect("lease");
-        let (stub_access, _) = stubs_for_sandbox(&server, "sbx-cx");
-
-        let req = build_request(
-            "POST",
-            "https://chatgpt.com/backend-api/conversation",
-            Body::empty(),
-        );
-        let req = {
-            let (mut parts, body) = req.into_parts();
-            parts.headers.insert(
-                "authorization",
-                format!("Bearer {stub_access}").parse().unwrap(),
-            );
-            Request::from_parts(parts, body)
-        };
-
-        let out = CodexProvider
-            .handle_request(req, server.inner_for_test())
-            .await;
-        let out_req = expect_request(out, "codex bearer swap");
-        let auth = out_req
-            .headers()
-            .get("authorization")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(auth, format!("Bearer {FAKE_JWT}"));
-
-        drop(_lease);
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn bearer_with_unknown_codex_stub_returns_401() {
-        // Stub prefix matches codex's, so it's clearly ours, but it's
-        // not in the registry. Provider should reject.
-        let (server, dir) = fresh_server().await;
-        let req = build_request("POST", "https://chatgpt.com/", Body::empty());
-        let req = {
-            let (mut parts, body) = req.into_parts();
-            parts.headers.insert(
-                "authorization",
-                format!("Bearer {STUB_ACCESS_PREFIX}unknownStubSuffix")
-                    .parse()
-                    .unwrap(),
-            );
-            Request::from_parts(parts, body)
-        };
-
-        let out = CodexProvider
-            .handle_request(req, server.inner_for_test())
-            .await;
-        let res = expect_response(out, "codex unknown stub");
-        assert_eq!(res.status(), 401);
-        let bytes = body_bytes(res.into_body()).await;
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.contains("unknown codex stub access token"), "body: {s}");
-
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn bearer_without_codex_prefix_passes_through() {
-        // A bearer that doesn't start with `pb-codex-oat-` isn't ours.
-        // The codex provider documents that this should pass through —
-        // future-proof for overlapping hosts.
-        let (server, dir) = fresh_server().await;
-        let req = build_request("POST", "https://chatgpt.com/", Body::empty());
-        let req = {
-            let (mut parts, body) = req.into_parts();
-            parts.headers.insert(
-                "authorization",
-                "Bearer some-non-codex-token".parse().unwrap(),
-            );
-            Request::from_parts(parts, body)
-        };
-
-        let out = CodexProvider
-            .handle_request(req, server.inner_for_test())
-            .await;
-        let out_req = expect_request(out, "non-codex bearer pass-through");
-        assert_eq!(
-            out_req
-                .headers()
-                .get("authorization")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer some-non-codex-token"
-        );
-
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn bearer_without_auth_header_passes_through() {
-        let (server, dir) = fresh_server().await;
-        let req = build_request("GET", "https://chatgpt.com/api/health", Body::empty());
-
-        let out = CodexProvider
-            .handle_request(req, server.inner_for_test())
-            .await;
-        let out_req = expect_request(out, "codex no-auth pass-through");
-        assert!(out_req.headers().get("authorization").is_none());
-
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn oauth_refresh_request_is_rejected_without_releasing_token() {
-        let (server, dir) = fresh_server().await;
-        let _lease = server
-            .lease("codex", "sbx-cx-rt", sample_codex_real())
-            .expect("lease");
-        let (_, stub_refresh) = stubs_for_sandbox(&server, "sbx-cx-rt");
-        let req = Request::builder()
-            .method("POST")
-            .uri("https://auth.openai.com/oauth/token")
-            .header("content-type", "application/json")
-            .body(Body::from(format!(
-                r#"{{"grant_type":"refresh_token","refresh_token":"{stub_refresh}"}}"#
-            )))
-            .unwrap();
-        let res = expect_response(
-            CodexProvider
-                .handle_request(req, server.inner_for_test())
-                .await,
-            "broker-owned codex refresh",
-        );
-        assert_eq!(res.status(), 403);
-        let body = String::from_utf8(body_bytes(res.into_body()).await).unwrap();
-        assert!(body.contains("OAuth rotation is broker-owned"));
-        assert!(!body.contains(&stub_refresh));
-        assert!(!body.contains("rt_codex_real"));
-
-        drop(_lease);
-        cleanup(server, dir);
     }
 }

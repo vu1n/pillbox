@@ -26,7 +26,6 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,28 +111,51 @@ struct RotationState {
 }
 
 pub(crate) struct TokenStore {
-    creds_path: PathBuf,
-    state_path: PathBuf,
-    lock_path: PathBuf,
+    files: HomeFiles,
     max_lock_wait: Duration,
 }
 
+/// The creds file and its sidecars, as paths relative to the agent home. The
+/// `auth login` guest mounts that home read-write, so every access goes through
+/// [`crate::guest_files`] from the home root and never follows a link.
+#[derive(Clone)]
+struct HomeFiles {
+    home: PathBuf,
+    creds: PathBuf,
+    state: PathBuf,
+    lock: PathBuf,
+}
+
+impl HomeFiles {
+    fn shown(&self, rel: &Path) -> String {
+        self.home.join(rel).display().to_string()
+    }
+
+    fn replace(&self, rel: &Path, bytes: &[u8], sync: bool) -> Result<()> {
+        crate::guest_files::replace(&self.home, rel, bytes, 0o600, sync)
+            .with_context(|| format!("write {}", self.shown(rel)))
+    }
+}
+
 impl TokenStore {
-    /// `creds_path` is the vendor creds file (the agent's `cred_sentinel` under its
-    /// auth home). The lock + state sidecars live beside it.
-    pub(crate) fn new(creds_path: PathBuf, max_lock_wait: Duration) -> Self {
+    /// `creds` is the vendor creds file relative to the agent's auth `home` (its
+    /// `cred_sentinel`). The lock + state sidecars live beside it.
+    pub(crate) fn new(home: PathBuf, creds: &Path, max_lock_wait: Duration) -> Self {
         let sibling = |suffix: &str| {
-            let mut name = creds_path
+            let mut name = creds
                 .file_name()
                 .map(|n| n.to_os_string())
                 .unwrap_or_default();
             name.push(suffix);
-            creds_path.with_file_name(name)
+            creds.with_file_name(name)
         };
         Self {
-            state_path: sibling(".pillbox-rotation.json"),
-            lock_path: sibling(".pillbox-rotation.lock"),
-            creds_path,
+            files: HomeFiles {
+                state: sibling(".pillbox-rotation.json"),
+                lock: sibling(".pillbox-rotation.lock"),
+                creds: creds.to_path_buf(),
+                home,
+            },
             max_lock_wait,
         }
     }
@@ -198,8 +220,7 @@ impl TokenStore {
 
         Ok(Begin::Rotate(RotateGuard {
             _lock: lock,
-            creds_path: self.creds_path.clone(),
-            state_path: self.state_path.clone(),
+            files: self.files.clone(),
             state,
             refresh,
             base_creds: disk,
@@ -211,13 +232,9 @@ impl TokenStore {
     /// releases when the returned file's fd closes, so a crash can't leak it
     /// (matches `events::log::LogLock`).
     fn lock_with_deadline(&self) -> Result<Option<LockGuard>> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.lock_path)
-            .with_context(|| format!("open lock {}", self.lock_path.display()))?;
+        let lock = &self.files.lock;
+        let file = crate::guest_files::open_or_create(&self.files.home, lock, 0o600)
+            .with_context(|| format!("open lock {}", self.files.shown(lock)))?;
         let deadline = Instant::now() + self.max_lock_wait;
         loop {
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -226,7 +243,7 @@ impl TokenStore {
             }
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                return Err(err).with_context(|| format!("lock {}", self.lock_path.display()));
+                return Err(err).with_context(|| format!("lock {}", self.files.shown(lock)));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -236,29 +253,33 @@ impl TokenStore {
     }
 
     fn read_creds(&self) -> Result<Value> {
-        let bytes = fs::read(&self.creds_path)
-            .with_context(|| format!("read creds {}", self.creds_path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse creds {}", self.creds_path.display()))
+        let shown = self.files.shown(&self.files.creds);
+        let bytes = crate::guest_files::read(&self.files.home, &self.files.creds)
+            .with_context(|| format!("read creds {shown}"))?
+            .with_context(|| format!("no creds at {shown}"))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parse creds {shown}"))
     }
 
     /// Missing/unreadable/corrupt state is treated as a fresh default — the state is
     /// recoverable bookkeeping, not the source of truth (the creds are).
     fn read_state(&self) -> RotationState {
-        fs::read(&self.state_path)
+        crate::guest_files::read(&self.files.home, &self.files.state)
             .ok()
+            .flatten()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
     }
 
     fn write_state(&self, state: &RotationState) -> Result<()> {
-        write_atomic(&self.state_path, &state_bytes(state)?, false)
+        self.files
+            .replace(&self.files.state, &state_bytes(state)?, false)
     }
 
     /// Like [`write_state`] but fsync'd through to disk before returning — used for
     /// the `pending` marker, which must be durable before the caller forwards.
     fn write_state_durable(&self, state: &RotationState) -> Result<()> {
-        write_atomic(&self.state_path, &state_bytes(state)?, true)
+        self.files
+            .replace(&self.files.state, &state_bytes(state)?, true)
     }
 }
 
@@ -280,8 +301,7 @@ impl TokenStore {
 ///   correct behavior.
 pub(crate) struct RotateGuard {
     _lock: LockGuard,
-    creds_path: PathBuf,
-    state_path: PathBuf,
+    files: HomeFiles,
     state: RotationState,
     refresh: String,
     base_creds: Value,
@@ -327,11 +347,13 @@ impl RotateGuard {
                  (would risk refresh-token reuse)"
             );
         }
-        write_atomic(&self.creds_path, &creds_bytes(&new_creds)?, true)?;
+        self.files
+            .replace(&self.files.creds, &creds_bytes(&new_creds)?, true)?;
         self.state.generation = self.state.generation.saturating_add(1);
         self.state.pending = None;
         self.state.last_refresh_at_ms = Some(now_ms());
-        write_atomic(&self.state_path, &state_bytes(&self.state)?, false)?;
+        self.files
+            .replace(&self.files.state, &state_bytes(&self.state)?, false)?;
         Ok(())
     }
 
@@ -372,7 +394,8 @@ impl RotateGuard {
     /// Not fsync'd: a lost clear leaves `pending` set, which fails safe (re-auth).
     pub(crate) fn abort_intact(mut self) -> Result<()> {
         self.state.pending = None;
-        write_atomic(&self.state_path, &state_bytes(&self.state)?, false)?;
+        self.files
+            .replace(&self.files.state, &state_bytes(&self.state)?, false)?;
         Ok(())
     }
 }
@@ -388,48 +411,6 @@ fn state_bytes(state: &RotationState) -> Result<Vec<u8>> {
 
 fn creds_bytes(creds: &Value) -> Result<Vec<u8>> {
     serde_json::to_vec(creds).context("serialize creds")
-}
-
-/// Write `bytes` to `path` atomically: a 0600 temp file in the same directory,
-/// optionally fsync'd, then `rename`d over the target (atomic on a POSIX fs). A crash
-/// leaves either the old or the new file whole, never a torn one.
-///
-/// When `sync`, the parent directory is fsync'd *after* the rename — the rename is a
-/// directory-metadata change, so without this a crash can lose it even though the
-/// temp file's data was synced. Load-bearing for any durable credential write (the
-/// next run must see the rotated token, not the consumed one).
-fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".pillbox-tmp-")
-        .tempfile_in(dir)
-        .with_context(|| format!("temp file in {}", dir.display()))?;
-    {
-        use std::io::Write;
-        tmp.as_file_mut()
-            .set_permissions(perms_0600())
-            .context("chmod temp 0600")?;
-        tmp.write_all(bytes).context("write temp")?;
-        if sync {
-            tmp.as_file().sync_all().context("fsync temp")?;
-        }
-    }
-    tmp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("rename into {}", path.display()))?;
-    if sync {
-        let dir_file =
-            fs::File::open(dir).with_context(|| format!("open dir for fsync {}", dir.display()))?;
-        dir_file
-            .sync_all()
-            .with_context(|| format!("fsync dir {}", dir.display()))?;
-    }
-    Ok(())
-}
-
-fn perms_0600() -> fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-    fs::Permissions::from_mode(0o600)
 }
 
 /// A short, stable, non-reversible fingerprint of a token — enough to tell two
@@ -490,7 +471,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let creds_path = dir.path().join(".credentials.json");
         fs::write(&creds_path, serde_json::to_vec(&creds).unwrap()).unwrap();
-        let store = TokenStore::new(creds_path, wait);
+        let store = TokenStore::new(
+            dir.path().to_path_buf(),
+            Path::new(".credentials.json"),
+            wait,
+        );
         (dir, store)
     }
 
@@ -843,7 +828,7 @@ mod tests {
             .create(true)
             .read(true)
             .append(true)
-            .open(&store.lock_path)
+            .open(store.files.home.join(&store.files.lock))
             .unwrap();
         assert_eq!(
             unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },

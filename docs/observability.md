@@ -1,10 +1,10 @@
 # Observability
 
-> **Note:** the OTLP + §0 event-log model stands. Pillbox is local-only;
-> the emitters are the local sandboxes — the **Docker** container (default)
-> and the **libkrun** microVM. Under the [libkrun pivot](./libkrun-sandbox.md)
-> the guest's events ride the `pillbox-init` vsock channel to the host, which
-> exports to the §0 log / OTLP. Telemetry is a headline differentiator — see
+> **Note:** the OTLP + §0 event-log model stands. The local emitter is the
+> **libkrun** microVM (the Docker backend is deleted; sections below that
+> describe its host bind-mount path are history). Under the
+> [libkrun pivot](./libkrun-sandbox.md) the guest's events ride the vsock
+> channel to the host, which exports to the §0 log / OTLP. Telemetry is a headline differentiator — see
 > the spec.
 
 Pillbox emits lifecycle telemetry as OTLP without taking a dependency on
@@ -120,13 +120,10 @@ record, so `pillbox session events --json` is the baseline measurement surface.
   `session transcript` by hand — when an OTLP traces endpoint is
   configured, every `pillbox run` spawns this tailer automatically
   (alongside a whole-chat *conversation* synthesizer that feeds
-  Workshop's Overview). For the Docker backend the agent's `$HOME` is
-  bind-mounted to a host path, so the tailer runs **host-side** against
-  that path. For the libkrun microVM the guest tails its own filesystem
-  and streams the rendered §0 events back to the host over the vsock
-  channel; the host exporter ships them. Either way the collector is
-  reached from the host, so a local `localhost:5899` Workshop works
-  without any tunnel.
+  Workshop's Overview). The microVM's `$HOME` is the run's home clone, a
+  host directory the guest mounts, so the tailer runs **host-side** against
+  the transcript the agent writes there. The collector is reached from the
+  host, so a local `localhost:5899` Workshop works without any tunnel.
 
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel

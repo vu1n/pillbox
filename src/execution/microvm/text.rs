@@ -6,16 +6,16 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::evidence::ExecutionEvidence;
-use super::native::{self, NativeLimits};
-use super::protocol::{self, CodexProfile};
-use super::store::OwnedInvocation;
-use super::usage::TurnUsage;
-use super::{
+use crate::contract::{Custom, Payload};
+use crate::execution::evidence::ExecutionEvidence;
+use crate::execution::native::{self, NativeLimits};
+use crate::execution::protocol::{self, CodexProfile};
+use crate::execution::store::OwnedInvocation;
+use crate::execution::usage::TurnUsage;
+use crate::execution::{
     digest, valid_digest, ArtifactRef, EvidenceRef, HarnessTransport, ModelProfile,
     SessionIdentity, TextOutputFormat,
 };
-use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::{self, BuilderInput, VmLimits};
 use crate::startup::StartupTimer;
@@ -118,7 +118,7 @@ impl TextLimits {
     /// The bounds every text driver runs inside, whatever the harness.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=super::MAX_TIMEOUT_MS).contains(&self.timeout_ms),
+            (1..=crate::execution::MAX_TIMEOUT_MS).contains(&self.timeout_ms),
             "invalid text timeout"
         );
         ensure!(
@@ -126,11 +126,11 @@ impl TextLimits {
             "invalid final text byte limit"
         );
         ensure!(
-            (1..=super::MAX_FRAME_BYTES).contains(&self.max_frame_bytes),
+            (1..=crate::execution::MAX_FRAME_BYTES).contains(&self.max_frame_bytes),
             "invalid native frame byte limit"
         );
         ensure!(
-            (1..=super::MAX_EVIDENCE_BYTES).contains(&self.max_evidence_bytes)
+            (1..=crate::execution::MAX_EVIDENCE_BYTES).contains(&self.max_evidence_bytes)
                 && self.max_frame_bytes <= self.max_evidence_bytes,
             "invalid native evidence byte limit"
         );
@@ -263,7 +263,7 @@ impl TextRequest {
             "text model catalog digest mismatch"
         );
         ensure!(
-            runtime.credential_ref == super::CREDENTIAL_REFERENCE,
+            runtime.credential_ref == crate::execution::CREDENTIAL_REFERENCE,
             "unsupported text credential reference"
         );
         ensure!(
@@ -466,7 +466,7 @@ fn run_local(
 ) -> Result<(TextCompletion, String)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
-    let real = crate::vault::pre_refresh(&credentials_path, "codex")?
+    let real = crate::vault::refresh::pre_refresh(&credentials_path, "codex")?
         .context("Codex token store did not return credentials")?;
     let fresh = crate::vault::providers::codex_execution::fresh_codex_credentials(
         &real,
@@ -619,10 +619,10 @@ pub(crate) fn check_live(owner: &OwnedInvocation, deadline: Instant) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{Claim, InvocationStore, Status};
     use super::*;
+    use crate::execution::store::{Claim, InvocationStore, Status};
+    use crate::execution::TeardownUnconfirmed;
     use crate::pillbox::Scope;
-    use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
 
     fn request() -> TextRequest {
         let input = "sealed HCP prompt";
@@ -660,7 +660,7 @@ mod tests {
             runtime: TextRuntime {
                 runner_image_id: format!("sha256:{}", "a".repeat(64)),
                 effective_model_catalog_digest: protocol::GPT6_EFFECTIVE_CATALOG_SHA256.into(),
-                credential_ref: super::super::CREDENTIAL_REFERENCE.into(),
+                credential_ref: crate::execution::CREDENTIAL_REFERENCE.into(),
                 network_hosts: vec!["chatgpt.com".into()],
                 limits: TextLimits {
                     timeout_ms: 120_000,

@@ -130,7 +130,6 @@ pub(super) fn grade_result(spec: &GraderSpec, code: i32, raw: String) -> GradeRe
 const GRADER_STARTED_MARKER: &str = "\u{1e}PBSTART";
 
 /// The guest shell command that prints [`GRADER_STARTED_MARKER`].
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 
 /// `sitecustomize.py` for an unprivileged (dropped) grader. With
@@ -147,7 +146,6 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 /// BEFORE site-packages, so tests import the worker's project even when the
 /// image has some other copy of it installed. No `;` or
 /// `'` (it rides a `'…'` shell string in an `&&` chain).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 fn py_bootstrap() -> String {
     // Every module the missing-tool check counts as image-provided, plus
     // pytest's own internals.
@@ -161,7 +159,6 @@ fn py_bootstrap() -> String {
 }
 
 /// [`py_bootstrap`]'s template; `RUNNERS` becomes the quoted module list.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 const PY_BOOTSTRAP: &str = r#"import importlib.util
 import os
 import sys
@@ -195,7 +192,6 @@ const PY_BOOTSTRAP_DIR: &str = "/tmp/.pillbox-py";
 
 /// `runuser` in the Debian runner image. It is in `sbin`, which the grader's
 /// PATH (`guest_path`) leaves out, so the dropped grader names it absolutely.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const RUNUSER: &str = "/usr/sbin/runuser";
 
 /// Guest setup that runs as root right before a grader drops to `nobody`: the
@@ -204,7 +200,6 @@ pub(crate) const RUNUSER: &str = "/usr/sbin/runuser";
 /// otherwise refuse it as dubious ownership; every repo in the VM is the
 /// worker's anyway). An `&&` chain with
 /// no `;`, so the caller's `mount && cd &&` prefix still gates the marker.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn dropped_grader_setup() -> String {
     format!(
         "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH={PY_BOOTSTRAP_DIR} \
@@ -219,7 +214,6 @@ pub(crate) fn dropped_grader_setup() -> String {
 /// No marker means the VM failed before the grader ran (no boot, no mount, a
 /// setup step aborted) — an error, never a failing grade, so an unavailable VM
 /// never reads as a worker that failed its tests.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(super) fn grader_output_after_start(code: i32, raw: &str) -> Result<String> {
     let Some(at) = raw.find(GRADER_STARTED_MARKER) else {
         let tail: String = raw

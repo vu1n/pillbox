@@ -187,7 +187,7 @@ the harness.)
 | `vault` | `--vault` | or-ed (a flag can turn it on, not off) |
 | `memory` | `--memory` | or-ed |
 | `egress_deny` | `--egress-deny` | or-ed |
-| `mount` | `--mount HOST:GUEST` | preset entries first, then the flag's |
+| `mount` | `--mount HOST:GUEST` | preset entries first, then the flag's; any entry makes `run` refuse (exit 2): the microVM takes no extra host mounts |
 | `with` | `--with NAME[=ENV_VAR]` | preset first, then flags |
 | `env` | `--env BUNDLE` | preset first, then flags |
 | `env_file` | `--env-file PATH` | preset first, then flags; a relative path resolves against the directory of the descriptor that declared it |

@@ -14,7 +14,7 @@ preserve historical status, including unratified proposals; they are not current
 |---|---|
 | [architecture.md](./architecture.md) | **Start here.** Verified system map, current placements, and structural debts. |
 | [vnext.md](./vnext.md) | Historical umbrella strategy and layering context; code and active decisions supersede stale sequence details. |
-| [libkrun-sandbox.md](./libkrun-sandbox.md) | **The substrate.** Docker → libkrun microVM: own-via-FFI, `pillbox-init`, vsock control + smoltcp egress, the security union, what survives the pivot. |
+| [libkrun-sandbox.md](./libkrun-sandbox.md) | **The substrate.** libkrun microVM (the Docker backend it replaced is deleted): own-via-FFI, `pillbox-init`, vsock control + smoltcp egress, the security union, what survives the pivot. |
 | [dx.md](./dx.md) | The developer-experience contract — the inner loops + zero-config-local. (Remote-parity sections are superseded by the local-first pivot.) |
 
 ## Substrate / §0 spine (the contracts everything rides on)
@@ -26,7 +26,7 @@ preserve historical status, including unratified proposals; they are not current
 | [managed-tier.md](./managed-tier.md) | **Experimental implementation.** Bounded D1/R2 execution using Cloudflare Sandbox; no custom Pillbox DO or remote §0 log. |
 | [durable-object-usage.md](./durable-object-usage.md) | Default-deny DO policy, cost gates, and Cloudflare Computer evaluation rubric. |
 | [agent-io-contract.md](./agent-io-contract.md) | The PTY-free structured I/O contract (`agent.proto`). |
-| [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; the `docker exec` carrier moves to vsock under libkrun.) |
+| [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; carried over vsock under libkrun.) |
 
 ## Reference (shipped behavior)
 
@@ -34,10 +34,10 @@ preserve historical status, including unratified proposals; they are not current
 |---|---|
 | [secrets.md](./secrets.md) | Storing API keys + `.env` bundles, lifecycle, precedence |
 | [config.md](./config.md) | Per-project `pillbox.toml` — schema, discovery, merge |
-| [vault.md](./vault.md) | `--vault` MITM proxy (stub-swap). *Hardening → vault v2 in libkrun-sandbox.md.* |
+| [vault.md](./vault.md) | `--vault` stub-swap MITM in the libkrun VMM child; `pillbox sidecar` as an egress-policy proxy. |
 | [observability.md](./observability.md) | OTLP telemetry — pointing pillbox at a collector |
-| [runner-image.md](./runner-image.md) | The sandbox image. *Docker framing; becomes a microVM rootfs under libkrun.* |
-| [shared-mcp.md](./shared-mcp.md) | `--mcp` shared MCP attachments |
+| [runner-image.md](./runner-image.md) | The sandbox image. *Built with Docker; exported as the microVM rootfs (`src/sandbox/oci.rs`).* |
+| [shared-mcp.md](./shared-mcp.md) | `--mcp` shared MCP attachments (host loopback forwarded into the microVM; managed refuses) |
 | [recipes.md](./recipes.md) | Copy-paste flows |
 | [security.md](./security.md) | Threat model + file layout. *VM-boundary upgrade tracked in libkrun-sandbox.md.* |
 | [opencode-integration.md](./opencode-integration.md) | opencode (server-mode) as a **first-class** run target on libkrun — the `/event` wire contract + drive/read API. (pi backlogged.) |

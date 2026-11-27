@@ -147,7 +147,6 @@ pub(crate) fn record_brief_usage(
 /// Stash a REPARENTED server run's brief so `session ingest` can capture + record usage AFTER its §0
 /// log drains (the log doesn't exist at dispatch-time, so capture can't run there). Writes
 /// `<session_dir>/.kypp-brief` (line 1 = project, lines 2+ = handles). Best-effort.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only the libkrun server bring-up stashes
 pub(crate) fn stash_brief(session_dir: &Path, project: &str, briefed: &[String]) {
     let mut body = String::with_capacity(64);
     body.push_str(project);

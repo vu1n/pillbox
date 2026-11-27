@@ -55,7 +55,7 @@ agent's latest uncommitted edits — exactly what "where is X" needs.
 EXPLORE_ROOT="$PWD" uv run --python 3.12 --with 'mcp>=1.12' \
   scripts/mcp/code-explore/server.py --port 8123
 
-# 2. attach it to a run (pillbox rewrites localhost → host.docker.internal)
+# 2. attach it to a run (the microVM reaches the host's loopback through its gateway)
 pillbox run --mcp code-explore=http://localhost:8123 -- "…task…"
 ```
 
@@ -85,6 +85,5 @@ existing API endpoint to validate it before standing up the 4B serve.)
 - `explore_code` ranking is term-coverage, not semantic; for a *shape* query use
   `find_pattern`. For genuinely large repos where an agentic multi-turn explorer
   wins, that's the FastContext swap above.
-- Binds `127.0.0.1` by default (reachable from Docker Desktop via
-  `host.docker.internal`). Set `--host 0.0.0.0` if your container networking needs
-  it; the server has no auth (pillbox's `--mcp-token` adds a bearer if you want one).
+- Binds `127.0.0.1` by default (the libkrun gateway forwards the guest to it).
+  The server has no auth (pillbox's `--mcp-token` adds a bearer if you want one).

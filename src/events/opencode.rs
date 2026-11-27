@@ -435,8 +435,7 @@ fn flush_frame(
 /// instead of ending — so `drain_sse` follows the in-sandbox `/api/event` capture
 /// file like `tail -F` (replay everything already there, then stream appends).
 /// Reading a file being appended is safe: at EOF the offset holds, and a later
-/// read returns bytes written past it. (Consumed by the libkrun file path;
-/// docker §0 still uses the live bridge.)
+/// read returns bytes written past it. (Consumed by the libkrun file path.)
 ///
 /// Two subtleties the obvious version gets wrong:
 /// - **Opens lazily by path.** The guest creates the file only when opencode
@@ -451,7 +450,6 @@ fn flush_frame(
 ///   line boundary), but at most [`FOLLOW_FINAL_DRAIN_BYTES`] more: a guest can
 ///   grow its capture without end (a huge sparse file, one endless line), and the
 ///   thread that set `stop` is joining this one.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
@@ -465,7 +463,6 @@ pub(crate) struct FollowReader {
 pub(crate) const FOLLOW_FINAL_DRAIN_BYTES: usize = 2 * MAX_CAPTURE_LINE_BYTES;
 
 impl FollowReader {
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn new(
         path: std::path::PathBuf,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

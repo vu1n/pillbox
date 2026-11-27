@@ -17,8 +17,8 @@ There are two security boundaries:
   vendor-owned Sandbox Durable Object owns container lifecycle only. Huddles
   owns collaboration and driver policy.
 
-The local Docker **agent backend** is deprecated. Docker is still in the build
-trust path today: it materializes the OCI rootfs that libkrun boots. A
+The local Docker **agent backend** is deleted. Docker is still in the build
+trust path today (as runner-image export plumbing, `src/sandbox/oci.rs`): it materializes the OCI rootfs that libkrun boots. A
 compromised Docker daemon can therefore tamper with that input even though it
 hosts neither the agent run nor the OAuth login (both run in libkrun microVMs).
 
@@ -180,7 +180,7 @@ alternative agent placement.
 
 A detached local session is a long-lived libkrun microVM plus a local session
 record. Its credential/egress broker is owned with the VM, so libkrun supports
-detached vaulted runs. The deprecated Docker backend does not.
+detached vaulted runs.
 
 `pillbox session detach <id>` SIGTERMs the `attached_pid` recorded
 in the session TOML. The recorded pid is validated before

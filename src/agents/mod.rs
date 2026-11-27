@@ -10,7 +10,6 @@
 //! Whatever the agent writes — `.credentials.json`, settings, refresh
 //! tokens — persists there naturally.
 
-#[cfg(feature = "libkrun")]
 use std::borrow::Cow;
 use std::{
     fs,
@@ -31,19 +30,19 @@ pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};
 pub(crate) const GUEST_HOME: &str = "/home/pillbox";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
-/// The guest `PATH` every backend hands the agent — docker (`-e PATH=`) and
-/// libkrun (the boot-script env + the grader) share this one definition so they
-/// can't drift into resolving different toolchains. Includes the agent user's
+/// The guest `PATH` the agent gets — the libkrun boot-script env and the grader
+/// share this one definition so they can't drift into resolving different
+/// toolchains. Includes the agent user's
 /// `~/.local/bin` where the runner installs per-user tools. The runner image
 /// must install agent binaries onto one of these dirs (see `runner/Dockerfile`).
 pub(crate) fn guest_path() -> String {
     format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin")
 }
 
-/// Per-agent MCP config builder. Returns a fully-formed injection
-/// (live tempfile + docker mount + extra argv); `None` on
+/// Per-agent MCP config builder, given the attachments and the guest home.
+/// Returns the guest files, argv and env the substrate lands; `None` on
 /// `AgentSpec` means the agent doesn't support `--mcp` yet.
-pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
+pub(crate) type McpInjectFn = fn(&[McpAttachment], &str) -> Result<McpInjection>;
 
 /// How pillbox talks to an agent. Most agents are a TUI we wrap in a PTY and
 /// observe by scraping their transcript file ([`Integration::Pty`]); a few
@@ -72,24 +71,21 @@ impl Integration {
 /// The per-agent data a [`Integration::Server`] agent needs, beyond the common
 /// [`AgentSpec`] fields — the §0 capture filename, its wire format, and the
 /// guest server's auth. `Some` iff `integration == Server`. Every server agent
-/// runs on the libkrun backend only (docker refuses `server.is_some()`).
+/// runs on the libkrun backend only.
 /// Carrying these here (rather than re-deriving `if agent_id == "…"` at each
 /// dispatch site) keeps the events-file name and drain-format selection as one
 /// source of truth.
 #[derive(Clone, Copy)]
 pub(crate) struct ServerProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
-    /// Consumed by the libkrun §0 read path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun §0 read path.
     pub(crate) events_file: &'static str,
     /// Wire format of that capture → selects the drain function. Consumed by the
-    /// libkrun §0 read path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// libkrun §0 read path.
     pub(crate) events_format: crate::events::EventsFormat,
     /// HTTP basic-auth `(user, password)` every host call to the guest server
     /// carries (OpenCode 2 refuses to serve without a password). Consumed by the
-    /// libkrun transport; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// libkrun transport.
     pub(crate) basic_auth: Option<(&'static str, &'static str)>,
 }
 
@@ -100,17 +96,14 @@ pub(crate) struct ServerProfile {
 #[derive(Clone, Copy)]
 pub(crate) struct StructuredProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
-    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun structured launch path.
     pub(crate) events_file: &'static str,
     /// How `--model` is parsed for this agent.
-    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun structured launch path.
     pub(crate) model: StructuredModelPolicy,
     /// Guest env var that authenticates without the login sentinel (e.g.
     /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
-    /// Consumed by the libkrun `authenticated_home` gate; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun `authenticated_home` gate.
     pub(crate) alt_auth_env: Option<&'static str>,
 }
 
@@ -124,10 +117,8 @@ pub(crate) enum StructuredModelPolicy {
     OptionalBare,
 }
 
-/// Libkrun-only policy for a PTY agent whose cloned home or terminal protocol
-/// needs agent-specific handling. Docker deliberately does not consume this:
-/// its PTY contract remains the existing raw byte stream.
-#[cfg(feature = "libkrun")]
+/// Libkrun policy for a PTY agent whose cloned home or terminal protocol needs
+/// agent-specific handling.
 #[derive(Clone, Copy)]
 pub(crate) struct LibkrunPtyProfile {
     cloned_home: Option<ClonedHomePreparation>,
@@ -135,7 +126,6 @@ pub(crate) struct LibkrunPtyProfile {
     input_framing: PtyInputFraming,
 }
 
-#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum ClonedHomePreparation {
     FreshCodex,
@@ -151,7 +141,6 @@ pub(crate) enum DetachedTranscriptSource {
 }
 
 impl DetachedTranscriptSource {
-    #[cfg(feature = "libkrun")]
     pub(crate) fn as_token(self) -> &'static str {
         match self {
             Self::ServerCapture(format) => format.as_str(),
@@ -174,13 +163,11 @@ impl DetachedTranscriptSource {
     }
 }
 
-#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum PtyInputFraming {
     BracketedPasteLfTurn,
 }
 
-#[cfg(feature = "libkrun")]
 impl LibkrunPtyProfile {
     /// Prepare only the throwaway home clone. Errors are launch failures: an
     /// unprepared detached agent can park before it accepts input or can expose
@@ -209,14 +196,12 @@ impl LibkrunPtyProfile {
 /// that gets the body and its Enter in one write can keep both as an unsent draft (Agent Relay
 /// reproduced this with Codex: the body showed on screen, no turn started), so the submit key
 /// always goes on its own, after a pause. Joined, the writes are the turn's bytes.
-#[cfg(feature = "libkrun")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PtyTurn<'a> {
     pub(crate) body: Cow<'a, [u8]>,
     pub(crate) submit: Option<&'a [u8]>,
 }
 
-#[cfg(feature = "libkrun")]
 impl<'a> PtyTurn<'a> {
     /// Raw input for an agent with no framing of its own: the bytes unchanged, with a trailing
     /// `\r\n`, `\r` or `\n` split off as the submit write.
@@ -253,23 +238,19 @@ pub struct AgentSpec {
     /// `AGENT_CREDENTIALS`, so the session packet always leaves it out.
     pub(crate) cred_sentinel: pillbox_credentials::AgentCredential,
     /// Read only by the libkrun login VM (`sandbox::libkrun::login`).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
     /// Read only by the libkrun login VM's OAuth callback relay.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
     /// Hosts this agent's `auth login` reaches beyond the vault providers' hosts,
     /// for every provider its login can pick. Exact names: the fence has no wildcards.
     // Read only by the login VM's fence: a run, session or sandbox launch never gets these hosts.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_hosts: &'static [&'static str],
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
     /// Build a per-run MCP config injection from `--mcp` flags.
-    /// `None` means this agent doesn't support `--mcp` yet —
-    /// the backend hard-errors at run time. Per-agent config-file
+    /// `None` means this agent doesn't support `--mcp` —
+    /// the backend refuses it with a usage error. Per-agent config-file
     /// mechanics differ enough (Claude `.mcp.json` vs Codex
     /// `config.toml`) that the rendering lives in the `mcp` module
     /// rather than in shared run code.
@@ -291,13 +272,10 @@ pub struct AgentSpec {
     pub(crate) server: Option<ServerProfile>,
     /// Structured one-shot data ([`StructuredProfile`]). `Some` iff
     /// `integration == Structured`. Consumed by the libkrun structured launch
-    /// path; dead on a non-libkrun build (docker only checks `integration`).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// path.
     pub(crate) structured: Option<StructuredProfile>,
     /// Agent-specific PTY behavior consumed only by libkrun. `None` preserves
-    /// the generic raw-input/no-clone-prep behavior (including Docker, which
-    /// never reads this field).
-    #[cfg(feature = "libkrun")]
+    /// the generic raw-input/no-clone-prep behavior.
     pub(crate) libkrun_pty: Option<LibkrunPtyProfile>,
 }
 
@@ -322,7 +300,6 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     prepare_workspace: Some(pretrust_claude_workspace),
     server: None,
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -331,8 +308,8 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 /// [`CODEX_SERVE`] is a structured sibling of [`CODEX`]. Opt-in via `--agent
 /// claude-stream`; the interactive PTY `claude` stays the default and is
 /// untouched. A separate id (not a flag on `claude`) because the integration
-/// kind is per-spec: it routes the run, the backend capability check (docker
-/// rejects Structured), and the events-file/model policy, and a sibling keeps
+/// kind is per-spec: it routes the run, the backend capability check, and the
+/// events-file/model policy, and a sibling keeps
 /// each spec's contract fixed.
 ///
 /// Shares `claude`'s auth home ([`auth_id`](AgentSpec::auth_id) `= "claude"`),
@@ -356,7 +333,6 @@ pub const CLAUDE_STREAM: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
     // Everything else is claude's: the shared auth home (`auth_id`), login,
     // sentinel, vault posture and permission args (root refuses bypass).
@@ -380,7 +356,6 @@ pub const CODEX: AgentSpec = AgentSpec {
     prepare_workspace: None,
     server: None,
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: Some(LibkrunPtyProfile {
         cloned_home: Some(ClonedHomePreparation::FreshCodex),
         detached_transcript: Some(DetachedTranscriptSource::Discover(
@@ -406,7 +381,7 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// session, not forwarded to Codex.
 ///
 /// libkrun-only, like every server agent (the server bring-up lives in the
-/// microVM run path; docker refuses any agent with a [`ServerProfile`]). **Non-vault v1**: the
+/// microVM run path). **Non-vault v1**: the
 /// app-server's model egress is `wss://api.openai.com/v1/responses` (WebSocket,
 /// `api.openai.com`), which the [`codex` vault provider](crate::vault::providers)
 /// (chatgpt.com only) doesn't intercept — so `--vault` is rejected until that
@@ -428,7 +403,9 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     login_hosts: CODEX.login_hosts,
     post_login_finalize: None,
     vault_capable: true,
-    mcp_inject: Some(mcp::codex_inject),
+    // The appserver-host bridge launches `codex app-server` itself, so there is
+    // no agent argv to carry codex's `-c mcp_servers.*` overrides.
+    mcp_inject: None,
     sandbox_args: &[],
     prepare_workspace: None,
     server: Some(ServerProfile {
@@ -437,7 +414,6 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         basic_auth: None,
     }),
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -470,7 +446,6 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         )),
     }),
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -504,7 +479,6 @@ pub const CURSOR: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: Some("CURSOR_API_KEY"),
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -551,7 +525,6 @@ pub const PI: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -585,7 +558,6 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -615,13 +587,16 @@ pub(crate) fn lookup(action: &'static str, id: &str) -> Result<&'static AgentSpe
 }
 
 fn finalize_claude_onboarding(home: &Path) -> Result<()> {
-    let path = home.join(".claude.json");
-    if !path.exists() {
+    // The `auth login` guest just had this home mounted read-write.
+    let rel = Path::new(".claude.json");
+    let path = home.join(rel);
+    let Some(raw) =
+        crate::guest_files::read(home, rel).with_context(|| format!("read {}", path.display()))?
+    else {
         return Ok(());
-    }
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    };
     let mut value: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
@@ -631,43 +606,30 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
     );
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
-    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    crate::guest_files::write(home, rel, serialized.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 /// Make a throwaway Codex home unambiguously fresh before libkrun mounts it.
 /// The authoritative auth home is never touched: stale rollouts are removed
 /// only from the clone, and only this run's unique guest workspace is trusted.
-#[cfg(feature = "libkrun")]
 fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
-    let sessions = home.join(".codex/sessions");
-    match fs::remove_dir_all(&sessions) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "clear cloned Codex transcript history {}",
-                    sessions.display()
-                )
-            });
-        }
-    }
+    crate::guest_files::remove_tree(home, Path::new(".codex/sessions"))
+        .context("clear cloned Codex transcript history")?;
 
     // Mutate the complete TOML document so unrelated settings and project
     // entries survive preparation of this one workspace.
-    let config_path = home.join(".codex/config.toml");
-    let mut config = match fs::read_to_string(&config_path) {
-        Ok(text) => text
+    let config_rel = Path::new(".codex/config.toml");
+    let config_path = home.join(config_rel);
+    let mut config = match crate::guest_files::read(home, config_rel)
+        .with_context(|| format!("read cloned Codex config {}", config_path.display()))?
+    {
+        Some(bytes) => String::from_utf8(bytes)
+            .context("cloned Codex config is not UTF-8")?
             .parse::<toml::Value>()
             .with_context(|| format!("parse cloned Codex config {}", config_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            toml::Value::Table(toml::map::Map::new())
-        }
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("read cloned Codex config {}", config_path.display()));
-        }
+        None => toml::Value::Table(toml::map::Map::new()),
     };
     let root = config
         .as_table_mut()
@@ -683,12 +645,13 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
         .as_table_mut()
         .context("cloned Codex project trust entry must be a TOML table")?;
     project.insert("trust_level".into(), toml::Value::String("trusted".into()));
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create cloned Codex config dir {}", parent.display()))?;
-    }
-    fs::write(&config_path, toml::to_string(&config)?)
-        .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
+    crate::guest_files::write(
+        home,
+        config_rel,
+        toml::to_string(&config)?.as_bytes(),
+        0o600,
+    )
+    .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
     Ok(())
 }
 
@@ -696,7 +659,6 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
 /// A trailing LF explicitly marks a complete turn, so paste the body as one
 /// input event and submit it with a CR in a later write. Non-terminated bytes
 /// remain exactly raw.
-#[cfg(feature = "libkrun")]
 fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> PtyTurn<'_> {
     let Some(body) = bytes.strip_suffix(b"\n") else {
         return PtyTurn {
@@ -724,8 +686,8 @@ fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> PtyTurn<'_> {
 /// `--dangerously-skip-permissions` can't bypass as root.
 ///
 /// `hasCompletedOnboarding` is the same flag [`finalize_claude_onboarding`]
-/// sets at login. Local docker inherits it via the bind-mounted global home;
-/// a libkrun guest with a fresh `$HOME` would otherwise hit the wizard.
+/// sets at login; a libkrun guest with a fresh `$HOME` would otherwise hit the
+/// wizard.
 /// Setting it here (every launch, every backend) is idempotent and
 /// backend-agnostic. Merges into any existing entry; creates the file +
 /// `projects` map as needed.
@@ -742,12 +704,16 @@ fn get_or_create_object<'a>(
 }
 
 fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
-    let path = home.join(".claude.json");
-    let mut value: serde_json::Value = if path.exists() {
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?
-    } else {
-        serde_json::json!({})
+    // The live agent home is mounted read-write into the `auth login` guest.
+    let rel = Path::new(".claude.json");
+    let path = home.join(rel);
+    let mut value: serde_json::Value = match crate::guest_files::read(home, rel)
+        .with_context(|| format!("read {}", path.display()))?
+    {
+        Some(raw) => {
+            serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?
+        }
+        None => serde_json::json!({}),
     };
     let root = value
         .as_object_mut()
@@ -760,7 +726,8 @@ fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
     entry.insert("hasCompletedProjectOnboarding".into(), true.into());
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
-    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    crate::guest_files::write(home, rel, serialized.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -815,7 +782,6 @@ impl AgentSpec {
         }
     }
 
-    #[cfg(feature = "libkrun")]
     pub(crate) fn resolved_oauth_port(&self) -> Option<u16> {
         let default = self.oauth_port?;
         let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
@@ -827,44 +793,28 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        // auth login runs only in the libkrun microVM; there is no Docker fallback.
-        #[cfg(not(feature = "libkrun"))]
-        let _ = resolved;
-        #[cfg(not(feature = "libkrun"))]
-        return Err(PillboxError::usage(
-            "login",
-            format!(
-                "`pillbox auth login --agent {}` needs the libkrun microVM backend, and this pillbox was built without it",
-                self.id
-            ),
-        )
-        .with_next("rebuild pillbox with the default `libkrun` feature")
-        .into());
+        // auth login runs only in the libkrun microVM.
+        let backend = crate::sandbox::SubstrateKind::Libkrun.backend()?;
+        let home = self.home_dir(resolved)?;
 
-        #[cfg(feature = "libkrun")]
-        {
-            let home = self.home_dir(resolved)?;
+        println!("pillbox: starting {} login inside a sandbox.", self.id);
+        println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
+        println!();
 
-            println!("pillbox: starting {} login inside a sandbox.", self.id);
-            println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
-            println!();
-
-            let code = crate::sandbox::libkrun::login::login(self, resolved, &home)?;
-            if code != 0 {
-                return Err(PillboxError::runtime(
-                    "login",
-                    format!("{} exited with status {code}", self.id),
-                )
-                .with_next(format!("pillbox auth login --agent {}", self.id))
-                .into());
-            }
-            self.finish_login(&home)
+        let code = backend.login(self, resolved, &home)?;
+        if code != 0 {
+            return Err(PillboxError::runtime(
+                "login",
+                format!("{} exited with status {code}", self.id),
+            )
+            .with_next(format!("pillbox auth login --agent {}", self.id))
+            .into());
         }
+        self.finish_login(&home)
     }
 
     /// The post-login checks: the credential sentinel exists, then the agent's
     /// optional finalize hook runs (best-effort).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     fn finish_login(&self, home: &Path) -> Result<()> {
         if !home.join(self.cred_sentinel).exists() {
             return Err(PillboxError::runtime(
@@ -918,6 +868,7 @@ impl AgentSpec {
 pub(crate) struct RunOpts {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) name: Option<String>,
+    /// `--mount` / preset `mount`: read only by `commands::run::start`, which refuses a run that has any.
     pub(crate) mounts: Vec<String>,
     /// `--with NAME[=ENV_VAR]` entries (parsed from raw CLI strings)
     pub(crate) withs: Vec<String>,
@@ -937,8 +888,8 @@ pub(crate) struct RunOpts {
     pub(crate) memory_briefed: Vec<String>,
     /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
     /// boundary. Resolved against `mcp_tokens` in the sandbox
-    /// backend; the backend hard-errors if non-empty and the
-    /// resolved agent has no `mcp_inject`.
+    /// backend; the backend refuses them if the resolved agent has
+    /// no `mcp_inject` or the launch path can't carry them.
     pub(crate) mcps: Vec<McpAttachment>,
     /// `--mcp-token NAME=SECRET_NAME` entries. Each references a
     /// `--mcp NAME=URL` and a pillbox-stored secret; values are
@@ -947,8 +898,8 @@ pub(crate) struct RunOpts {
     pub(crate) args: Vec<String>,
     /// `--detach` — start the session and exit. The session is recorded
     /// in the per-pillbox registry and the user reattaches with `pillbox
-    /// session attach <id>`. Supported on local Docker + libkrun backends
-    /// (each persists the in-sandbox pty-host).
+    /// session attach <id>`. Supported on the libkrun backend (it persists
+    /// the in-guest pty-host).
     pub(crate) detach: bool,
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
@@ -1058,7 +1009,6 @@ pub(crate) fn resolve_run_env(
     env_bundles: &[String],
     env_files: &[PathBuf],
     withs: &[ResolvedWith],
-    mut vault: Option<&mut crate::vault::VaultSession>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     use std::collections::BTreeMap;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -1105,24 +1055,19 @@ pub(crate) fn resolve_run_env(
                 .with_next(format!("pillbox secret add {}", w.secret_name))
         })?;
 
-        let injected = match (w.meta.as_ref(), vault.as_deref_mut()) {
-            (Some(meta), Some(session)) => {
-                session.lease_api_key(&w.secret_name, real_value.trim_end(), meta)?
-            }
-            (Some(_meta), None) => {
-                return Err(PillboxError::runtime(
-                    "run",
-                    format!(
-                        "secret `{}` is marked vaulted but no vault session is active",
-                        w.secret_name
-                    ),
-                )
-                .into());
-            }
-            (None, _) => real_value,
-        };
+        // A vaulted secret is swapped by the launch's own vault, never composed into the env.
+        if w.meta.is_some() {
+            return Err(PillboxError::runtime(
+                "run",
+                format!(
+                    "secret `{}` is marked vaulted but no vault session is active",
+                    w.secret_name
+                ),
+            )
+            .into());
+        }
 
-        if let Some(_prev) = env.insert(w.env_var.clone(), injected) {
+        if let Some(_prev) = env.insert(w.env_var.clone(), real_value) {
             eprintln!(
                 "pillbox: note: {} shadowed by --with {}",
                 w.env_var, w.raw_entry
@@ -1131,35 +1076,6 @@ pub(crate) fn resolve_run_env(
     }
 
     Ok(env)
-}
-
-/// `docker run` args common to every local launch: host-gateway alias +
-/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head
-/// (`["-d"]` for the detached attach-transport flow).
-fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
-    let mut v: Vec<String> = stdio_prefix.iter().map(|s| (*s).into()).collect();
-    v.extend([
-        // Make `host.docker.internal` resolve on Linux. Docker Desktop
-        // already provides this alias and ignores the flag; vault and
-        // `--mcp` (and any future host-reachable feature) all rely on
-        // it being there unconditionally.
-        "--add-host".into(),
-        "host.docker.internal:host-gateway".into(),
-        "-e".into(),
-        format!("HOME={GUEST_HOME}"),
-        "-e".into(),
-        "TERM=xterm-256color".into(),
-        "-e".into(),
-        format!("PATH={}", guest_path()),
-    ]);
-    v
-}
-
-/// Detached base args for the attach-transport flow: `-d`, no `--rm`, so the
-/// pty-host container outlives the client and can be `docker exec`'d into
-/// and explicitly removed.
-pub(crate) fn base_docker_args_detached() -> Vec<String> {
-    base_docker_args_with(&["-d"])
 }
 
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
@@ -1189,7 +1105,7 @@ mod tests {
     use crate::pillbox;
     use crate::secrets::{AddSource, WriteScope};
     use crate::test_util::with_isolated_home;
-    use crate::vault::{HeaderScheme, OAuthAgent, VaultMeta, VaultSession};
+    use crate::vault::{HeaderScheme, VaultMeta};
 
     fn run_opts_with_withs(withs: Vec<&str>) -> RunOpts {
         RunOpts {
@@ -1216,149 +1132,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env =
-                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap();
+            let env = resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs).unwrap();
             assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
-        });
-    }
-
-    #[test]
-    fn resolve_run_env_swaps_vaulted_secret_for_stub() {
-        with_isolated_home("agents-vault", || {
-            let g = pillbox::global();
-            std::env::set_var("__PILLBOX_TEST_VAULTED", "sk-ant-api03-REAL");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "VAULTED_KEY",
-                AddSource::EnvVar("__PILLBOX_TEST_VAULTED".into()),
-                false,
-                Some(VaultMeta::new(
-                    "api.anthropic.com".into(),
-                    HeaderScheme::XApiKey,
-                    "sk-ant-api03-".into(),
-                )),
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_VAULTED");
-
-            let mut session = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
-            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(
-                &g,
-                &opts.env_bundles,
-                &opts.env_files,
-                &withs,
-                Some(&mut session),
-            )
-            .unwrap();
-
-            let injected = env.get("VAULTED_KEY").cloned().unwrap();
-            assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
-            assert_ne!(injected, "sk-ant-api03-REAL");
-        });
-    }
-
-    #[test]
-    fn resolve_run_env_mixed_vaulted_and_plain() {
-        with_isolated_home("agents-mix", || {
-            let g = pillbox::global();
-            std::env::set_var("__PILLBOX_TEST_MIX_P", "plain-val");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "MIX_PLAIN",
-                AddSource::EnvVar("__PILLBOX_TEST_MIX_P".into()),
-                false,
-                None,
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_MIX_P");
-            std::env::set_var("__PILLBOX_TEST_MIX_V", "ghp_REAL_token");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "MIX_VAULTED",
-                AddSource::EnvVar("__PILLBOX_TEST_MIX_V".into()),
-                false,
-                Some(VaultMeta::new(
-                    "api.github.com".into(),
-                    HeaderScheme::AuthorizationBearer,
-                    "ghp_".into(),
-                )),
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_MIX_V");
-
-            let mut session = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
-            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(
-                &g,
-                &opts.env_bundles,
-                &opts.env_files,
-                &withs,
-                Some(&mut session),
-            )
-            .unwrap();
-
-            assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
-            let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
-            assert!(stub.starts_with("ghp_"));
-            assert_ne!(stub, "ghp_REAL_token");
-        });
-    }
-
-    #[test]
-    fn vault_uses_per_run_ca_unless_a_stable_one_is_pinned() {
-        with_isolated_home("agents-perrun-ca", || {
-            let g = pillbox::global();
-            let vault_dir = g.subdir("vault").unwrap();
-
-            // No pinned CA → per-run ephemeral: the cert exists but lives in a
-            // tempdir, NOT under the pillbox's vault dir.
-            let s1 = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            assert!(s1.ca_cert_path().exists());
-            assert!(
-                !s1.ca_cert_path().starts_with(&vault_dir),
-                "ephemeral CA must not persist in the pillbox vault dir: {}",
-                s1.ca_cert_path().display()
-            );
-            drop(s1);
-
-            // Pin a stable CA → runs reuse it (cert path is inside the vault dir).
-            crate::vault::Ca::ensure(&vault_dir).unwrap();
-            let s2 = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            assert!(
-                s2.ca_cert_path().starts_with(&vault_dir),
-                "a pinned stable CA must be reused: {}",
-                s2.ca_cert_path().display()
-            );
         });
     }
 
@@ -1384,8 +1159,7 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let err =
-                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap_err();
+            let err = resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
         });
@@ -1507,7 +1281,6 @@ mod tests {
         assert_eq!(v["hasCompletedOnboarding"], true);
     }
 
-    #[cfg(feature = "libkrun")]
     #[test]
     fn detached_transcript_source_tokens_round_trip_and_reject_unknown() {
         let sources = [

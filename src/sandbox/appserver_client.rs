@@ -6,7 +6,7 @@
 //! bridge's one-shot routes.
 //!
 //! All of this is consumed only by the libkrun backend (codex-serve is
-//! libkrun-only), hence the `allow(dead_code)` on the non-libkrun build.
+//! libkrun-only).
 
 use serde_json::{json, Value};
 
@@ -19,21 +19,17 @@ use crate::sandbox::http::SandboxHttp;
 /// the backend's [`SandboxHttp`] over the vsock forward). Distinct constant from
 /// opencode's so the two server agents can't be confused, even though the vsock
 /// forward maps each to the same guest-side port today.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const BRIDGE_PORT: u16 = 4097;
 
 /// Filename (under the agent home) the bridge appends codex notifications to —
 /// the §0 NDJSON capture, the codex analog of opencode's `EVENTS_FILE`. Lives in
 /// the shared/CoW home so it persists + is host-readable for the drain.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const EVENTS_FILE: &str = ".pillbox-codex-appserver-events.ndjson";
 
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 const ACTION: &str = "run (codex-serve)";
 
 /// Poll `GET /health` until the bridge answers `200` (codex boot + the
 /// handshake take a moment), bounded so a dead bridge fails loud not hangs.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     for _ in 0..60 {
         if let Ok(resp) = http.request("GET", "/health", None) {
@@ -48,7 +44,6 @@ pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
 
 /// `POST /session` → the codex `threadId` the bridge started at boot (the
 /// agent-native session id `turn/start` targets; stored on the session record).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn create_session(http: &dyn SandboxHttp) -> Result<String> {
     let resp = http.request("POST", "/session", Some("{}"))?;
     let body = resp.body.trim();
@@ -70,7 +65,6 @@ pub(crate) fn create_session(http: &dyn SandboxHttp) -> Result<String> {
 /// Drive the session: `POST /turn` with the prompt text. The bridge issues
 /// `turn/start` and the turn streams as notifications to the events file (read
 /// via the §0 drain). Any 2xx is success (the bridge returns 204).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn send_turn(http: &dyn SandboxHttp, text: &str) -> Result<()> {
     let body = json!({ "text": text }).to_string();
     let resp = http.request("POST", "/turn", Some(&body))?;

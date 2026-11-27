@@ -23,7 +23,7 @@ fail() { echo "  ✗ dispatch-workers: $1"; exit 1; }
 
 # libkrun-only today (same grade-path constraint as dispatch.sh): the grader
 # resolves each worker's live workspace via `session info --json` →
-# `.session.workspace`, which only libkrun sessions populate. Skip on docker.
+# `.session.workspace`, which only libkrun sessions populate. Skip on any other backend.
 if [ "$BACKEND" != libkrun ]; then
   echo "  · dispatch-workers smoke skipped — backend=$BACKEND not wired yet (libkrun-only grade path)"
   exit 0

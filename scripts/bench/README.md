@@ -7,8 +7,8 @@ timings.
 ## Examples
 
 ```sh
-# One Docker PTY case, five measured runs after one warmup.
-scripts/bench/startup.py --case docker-claude --warmup 1 --repeat 5
+# One libkrun PTY case, five measured runs after one warmup.
+scripts/bench/startup.py --case libkrun-claude --warmup 1 --repeat 5
 
 # Server-mode opencode (libkrun-only), with a fixed model.
 # Defaults to the same opencode image used by the smoke/eval scripts:
@@ -20,10 +20,10 @@ scripts/bench/startup.py \
   --repeat 5
 
 # Show the commands without starting agents.
-scripts/bench/startup.py --all-docker --dry-run
+scripts/bench/startup.py --all-libkrun --dry-run
 
 # Emit raw measured runs plus aggregate summaries.
-scripts/bench/startup.py --all-docker --json
+scripts/bench/startup.py --all-libkrun --json
 ```
 
 ## Notes

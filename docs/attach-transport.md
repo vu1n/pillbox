@@ -1,9 +1,10 @@
 # Interactive attach transport — design notes
 
 > **Note (2026-06-01):** the `Frame` protocol + pump/relay design here stands and
-> is transport-agnostic. The **carrier** below (`docker exec`, ssh-exec, the e2b
-> helper) is **deprecated** — under the [libkrun pivot](./libkrun-sandbox.md) the
-> frames ride a **vsock** (or forwarded-socket) channel to `pillbox-init`. The
+> is transport-agnostic. The **carriers** below (`docker exec`, ssh-exec, the e2b
+> helper, the `pty-relay` bridge) are **removed** — under the
+> [libkrun pivot](./libkrun-sandbox.md) the frames ride a **vsock** (or
+> forwarded-socket) channel to the guest pty-host. The
 > protocol is unchanged; only what carries the bytes moves.
 
 Status: draft (2026-05-27). Sibling to

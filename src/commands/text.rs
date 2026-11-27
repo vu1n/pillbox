@@ -55,11 +55,11 @@ fn execute(pb: &Pillbox, store: &InvocationStore, value: Value) -> Result<Record
         return existing_record(existing);
     }
     if value.get("contract_version").and_then(Value::as_str)
-        == Some(execution::text_v2::CONTRACT_VERSION)
+        == Some(execution::microvm::text_v2::CONTRACT_VERSION)
     {
         return execute_v2(pb, store, value, &canonical);
     }
-    let request: execution::text::TextRequest = serde_json::from_value(value)?;
+    let request: execution::microvm::text::TextRequest = serde_json::from_value(value)?;
     request.validate()?;
     ensure!(
         execution::canonical_json(&serde_json::to_value(&request)?)? == canonical,
@@ -71,7 +71,7 @@ fn execute(pb: &Pillbox, store: &InvocationStore, value: Value) -> Result<Record
         Claim::Owned(owner) => owner,
         other => return existing_record(other),
     };
-    let outcome = execution::text::execute(pb, &request, &mut owner);
+    let outcome = execution::microvm::text::execute(pb, &request, &mut owner);
     settle(&mut owner, outcome)?;
     Ok(owner.record().clone())
 }
@@ -82,7 +82,7 @@ fn execute_v2(
     value: Value,
     canonical: &str,
 ) -> Result<Record> {
-    let request: execution::text_v2::TextRequestV2 = serde_json::from_value(value)?;
+    let request: execution::microvm::text_v2::TextRequestV2 = serde_json::from_value(value)?;
     request.validate()?;
     ensure!(
         execution::canonical_json(&serde_json::to_value(&request)?)? == canonical,
@@ -92,24 +92,26 @@ fn execute_v2(
         Claim::Owned(owner) => owner,
         other => return existing_record(other),
     };
-    match execution::text_v2::execute(pb, &request, &mut owner)? {
-        execution::text_v2::Outcome::Completed(detail) => {
+    match execution::microvm::text_v2::execute(pb, &request, &mut owner)? {
+        execution::microvm::text_v2::Outcome::Completed(detail) => {
             owner.finish(Status::Completed, detail)?
         }
-        execution::text_v2::Outcome::Failed(detail) => owner.finish(Status::Failed, detail)?,
+        execution::microvm::text_v2::Outcome::Failed(detail) => {
+            owner.finish(Status::Failed, detail)?
+        }
     }
     Ok(owner.record().clone())
 }
 
 pub(crate) fn settle(
     owner: &mut OwnedInvocation,
-    result: Result<execution::text::TextCompletion>,
+    result: Result<execution::microvm::text::TextCompletion>,
 ) -> Result<()> {
     match result {
         Ok(completion) => owner.finish(Status::Completed, serde_json::to_value(completion)?)?,
         Err(error) => {
             if error
-                .downcast_ref::<crate::sandbox::libkrun::repository::TeardownUnconfirmed>()
+                .downcast_ref::<crate::execution::TeardownUnconfirmed>()
                 .is_some()
             {
                 return Err(error);

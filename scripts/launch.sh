@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # launch.sh — interactive `pillbox run` launcher, with saved profiles.
 #
-# Interactive mode walks you through the options (agent, backend, vault,
+# Interactive mode walks you through the options (agent, vault,
 # memory, telemetry, seeded prompt), preflight-checks everything the chosen
 # combination needs (binary built+codesigned, runner image, Docker, Raindrop,
 # kypp, agent auth), explains how to fix whatever's missing, then prints the
@@ -104,6 +104,7 @@ load_profile() { # sets the GLOBAL choice vars (AGENT/BACKEND/...) from a profil
   local img; img="$(profile_get "$f" IMAGE)"
   [ -n "$img" ] && { IMAGE="$img"; IMAGE_OVERRIDE=1; }
   [ -n "$AGENT" ] && [ -n "$BACKEND" ] || die "profile $(basename "$f") is missing AGENT/BACKEND"
+  [ "$BACKEND" = libkrun ] || die "profile $(basename "$f") uses backend '$BACKEND'; libkrun is the only local backend (the docker backend was removed)"
 }
 
 save_profile_offer() {
@@ -195,9 +196,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     opencode "opencode serve (server-mode: drive via session send, no terminal)" \
     pi       "pi coding agent (PTY)")"
 
-  BACKEND="$(pick "Backend?" libkrun \
-    libkrun "microVM (HVF) — own egress fence + in-child MITM vault; the dogfood path" \
-    docker  "container — cross-platform fallback; vault runs host-side")"
+  BACKEND=libkrun # the one local backend
 
   VAULT=""
   if yesno "Vault (credential stub-swap MITM)?" y \
@@ -229,13 +228,13 @@ if [ -x "$PB" ]; then
   ok "pillbox binary: $PB"
 else
   bad "no pillbox binary at $PB"
-  note "build it: scripts/lk-build.sh (libkrun) or cargo build (docker-only)"
+  note "build it: scripts/lk-build.sh"
   fail=1
 fi
 
 if [ "$BACKEND" = libkrun ] && [ -x "$PB" ]; then
-  # nm + codesign: a bare cargo build strips the HVF entitlement and pillbox
-  # silently falls back to docker — catch it here instead.
+  # nm + codesign: a bare cargo build strips the HVF entitlement, and the VM
+  # then can't start — catch it here instead.
   if [ "$(nm "$PB" 2>/dev/null | grep -c LibkrunBackend)" -ge 1 ]; then
     ok "binary has the libkrun backend"
   else
@@ -244,7 +243,7 @@ if [ "$BACKEND" = libkrun ] && [ -x "$PB" ]; then
   if [ "$(codesign -d --entitlements :- "$PB" 2>/dev/null | grep -c hypervisor)" -ge 1 ]; then
     ok "binary codesigned with the HVF entitlement"
   else
-    bad "binary not codesigned — libkrun would silently fall back to docker"
+    bad "binary not codesigned — libkrun can't create the VM"
     note "fix: scripts/lk-build.sh"
     fail=1
   fi
@@ -303,11 +302,10 @@ fi
 
 # ── compose + run ────────────────────────────────────────────────────────
 envs=()
-# Leverage the cascade: libkrun is the binary's default backend, so only flag docker;
+# Leverage the cascade: libkrun is the binary's default backend, so no backend flag;
 # the runner image comes from the descriptor cascade, so only pass PILLBOX_RUNNER_IMAGE
 # on an explicit override (env/profile) — the default run stays flagless, the cascade
 # governs, and we never drift from the binary's own run-time resolution.
-[ "$BACKEND" = docker ] && envs+=("PILLBOX_BACKEND=docker")
 [ "$IMAGE_OVERRIDE" -eq 1 ] && envs+=("PILLBOX_RUNNER_IMAGE=$IMAGE")
 [ -n "$TELEMETRY" ] && envs+=("OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT")
 

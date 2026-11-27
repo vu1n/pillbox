@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use super::{EgressSpec, RefreshSpec, SwapPair, VmSpec, VsockAttach};
 use crate::execution::files::FileTree;
 use crate::execution::verifier::{self, VerifierConfiguration};
-use crate::execution::Verifier;
+use crate::execution::{TeardownUnconfirmed, Verifier};
 use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
@@ -110,19 +110,6 @@ impl OwnershipSpec {
         self.remaining_ms.is_some()
     }
 }
-
-/// A caller must not seal a terminal result when this marker is in the error
-/// chain: process ownership still needs recovery and sampling must not restart.
-#[derive(Debug)]
-pub(crate) struct TeardownUnconfirmed;
-
-impl std::fmt::Display for TeardownUnconfirmed {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("owned execution teardown was not confirmed")
-    }
-}
-
-impl std::error::Error for TeardownUnconfirmed {}
 
 fn cleanup_failure(error: anyhow::Error, cleanup: Result<ExitStatus>) -> anyhow::Error {
     match cleanup {
@@ -903,7 +890,7 @@ fn builder_spec(
             vec![PROVIDER_HOST.into()],
             None,
             Some(ca_dir.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             Some(RefreshSpec {
                 creds_path: input.refresh_credentials.to_string_lossy().into_owned(),
                 auth_id: "codex".into(),
@@ -1914,8 +1901,7 @@ fn materialize_exact(
     if cache_complete(&generation.join("rootfs"), image_id)? {
         return Ok(());
     }
-    let mut inspect = Command::new("docker");
-    inspect.args(["image", "inspect", image_id, "--format", "{{.Id}}"]);
+    let mut inspect = crate::sandbox::oci::inspect_id_command(image_id);
     let inspected = run_command(
         &mut inspect,
         deadline,
@@ -1934,19 +1920,14 @@ fn materialize_exact(
     let archive = stage.path().join("rootfs.tar");
     let container = format!("pillbox-repository-{}", uuid::Uuid::now_v7());
     let export = (|| -> Result<()> {
-        let mut create = Command::new("docker");
-        create.args(["create", "--name", &container, image_id]);
+        let mut create = crate::sandbox::oci::create_named_command(&container, image_id);
         run_command(
             &mut create,
             deadline,
             cancelled,
             "create exact runner export",
         )?;
-        let mut export = Command::new("docker");
-        export
-            .args(["export", "--output"])
-            .arg(&archive)
-            .arg(&container);
+        let mut export = crate::sandbox::oci::export_to_file_command(&container, &archive);
         run_command(
             &mut export,
             deadline,
@@ -1969,8 +1950,7 @@ fn materialize_exact(
         fs::remove_file(&archive).context("remove exported runner archive")?;
         Ok(())
     })();
-    let mut remove = Command::new("docker");
-    remove.args(["rm", "--force", &container]);
+    let mut remove = crate::sandbox::oci::remove_command(&container);
     let cleanup = run_command(
         &mut remove,
         Instant::now() + STOP_TIMEOUT,
@@ -2396,7 +2376,7 @@ mod tests {
         );
         let egress = spec.egress.as_ref().unwrap();
         assert_eq!(egress.allowlist, ["chatgpt.com"]);
-        assert!(egress.local_forward_port.is_none());
+        assert!(egress.local_forward_ports.is_empty());
         let serialized = serde_json::to_string(&spec).unwrap();
         assert!(!serialized.contains(&value.access_release.real));
         assert!(serialized.contains(&value.access_release.stub));

@@ -1,8 +1,12 @@
 # libkrun sandbox — the substrate pivot (Docker → microVM)
 
-**Status:** direction / spec (not yet built). Supersedes the Docker-daemon local
-backend and the whole remote-backend line ([remotes-redesign.md](./archive/remotes-redesign.md),
-[remotes.md](./archive/remotes.md) — now deprecated).
+**Status:** built — libkrun is the default build and the only local backend
+(updated 2026-11-27). It superseded the Docker-daemon local backend, which is
+now **deleted** (step 8 below), and the whole remote-backend line
+([remotes-redesign.md](./archive/remotes-redesign.md),
+[remotes.md](./archive/remotes.md)). Docker remains only as runner-image export
+plumbing (`src/sandbox/oci.rs`): the microVM rootfs is `docker export`ed from the
+runner image. The sections below keep the pivot's design and slice history.
 
 > **Adopt-vs-maintain (2026-06-06).** [smolvm](https://github.com/smol-machines/smolvm)
 > (smol-machines, Apache-2.0, 3.5k★) is an independent OSS implementation of
@@ -169,8 +173,9 @@ ports by swapping only the bottom:
 
 ## Superseded / deprecated by this pivot
 
-- **Local Docker backend** (`sandbox/docker.rs`) → a libkrun backend. Code
-  currently ships (the default local backend); deprecated in direction.
+- **Local Docker backend** (`sandbox/docker.rs`) → a libkrun backend. **Deleted**:
+  `PILLBOX_BACKEND=docker` is refused, and an old docker session or sandbox record
+  can only be listed and removed (its container is left for the user).
 - **Remote backends** — `docker://`, `ssh://`, `e2b://` and
   [remotes-redesign.md](./archive/remotes-redesign.md). Already **removed** from
   the codebase: "remote" is now Cloudflare-managed or pillbox-local-on-the-box;
@@ -815,19 +820,21 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
       sets `VsockAttach.listen` when `opts.detach`; `pty-host --vsock-listen`
       (`attach/host.rs`) binds `AF_VSOCK`/`VMADDR_CID_ANY` and serves an accept
       loop (a dropped client doesn't kill the live agent).
-    - **`run_detached`** persists the `VmSpec` tempfile (the child reads it *after*
+    - **`launch_detached`** persists the `VmSpec` tempfile (the child reads it *after*
       the parent returns), spawns the `__krun-vmm` child with null stdio (don't
       wait — it is a `sandbox::DetachedChild`, whose waiter thread reaps it if it exits while
       a long-lived caller such as dispatch lives; it reparents to init once the
       caller exits), pipes the real creds to its stdin (the
-      env-fork channel, unchanged), and writes a `Session` whose `sandbox_id` is a
-      JSON `LibkrunHandle { sock, pid, creds, workspace, spec }`. No cleanup on
-      return — the child owns the VM.
+      env-fork channel, unchanged), and writes a `Session` whose `[substrate]`
+      table is `kind = "libkrun"` plus the handle's fields (`sock`, `pid`,
+      `creds`, `workspace`, `spec`, and `rootfs` when it owns one). JSON output
+      reports that handle as `sandbox_id`. No cleanup on return — the child owns
+      the VM.
     - **`reattach`** decodes the handle, `UnixStream::connect`s the persistent
       sock, and runs the normal `pump::attach_terminal` (detach-enabled). **`kill_
       session`** `SIGKILL`s `handle.pid` + scrubs the sock/spec/creds/workspace
-      clones + drops the record. Dispatched from `commands/session.rs`
-      (`Backend::Libkrun` arms, cfg-gated).
+      clones + drops the record. `commands/session` reaches both through
+      `sandbox::live_session`, which picks the session's substrate.
     - **Live-verified** (`pillbox-runner:l6`): `run --detach` returned immediately
       with a live VMM child; `session list` showed `running/detached`; `session
       attach` connected over the port2-listen sock and rendered claude's UI **with
@@ -923,7 +930,11 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      complete capture) / teardown, any model provider via the standard profile +
      `--egress-allow`. This closes substrate primitive #1 (complete persisted
      traces) — the meta-harness's next gate is the **verifiable reward channel**.
-8. **Deprecate Docker** — remove the Docker backend once libkrun is at parity (the remote backends are already gone).
+8. ✅ **Delete Docker** — the Docker agent backend, its host vault lease plane
+   and its pty-relay are removed; `--mcp` was ported to the microVM (host loopback
+   forwarded at the gateway) and the managed tier refuses it. Records store one
+   `Substrate`; the build without the `libkrun` feature is the in-guest tools
+   build with no substrate (see [substrate-plane.md](./substrate-plane.md)).
 
 ## Dependencies
 

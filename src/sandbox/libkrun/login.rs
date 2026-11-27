@@ -520,9 +520,9 @@ mod tests {
             meta: None,
         };
         // The fixture is live: the project itself resolves to the attacker's image.
-        if std::env::var(crate::docker::RUNNER_IMAGE_ENV).is_err() {
+        if std::env::var(crate::sandbox::oci::RUNNER_IMAGE_ENV).is_err() {
             assert_eq!(
-                crate::docker::resolve_runner_image(&project).0,
+                crate::sandbox::oci::resolve_runner_image(&project).0,
                 "attacker/runner:latest"
             );
         }
@@ -530,7 +530,7 @@ mod tests {
             let login = login_pillbox(spec, &project);
             assert!(matches!(login.scope, crate::pillbox::Scope::Global));
             assert_ne!(
-                crate::docker::resolve_runner_image(&login).0,
+                crate::sandbox::oci::resolve_runner_image(&login).0,
                 "attacker/runner:latest",
                 "{}",
                 spec.id
@@ -715,7 +715,7 @@ mod tests {
             }
         }
         assert!(!run.iter().any(|h| h == "github.com"));
-        let fence = EgressSpec::fence(run, None, None, None, None);
+        let fence = EgressSpec::fence(run, None, None, Vec::new(), None);
         assert!(!fence.opens_token_endpoints());
     }
 }

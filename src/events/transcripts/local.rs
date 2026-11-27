@@ -1,9 +1,7 @@
-//! Host-side transcript streaming for local-docker foreground runs.
+//! Host-side transcript streaming for local foreground runs.
 //!
-//! Unlike the remote backends — where the transcript jsonl lives
-//! inside an ephemeral sandbox — local-docker bind-mounts the agent's
-//! `$HOME` from the host (see `sandbox::docker`). So the
-//! harness's `~/.claude/projects/<encoded>/<uuid>.jsonl` (Codex:
+//! The agent's `$HOME` is a host directory the sandbox shares (libkrun's
+//! creds clone), so the harness's `~/.claude/projects/<encoded>/<uuid>.jsonl` (Codex:
 //! `~/.codex/sessions/.../rollout-*.jsonl`) is written straight to a
 //! host path, and the host can tail it live and ship spans to the
 //! operator's collector with no egress hop.
@@ -101,7 +99,6 @@ impl TailerHandle {
     /// flag** (a poll-based follow reader, e.g. the libkrun opencode `/event`
     /// file drain) — there's no transport to tear down, so stop-and-join just
     /// flips the flag and joins.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only the libkrun file-drain uses it
     pub(crate) fn from_flag(stop: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
         Self {
             stop,
@@ -234,35 +231,6 @@ pub(crate) fn spawn_local_tailer(
     )
 }
 
-/// Tail an already-running session's transcript into `log` — for the gateway
-/// (`session subscribe`) to fill + stream a *detached* session's events while
-/// it serves, closing the drive (`session send`) + read loop on one session.
-/// Unlike [`spawn_local_tailer`] it does NOT exclude pre-existing files: the
-/// transcript may already be on disk (the agent's been running) or appear once
-/// a driver sends the first input. Host-side only (the transcript is on a
-/// bind-mounted home); `None` if the agent has no transcript parser.
-pub(crate) fn spawn_attach_tailer(
-    log: SessionLog,
-    home: &Path,
-    agent_id: &str,
-    guest_cwd: &str,
-    session_id: &str,
-) -> Option<TailerHandle> {
-    let harness = Harness::for_agent(agent_id)?;
-    let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
-    // Read-side filler takes the concrete local session log used by every
-    // placement.
-    Some(spawn_tailer(
-        TailPersistence::BestEffort(Some(log)),
-        watch_root,
-        scope_dir,
-        harness,
-        session_id.to_string(),
-        true,
-        Ok(HashSet::new()), // include existing — the session may already be running
-    ))
-}
-
 /// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
 /// newest not in `exclude`), then follow it into the sinks until stopped.
 fn spawn_tailer(
@@ -331,8 +299,7 @@ fn spawn_tailer(
 /// configured and the agent has a transcript parser, spawn the live
 /// tailer — the shared observability bootstrap every backend runs once
 /// it's at the point where the agent's transcript will be local to the
-/// *current* process's filesystem (local-docker: bind-mounted host home;
-/// remote: the sandbox-side pillbox's own home). Returns the tailer
+/// *current* process's filesystem (libkrun: the shared creds clone). Returns the tailer
 /// handle (or `None` when there's nothing to tail) for the caller to
 /// shut down after the agent exits.
 ///

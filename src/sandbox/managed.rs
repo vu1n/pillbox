@@ -57,7 +57,8 @@ use super::{Caps, LiveSession, SandboxBackend, Started};
 use crate::agents::{AgentSpec, RunOpts};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::session::{self, Session, BACKEND_MANAGED};
+use crate::sandbox::{Substrate, SubstrateKind};
+use crate::session::{self, Session};
 use crate::workspace::WorkspaceBackend;
 
 mod execution_client;
@@ -112,8 +113,12 @@ impl SandboxBackend for ManagedBackend {
         }
     }
 
-    fn id(&self) -> &'static str {
-        BACKEND_MANAGED
+    fn kind(&self) -> SubstrateKind {
+        SubstrateKind::Managed
+    }
+
+    fn live(&self, session: &Session) -> Box<dyn LiveSession> {
+        Box::new(ManagedLiveSession::new(session.clone()))
     }
 
     /// Container-native, rustic-on-R2 workspace placement.
@@ -125,6 +130,14 @@ impl SandboxBackend for ManagedBackend {
     /// This builds ONLY the host side — the DO/worker restore+snapshot is a
     /// separate build to the same frozen contract (see docs/managed-tier.md).
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
+        // Managed execution has no MCP wiring: refuse `--mcp`/`--mcp-token`, never ignore them.
+        if !opts.mcps.is_empty() || !opts.mcp_tokens.is_empty() {
+            return Err(PillboxError::usage(
+                "run",
+                "managed execution does not support --mcp attachments",
+            )
+            .into());
+        }
         let supported = require_supported_agent(spec)?;
         self.run_supported(supported, opts, resolved)
     }
@@ -217,15 +230,13 @@ impl ManagedBackend {
         //    execution session id + (later) the result handle — NEVER the creds or password,
         //    which are re-resolved from env via `workspace()` on every run.
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: endpoint.clone(),
             execution_session_id: session_id.clone(),
         };
         let session = Session {
             id: session_id.clone(),
             label: opts.label.clone(),
-            backend: BACKEND_MANAGED.to_string(),
-            sandbox_id: serde_json::to_string(&handle)
-                .map_err(|e| PillboxError::config("run", format!("encode managed handle: {e}")))?,
             pty_pid: 0,
             agent_id: supported.spec.id().to_string(),
             started_at: crate::session::now_rfc3339(),
@@ -236,7 +247,7 @@ impl ManagedBackend {
             expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
             // The container mounts the restored tree at `/workspace`.
             guest_cwd: crate::agents::GUEST_WORKSPACE.to_string(),
-            placement: session::Placement::Managed,
+            substrate: Substrate::Managed(handle),
             server: Some(crate::session::ServerSession {
                 // The execution runtime correlates each bounded turn by this id.
                 agent_session_id: session_id.clone(),
@@ -451,7 +462,7 @@ impl LiveSession for ManagedLiveSession {
     }
 }
 
-/// What a managed session stores in [`Session::sandbox_id`] (as JSON): the Worker
+/// What a managed session stores as its [`Substrate::Managed`] handle: the Worker
 /// origin + execution session id. Mirrors libkrun's
 /// `LibkrunHandle` pattern — an opaque, backend-specific handle the runtime decodes
 /// to find the session again. No credential material (the token comes from env).
@@ -463,6 +474,9 @@ pub(crate) struct ManagedHandle {
     /// retired gateway client without preserving gateway semantics.
     #[serde(alias = "do_session_id")]
     pub(crate) execution_session_id: String,
+    // Fields a newer pillbox wrote are kept, so rewriting the record never drops them.
+    #[serde(flatten)]
+    pub(crate) extra: toml::Table,
 }
 
 impl ManagedHandle {
@@ -472,14 +486,14 @@ impl ManagedHandle {
     }
 
     fn decode_for_origin(session: &Session, configured: &str) -> Result<Self> {
-        let handle: Self = serde_json::from_str(&session.sandbox_id)
-            .map_err(|e| {
-                PillboxError::config(
-                    "session",
-                    format!("decode managed session handle for `{}`: {e}", session.id),
-                )
-            })
-            .map_err(anyhow::Error::from)?;
+        let Substrate::Managed(handle) = &session.substrate else {
+            return Err(PillboxError::config(
+                "session",
+                format!("session `{}` has no managed handle", session.id),
+            )
+            .into());
+        };
+        let handle = handle.clone();
         if handle.execution_session_id != session.id {
             return Err(PillboxError::config(
                 "session",
@@ -1501,6 +1515,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mcp_is_refused_before_managed_state_or_external_access() {
+        for name in ["managed-mcp", "managed-mcp-token"] {
+            crate::test_util::with_isolated_home(name, || {
+                let resolved = crate::pillbox::global();
+                let mut opts = run_opts();
+                if name == "managed-mcp" {
+                    opts.mcps = vec![crate::agents::McpAttachment::parse(
+                        "mem0=https://mcp.example.com/mcp",
+                    )
+                    .unwrap()];
+                } else {
+                    opts.mcp_tokens = vec![crate::agents::McpTokenSpec {
+                        mcp_name: "mem0".into(),
+                        secret_name: "MEM0_TOKEN".into(),
+                    }];
+                }
+                let error = ManagedBackend
+                    .run(&crate::agents::OPENCODE, opts, &resolved)
+                    .expect_err("managed --mcp must be refused");
+                let usage = error
+                    .downcast_ref::<PillboxError>()
+                    .is_some_and(|e| matches!(e.category, crate::errors::ExitCategory::Usage));
+                assert!(usage, "expected a usage error, got: {error:#}");
+                assert!(error.to_string().contains("--mcp"), "{error:#}");
+                assert!(
+                    !resolved.state_dir.exists(),
+                    "the refusal must precede session, snapshot, and credential state"
+                );
+            });
+        }
+    }
+
     /// HMAC-SHA256 against the RFC 4231 Test Case 2 vector
     /// (key=`"Jefe"`, data=`"what do ya want for nothing?"`) — proves our
     /// hand-rolled HMAC matches the standard, so a token the DO's WebCrypto
@@ -1593,18 +1640,17 @@ mod tests {
         assert_ne!(signature, alternate);
     }
 
-    /// The handle round-trips through the record's `sandbox_id` JSON, so the
-    /// plane can decode the DO endpoint + session id back out.
+    /// The handle round-trips through the record's substrate, so the plane can
+    /// read the Worker endpoint + session id back out.
     #[test]
-    fn managed_handle_round_trips_through_sandbox_id() {
+    fn managed_handle_round_trips_through_the_substrate() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "abc123def456".into(),
         };
         let mut s = Session::test_fixture();
-        s.backend = BACKEND_MANAGED.to_string();
-        s.placement = session::Placement::Managed;
-        s.sandbox_id = serde_json::to_string(&handle).unwrap();
+        s.substrate = Substrate::Managed(handle.clone());
 
         let decoded = ManagedHandle::decode_for_origin(&s, "https://w.workers.dev")
             .expect("decodes the managed handle");
@@ -1614,18 +1660,21 @@ mod tests {
     #[test]
     fn managed_handle_rejects_record_and_origin_mismatch() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "def456abc123".into(),
         };
         let mut session = Session::test_fixture();
-        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
+        session.substrate = Substrate::Managed(handle);
         assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
 
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://other.workers.dev".into(),
             execution_session_id: session.id.clone(),
         };
-        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        session.substrate = Substrate::Managed(handle);
         assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
     }
 
@@ -1652,13 +1701,12 @@ mod tests {
     #[test]
     fn unsupported_verbs_reject_with_clear_errors() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "sess-do".into(),
         };
         let mut s = Session::test_fixture();
-        s.backend = BACKEND_MANAGED.to_string();
-        s.placement = session::Placement::Managed;
-        s.sandbox_id = serde_json::to_string(&handle).unwrap();
+        s.substrate = Substrate::Managed(handle);
         let live = ManagedLiveSession::new(s);
 
         assert!(live.http().is_err(), "managed exposes no SandboxHttp");
@@ -1754,14 +1802,13 @@ mod tests {
     #[test]
     fn persisted_record_excludes_creds_and_password() {
         let handle = ManagedHandle {
+            extra: Default::default(),
             endpoint: "https://w.workers.dev".into(),
             execution_session_id: "sess-do".into(),
         };
         let session = Session {
             id: "sess-do".into(),
             label: None,
-            backend: BACKEND_MANAGED.to_string(),
-            sandbox_id: serde_json::to_string(&handle).unwrap(),
             pty_pid: 0,
             agent_id: "opencode".into(),
             started_at: crate::session::now_rfc3339(),
@@ -1770,7 +1817,7 @@ mod tests {
             result_snapshot: Some("snap-result".into()),
             expires_at: None,
             guest_cwd: crate::agents::GUEST_WORKSPACE.to_string(),
-            placement: session::Placement::Managed,
+            substrate: Substrate::Managed(handle),
             server: Some(crate::session::ServerSession {
                 agent_session_id: "sess-do".into(),
                 model: "zai-coding-plan/glm-4.5-air".into(),

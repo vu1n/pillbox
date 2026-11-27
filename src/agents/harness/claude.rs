@@ -1,14 +1,11 @@
 //! Claude Code harness adapter — `claude -p … --output-format stream-json`
 //! (a `HarnessAdapter`, stdout JSON-lines).
 //!
-//! Two drivers share this normalizer:
-//!   - libkrun `claude-stream` ([`crate::agents::CLAUDE_STREAM`]): a supervised
-//!     one-shot in the microVM. argv comes from [`ClaudeAdapter::guest_root_argv`]
-//!     (the guest runs as root, so `--permission-mode auto`, never
-//!     `--dangerously-skip-permissions`); `sandbox::structured` drains the
-//!     capture into the durable SessionLog.
-//!   - the deprecated docker `sandbox agent` channel, argv from
-//!     [`HarnessAdapter::run_argv`] (left as-is; docker gets no new work).
+//! Its driver is libkrun `claude-stream` ([`crate::agents::CLAUDE_STREAM`]): a
+//! supervised one-shot in the microVM. argv comes from
+//! [`ClaudeAdapter::guest_root_argv`] (the guest runs as root, so
+//! `--permission-mode auto`, never `--dangerously-skip-permissions`);
+//! `sandbox::structured` drains the capture into the durable SessionLog.
 //!
 //! Schema: first verified against Claude Code 2.1.143; re-verified against the
 //! runner-pinned 2.1.289 from real stream-json captures of the 2.1.289 binary
@@ -48,7 +45,6 @@ pub(crate) struct ClaudeAdapter {
 }
 
 impl ClaudeAdapter {
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn with_request(requested: Option<RequestedRunProfile>) -> Self {
         Self {
             state: ClaudeState::default(),
@@ -66,7 +62,6 @@ impl ClaudeAdapter {
     /// instead of stalling. `--` ends option parsing so a prompt starting with
     /// `-` is never read as a flag. Not `--bare`: bare mode never reads OAuth
     /// credentials, and the vault hands the guest a stubbed OAuth file.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn guest_root_argv(&self, permission_args: &[&str], prompt: &str) -> Vec<String> {
         let mut argv: Vec<String> = [
             "claude",
@@ -123,9 +118,8 @@ impl ClaudeAdapter {
 
 impl HarnessAdapter for ClaudeAdapter {
     fn run_argv(&self, prompt: &str) -> Vec<String> {
-        // Docker `sandbox agent` only (deprecated path, unchanged). `--verbose`
-        // is required alongside `stream-json`; skip-permissions needs the
-        // non-root user the docker agent sandbox is launched as. The root
+        // A non-root guest's argv. `--verbose` is required alongside
+        // `stream-json`; skip-permissions needs a non-root user. The root
         // libkrun guest uses [`ClaudeAdapter::guest_root_argv`] instead.
         vec![
             "claude".into(),

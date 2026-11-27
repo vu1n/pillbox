@@ -53,8 +53,8 @@ its native structured protocol on pipes:
 agent ids that share the PTY agent's auth home (`auth_id`): `codex-serve`
 (server mode) and `claude-stream` (one-shot `Integration::Structured`, like pi
 and cursor). A separate id rather than a flag because the integration kind is a
-per-spec property that routes the run, the backend check (docker rejects
-structured agents), and the capture/model policy.
+per-spec property that routes the run, the backend capability check, and the
+capture/model policy.
 
 `claude-stream` notes, verified against Claude Code 2.1.289 (the runner pin)
 from captures of the real binary talking to a loopback API mock — no live

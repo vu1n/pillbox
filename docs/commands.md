@@ -2,9 +2,12 @@
 
 The full `pillbox` CLI surface — the detail behind the AGENTS.md router.
 
-> **NOTE:** docker-backend commands/flags below are **deprecated** — libkrun
-> is THE backend. They remain
-> documented until the docker backend is deleted.
+> **Substrate:** libkrun is THE local backend. `PILLBOX_BACKEND` picks the
+> substrate a new run is placed on: unset (or `libkrun`) → the local libkrun
+> microVM, `managed` → the experimental Cloudflare managed tier. Any other value
+> is a usage error (exit 2) — `docker` included: the Docker backend was removed.
+> A pillbox built without the `libkrun` feature (the in-guest tools build) has
+> no substrate and refuses every command that needs one with exit 2.
 
 ## Command surface
 
@@ -41,7 +44,7 @@ global pillbox regardless of where you are.
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). Structured-session JSON separates the persisted `execution.requested` provider/model/profile/reasoning request from `served_model` and `effective_limits`. Reported runtime facts cite their session-log `seq`; missing facts are explicit `unavailable` values and are never filled from the request. |
 | `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, an activity summary from the durable log, and the **conditions table** (`Ready` / `AwaitingInput` / `Finished` / `ResultAvailable`, each True/False with a reason and a since-time) — the "what happened / why is it stuck" companion to `info`. `--json` carries the same `conditions[]` as `info`/`list` (schema below). Accepts an id prefix ≥ 4 chars. |
-| `pillbox session attach ID` | Reattach to a detached local libkrun PTY session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Managed sessions have no host PTY; the deprecated Docker backend remains compatibility residue. |
+| `pillbox session attach ID` | Reattach to a detached local libkrun PTY session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Managed sessions have no host PTY. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session send ID TEXT` | Drive a running session through `LiveSession`: raw input for a local libkrun PTY, a structured prompt for server-mode/managed agents. Pair with `session subscribe` or `watch` to read the response. Add a trailing newline/`\r` to submit to a TUI agent. On a libkrun PTY the body and that terminator go as two writes 250 ms apart, because a composer that gets both in one write can keep the turn as an unsent draft (Codex `codex` gets the body as a bracketed paste, then CR); the bytes are otherwise unchanged. A send that returns is not proof the agent took the turn: use `session wait-idle` or the session log to see that it ran. |
 | `pillbox session annotate ID TEXT [--anchor REF]` | Record an attributed, durable §0 comment WITHOUT driving the agent — the async, keyboard-free "chime in" (distinct from `send`, which steers). Lands in the log stamped with your actor; an orchestrator may inject it as agent context. `--anchor` references what it's about (a seq, a path, a message id). |
@@ -51,7 +54,7 @@ global pillbox regardless of where you are.
 | `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the result workspace push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
 | `pillbox session pull ID [--to DIR]` | Rehydrate a session's result workspace into a directory. Reads `result_snapshot` from the session record; errors clearly if the agent hasn't finished. Default `DIR` is `./session-<id>`. |
 | `pillbox session score ID (--cmd "VERIFIER" \| --rubric FILE) [--snapshot HANDLE \| --workspace DIR] [--in-sandbox] [--drop-privileges] [--grader-egress HOST]… [--json]` | **Externally grade** a session's result — the verifiable, non-self-reported reward channel (vs `session done --status`, which is the agent's self-report, Goodhart-banned). `--cmd VERIFIER` runs one command via `sh -c` with cwd = the rehydrated `result_snapshot` (or `--snapshot`/`--workspace`), captures its **exit code + output**, and appends a `scored` §0 event (exit 0 → passed/score 1.0, else 0.0; combined output → `feedback`, tail-capped at 32K). **`--rubric FILE`** (mutually exclusive with `--cmd`) grades against a checklist — each non-blank, non-`#` line is `NAME :: COMMAND`, a named criterion run in the same workspace — and the `scored` event gains **per-criterion verdicts** (`criteria: [{name, passed, feedback}]`) with `score` = the passed fraction (a real gradient; the decomposed feedback an optimizer reflects on). Default runs on the host; **`--in-sandbox`** runs it in a one-shot microVM (the runner toolchain, offline + secret-free) — for real repos whose tests need the image's deps (libkrun feature). The guest prints a marker only after the workspace is mounted; if it is missing (the VM died first) the command errors and records no `scored` event. **`--drop-privileges`** (in-sandbox only) runs that grader as `nobody` — dispatch sets it once protected paths are mode-locked. **`--grader-egress HOST`** (repeatable, in-sandbox only) opens the grader's DNS-fence to the listed hosts so its tests can fetch deps (`--grader-egress pypi.org --grader-egress files.pythonhosted.org` for pip; `registry.npmjs.org` for npm) — same MITM-with-empty-swap path as a vault run, no creds, every other host fenced; trades offline reproducibility for reachability. **`--json`** emits the verdict (`{version, session, grader, passed, score, feedback, seq}`) on stdout so a loop reads the result directly — no stdout-scrape, no §0-log reach-in; `seq` is the `scored` event's log seq. Otherwise read back via the session's §0 log (`session subscribe`/`watch` or the log file); the optimization loops consume these. |
-| `pillbox session ingest ID [--json]` | Drain a session's durable raw §0 capture (its persisted `/api/event` stream) into the canonical `log.jsonl`, **post-hoc and idempotent**. For headless/batch runs (the optimization loop) where no live `subscribe`/`watch` filled the log: the reparented guest outlives `run`, so a host-side live tailer can't persist for it, but the guest's capture file does — so the full agent **trajectory** (messages + tool calls) lands in the §0 log without racing the session. Run it BEFORE `session score` so trajectory events precede the `scored` event in seq order. Re-running is a no-op (`.ingested` marker). **libkrun opencode today**; docker/PTY sessions drain live via `session subscribe`/`watch`. No VM boot — pure file read + log append. |
+| `pillbox session ingest ID [--json]` | Drain a session's durable raw §0 capture (its persisted `/api/event` stream) into the canonical `log.jsonl`, **post-hoc and idempotent**. For headless/batch runs (the optimization loop) where no live `subscribe`/`watch` filled the log: the reparented guest outlives `run`, so a host-side live tailer can't persist for it, but the guest's capture file does — so the full agent **trajectory** (messages + tool calls) lands in the §0 log without racing the session. Run it BEFORE `session score` so trajectory events precede the `scored` event in seq order. Re-running is a no-op (`.ingested` marker). **libkrun opencode today**; PTY sessions drain live via `session subscribe`/`watch`. No VM boot — pure file read + log append. |
 | `pillbox session log ID [--type TYPE]… [--last] [--from SEQ]` | **Read** a session's durable §0 log (`log.jsonl`) — the per-session event stream `score`/`ingest`/`wait-idle` write — as one event JSON per line in seq order. The structured §0 read an orchestrator/eval harness uses instead of opening the on-disk log by hand. `--type` filters by payload tag (repeatable; snake_case, e.g. `tool_call`, `scored`, `message_end`; an unknown tag matches nothing — typo → empty, not error); `--last` keeps only the final match (the "latest scored/idle verdict" read); `--from SEQ` starts mid-log. Resolves the session **record** (consistent with `score`/`ingest`), so an already-`rm`'d session's orphaned log isn't readable this way. Distinct from `session events`, the pillbox-wide *lifecycle* stream. |
 | `pillbox session wait-idle ID [--timeout SECS] [--from SEQ]` | Block until the session's current turn goes **idle** — the agent finished and is waiting for input (the §0 `AttentionRequired` signal) or the run terminated (`RunFinished`/`RunFailed`). The drive-surface "turn done" primitive: `session send` a prompt, then `wait-idle` instead of polling. Drains the §0 capture into the durable log **while** waiting (so the trajectory lands too — a later `session ingest` is then redundant). Exits 0 on idle, **1 on `--timeout`**. Waits for an idle event after the current log tail (or `--from SEQ`). `session info --json` exposes the result-workspace path for graders/orchestrators. |
 | `pillbox session guard ID [--max-repeats N] [--max-tokens N] [--kill]` | **Circuit-breaker** over a session's LIVE §0 stream: subscribe (filling the durable log as it watches, like `wait-idle`), run a **pure pathology detector** over each event, and on a trip either tear down the session (`--kill`, the orphan-safe `session rm` kill path) or — by **default (dry-run)** — just log the trip and exit 0. `--kill` is the explicit arm because a kill can destroy a VM. Three event-driven signals: (1) a **repeated identical tool call** — the same (name, input) firing `≥ N` times in a row (`--max-repeats N`); (2) an **error spiral** — `≥ N` consecutive tool errors (same `--max-repeats` threshold), and any `RunFailed` always trips immediately; (3) a **token blowout** — cumulative `Usage` input+output tokens past `--max-tokens N`. `--max-repeats`/`--max-tokens` default to 0 (disabled); with neither set, the guard trips only on `RunFailed`. Returns when it trips, the stream ends, or Ctrl-C. A **standalone monitor** — not (yet) wired into `dispatch`'s send→wait-idle loop. (`--stall-secs`, a wall-clock watchdog, is a deferred follow-up.) |
@@ -60,7 +63,7 @@ global pillbox regardless of where you are.
 | `pillbox session prune [--dry-run]` | Tear down every session whose `expires_at` is in the past (calls `session rm` per record). Sessions without `--ttl` are left alone. Intended for cron/orchestrator schedules; pillbox doesn't auto-prune. |
 | `pillbox session events [--follow] [--json]` | Tail the local events stream (`<pillbox>/events.jsonl`). |
 | `pillbox session transcript FILE --session-id ID [--agent claude\|codex] [--follow]` | Drain an agent-native transcript (Claude Code `~/.claude/projects/<encoded>/<uuid>.jsonl` or Codex `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`) and emit one OTLP child span per rendered event, parented under the session span derived from `ID`. Harness auto-detected from path; `--agent` overrides. `--follow` drains then blocks waiting on FS notifications and emits spans for each appended line (Ctrl-C to stop) — the "watch your agent think" mode. Requires `OTEL_EXPORTER_OTLP_ENDPOINT` to actually ship; parser runs regardless and reports the event count. See [docs/observability.md](./docs/observability.md). |
-| `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
+| `pillbox doctor [--json]` | Diagnose `$HOME`, data-dir perms, the selected substrate (and, for libkrun, virtualization, runtime deps, disk headroom, orphaned VMMs), and whether the runner image is available for rootfs export (optional). |
 | `pillbox version` | Print pillbox + runner image versions. |
 | `pillbox push [--tag T] [--message M] [--bookmark NAME] [--parent HANDLE]… [--json]` | Snapshot cwd into the pillbox's rustic repo. `--bookmark NAME` also points a bookmark at the new snapshot atomically (snapshot+name in one call, bound to this push — no handle-copy or `latest` race; needs a project pillbox). `--parent HANDLE` (repeatable, prefix-ok) records parent snapshots as this one's **lineage** — the merge-back edge an orchestrator declares after merging collected results (`push --parent <base> --parent <winner>`). Parents resolve to full ids (unknown parent → error) and are stored pillbox-native (survive `session rm`, work on S3/R2); surfaced as a `parents` array by `snapshot show/list --json`. |
 | `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot (defaults to latest) or bookmark. |
@@ -81,9 +84,9 @@ global pillbox regardless of where you are.
 repeatedly — the PTY-free exec channel an orchestrator drives. The VM works on
 its own CoW, secret-scrubbed clone of the workspace (never the host directory):
 its writes land in the clone, whose host path `sandbox list --json` reports as
-`workspace_clone`. Docker is deprecated: with `PILLBOX_BACKEND=docker` (or a
-build without libkrun) `spawn` is refused, and an old docker record can only be
-destroyed (its container is left for you to remove). See
+`workspace_clone`. `PILLBOX_BACKEND=managed` and a build without libkrun refuse
+`spawn`, and a record left by the removed Docker backend can only be destroyed
+(its container is left for you to remove). See
 [sandboxes](features/sandboxes.md).
 
 | Command | What it does |
@@ -123,7 +126,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 | `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `prime-agent` \| `cursor`). `pi`, `prime-agent`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. `prime-agent` is Prime Intellect's fork of pi: same `--model PROVIDER/MODEL`, adapter and posture as `pi`, with its own auth home (`~/.prime/agent/auth.json`). Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
-| `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |
+| `--mount HOST:GUEST` | — | Refused (exit 2, before anything launches): the microVM takes no extra host mounts. A preset `mount` is refused the same way. |
 | `--with NAME[=ENV_VAR]` | — | Inject one stored secret. |
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle. |
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
@@ -131,7 +134,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 | `--egress-allow HOST` | — | Open one host through the libkrun egress fence **and** the vault broker allowlist (repeatable; exact match, or `.suffix` for subdomains). For a self-hosted model endpoint or a registry a build needs. |
 | `--egress-deny` | — | Switch on the vault broker's **default-deny**: block outbound to any host with no credential provider that isn't on `--egress-allow`. Enforced at the vault proxy — needs `--vault` (or a vaulted `--with`), else warns and is a no-op. See [docs/vault.md](./docs/vault.md). |
 | `--memory` | — | Wire in swarm memory (the external [`kypp`](https://github.com/vu1n/kypp) engine, attached not owned): brief the agent from project memory at start, capture this session's §0 log after. Host-side, best-effort — a missing/erroring `kypp` warns, never fails the run. |
-| `--mcp NAME=URL` | — | Attach a shared MCP server (`http(s)://`). NAME is what the agent sees; `localhost`/`127.0.0.1` are rewritten to `host.docker.internal`. Repeatable. See [docs/shared-mcp.md](./docs/shared-mcp.md). |
+| `--mcp NAME=URL` | — | Attach a shared MCP server (`http(s)://`). NAME is what the agent sees. A server on the host's loopback (`localhost`/`127.0.0.1`/`[::1]:PORT`) is forwarded into the microVM at the gateway; a remote server must be `https://` on port 443 with a DNS host name, which joins the run's egress allowlist. claude, codex and opencode honor it; other agents and the managed tier refuse it. Repeatable. See [docs/shared-mcp.md](./docs/shared-mcp.md). |
 | `--mcp-token NAME=SECRET_NAME` | — | Attach a bearer token (from the secret store) to a `--mcp NAME`. claude folds it into a 0600 headers tempfile; codex into an env var via `bearer_token_env_var`. Never lands in argv or shell history. Repeatable. |
 | `--from-bookmark NAME` | — | Start from a named snapshot bookmark — the **guest** workspace is forked from that snapshot before the agent launches. Bookmark forks require the local libkrun backend. Without `--workspace`, the snapshot is materialized into a shared base cache and CoW-cloned per run (so `k` dispatch workers pay one restore, not `k`) and your **cwd and the selected project directory are left untouched** — use `pillbox pull` to restore a snapshot into cwd. With `--workspace DIR`, the snapshot is restored into that dir. |
 | `--detach` | — | Start a local libkrun session and immediately return; the microVM and its credential/egress broker keep running. Reattach with `pillbox session attach <id>`. Managed detached finalization is not implemented. |
@@ -214,7 +217,7 @@ not `PROVIDER/MODEL`.
 A local libkrun `pillbox run --detach` session can be left running and
 reconnected to later. The VM owns its credential/egress broker, so vaulted
 detached runs are supported. Managed detached finalization is not implemented;
-the deprecated Docker backend does not define the product contract.
+only libkrun sessions can be reattached.
 
 | Action | How |
 |---|---|
@@ -369,10 +372,13 @@ future releases; the version bumps on restructure. Pin against
 // pillbox doctor --json
 {
   "version": 1,
+  "backend": "libkrun",          // the selected substrate; null when PILLBOX_BACKEND is refused
   "checks": [
-    { "name": "docker_daemon", "ok": true, "detail": "Docker 24.0.7" },
-    { "name": "runner_image", "ok": true, "detail": "pillbox:latest (...)" },
-    { "name": "data_dir_perms", "ok": true, "detail": "/Users/x/.pillbox mode 700" }
+    { "name": "home_resolvable", "ok": true, "detail": "/Users/x", "required": true },
+    { "name": "data_dir_perms", "ok": true, "detail": "/Users/x/.pillbox mode 700", "required": true },
+    { "name": "substrate", "ok": true, "detail": "libkrun", "required": true },
+    { "name": "virtualization", "ok": true, "detail": "CPU virtualization available", "required": true },
+    { "name": "runner_image", "ok": true, "detail": "pillbox:latest (...)", "required": false }
   ],
   "overall_ok": true
 }

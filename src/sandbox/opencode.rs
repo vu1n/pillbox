@@ -27,11 +27,9 @@ const ACTION: &str = "run (opencode server)";
 
 /// Port the in-sandbox `opencode serve` listens on (guest loopback only; reached
 /// by the backend's [`SandboxHttp`] transport).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const SERVE_PORT: u16 = 4096;
 
 /// HTTP basic-auth user OpenCode 2's server expects.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const SERVER_USER: &str = "opencode";
 
 /// The guest server's password. OpenCode 2 refuses to serve without one (it
@@ -40,7 +38,6 @@ pub(crate) const SERVER_USER: &str = "opencode";
 /// it. It is not a secret: the server binds guest loopback and is reached from
 /// the host only through the session's private vsock socket; the microVM is the
 /// boundary, not this password.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const SERVER_PASSWORD: &str = "pillbox-guest-loopback";
 
 /// Default model when `--model` isn't given. `provider/modelID`. OpenCode 2
@@ -57,11 +54,9 @@ pub(crate) const DEFAULT_MODEL: &str = "zai-coding-plan/glm-4.5-air";
 /// is dropped, events during a disconnect are missed), which is why the capture
 /// is a co-located file rather than a host-side subscription. See
 /// [`crate::events::opencode::FollowReader`].
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const EVENTS_FILE: &str = ".pillbox-opencode-events.sse";
 
 /// The in-sandbox command: a headless opencode server bound to localhost.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn serve_args() -> Vec<String> {
     [
         "opencode",
@@ -87,7 +82,6 @@ pub(crate) fn serve_args() -> Vec<String> {
 /// built-in catalog); agent-level `request.body` and the v1 `temperature` /
 /// `options.temperature` fields were accepted but never sent (checked against
 /// a capturing provider on 2.0.24).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn serve_env(model: &str, temperature: Option<f64>) -> Result<Vec<(String, String)>> {
     let (provider, model_id) = split_model(model, ACTION)?;
     let mut env = vec![(
@@ -118,7 +112,6 @@ fn split_model<'a>(model: &'a str, action: &'static str) -> Result<(&'a str, &'a
 /// can take a few seconds), bounded so a dead server fails loud instead of hanging.
 /// A `404` means the server is up but has no 2.x routes: the runner image still
 /// carries OpenCode 1.x, which this adapter does not speak.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     for _ in 0..60 {
         if let Ok(resp) = http.request("GET", "/api/info", None) {
@@ -142,7 +135,6 @@ pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
 
 /// `POST /api/session` with the model → the new session id (`ses_…`, under
 /// `data.id`). `model` is `provider/modelID`.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn create_session(http: &dyn SandboxHttp, model: &str) -> Result<String> {
     let (provider, model_id) = split_model(model, ACTION)?;
     let body = serde_json::json!({ "model": { "providerID": provider, "id": model_id } });
@@ -173,7 +165,6 @@ pub(crate) fn create_session(http: &dyn SandboxHttp, model: &str) -> Result<Stri
 /// Drive the session: `POST /api/session/{id}/prompt` with the text. OpenCode
 /// admits the input durably and returns it (`200`); the turn itself streams on
 /// `/api/event` (read via [`spawn_event_bridge`] or the guest capture).
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn send_prompt(
     http: &dyn SandboxHttp,
     opencode_session: &str,

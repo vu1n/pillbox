@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Context, Result};
 use serde_json::json;
 
-use super::evidence::ExecutionEvidence;
-use super::files::{FileBroker, FileTree};
-use super::native::{self, NativeLimits};
-use super::protocol::{self, CodexProfile};
-use super::store::OwnedInvocation;
-use super::{snapshot, verifier, *};
 use crate::contract::{Custom, Payload, RunFinished, Scored};
+use crate::execution::evidence::ExecutionEvidence;
+use crate::execution::files::{FileBroker, FileTree};
+use crate::execution::native::{self, NativeLimits};
+use crate::execution::protocol::{self, CodexProfile};
+use crate::execution::store::OwnedInvocation;
+use crate::execution::{snapshot, verifier, *};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::{self, BuilderInput, VerifierInput, VmLimits};
 
@@ -123,7 +123,7 @@ fn run_builder(
     check_live(owner, deadline)?;
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
-    let real = crate::vault::pre_refresh(&credentials_path, "codex")?
+    let real = crate::vault::refresh::pre_refresh(&credentials_path, "codex")?
         .context("Codex token store did not return credentials")?;
     let fresh = crate::vault::providers::codex_execution::fresh_codex_credentials(
         &real,

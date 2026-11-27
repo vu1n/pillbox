@@ -3,14 +3,14 @@ id: repository-execution
 paths:
   - "src/commands/execution.rs"
   - "src/execution/mod.rs"
-  - "src/execution/local.rs"
+  - "src/execution/microvm/local.rs"
   - "src/execution/store.rs"
   - "src/execution/snapshot.rs"
   - "src/execution/files.rs"
   - "src/execution/native.rs"
   - "src/execution/protocol.rs"
   - "src/execution/verifier.rs"
-  - "src/execution/probe.rs"
+  - "src/execution/microvm/probe.rs"
   - "src/execution/evidence.rs"
   - "src/sandbox/libkrun/repository/**"
   - "src/sandbox/libkrun/repository.rs"
@@ -19,7 +19,7 @@ paths:
 entry:
   - "src/commands/execution.rs:dispatch"
   - "src/execution/store.rs:InvocationStore"
-  - "src/execution/local.rs:execute"
+  - "src/execution/microvm/local.rs:execute"
 tests:
   - "src/execution/store.rs:duplicate_never_gets_ownership_and_changed_request_conflicts"
   - "src/execution/store.rs:owner_loss_is_interrupted_even_before_first_launch"

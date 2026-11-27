@@ -56,7 +56,9 @@ impl SessionOps for LiveSessions {
 /// Whether this build can run the grader microVM. Without it dispatch and eval
 /// refuse to start rather than grade worker code on the host.
 pub(crate) fn grader_vm_available() -> bool {
-    cfg!(feature = "libkrun")
+    crate::sandbox::SubstrateKind::Libkrun
+        .backend()
+        .is_ok_and(|backend| backend.capabilities().in_sandbox_grading)
 }
 
 /// Restore `bookmark` into a fresh temp dir and scrub it like a worker's clone —

@@ -93,7 +93,7 @@ fn host_matches(host: &str, entry: &str) -> bool {
 /// already pins names to the gateway, so this closes the complementary hole
 /// where an allowlisted *name* resolves host-side to something internal —
 /// cloud metadata 169.254.169.254, `10.0.0.0/8`, a LAN box, `::1`) and the
-/// docker broker's forward connector (no network fence at all, so this is the
+/// sidecar proxy's forward connector (no network fence at all, so this is the
 /// only line between a rebind/allowlisted-internal name and an SSRF). Checked at
 /// the resolved IP so there's no TOCTOU. Global/public addresses pass.
 /// (iron-proxy's guard; see docs/vault.md.)

@@ -89,7 +89,7 @@ fn spec(
             vec![PROVIDER_HOST.into()],
             None,
             Some(ca.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             Some(RefreshSpec {
                 creds_path: input.refresh_credentials.to_string_lossy().into_owned(),
                 auth_id: "claude".into(),
@@ -185,7 +185,7 @@ mod tests {
         assert!(spec.shares.is_empty());
         let egress = spec.egress.unwrap();
         assert_eq!(egress.allowlist, [PROVIDER_HOST]);
-        assert!(egress.local_forward_port.is_none());
+        assert!(egress.local_forward_ports.is_empty());
         assert_eq!(egress.refresh.unwrap().auth_id, "claude");
     }
 }

@@ -423,8 +423,8 @@ mod tests {
     fn collect_errors_all_or_nothing_when_a_session_has_no_result() {
         with_isolated_home("collect-pending", || {
             let g = pillbox::global();
-            // A fixture session with no result_snapshot and (docker, no live
-            // backend) no live clone → unfinished.
+            // A fixture session with no result_snapshot and no live clone →
+            // unfinished.
             let mut s = Session::test_fixture();
             s.id = Session::new_id();
             s.result_snapshot = None;

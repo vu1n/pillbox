@@ -2,11 +2,9 @@
 //! the [`Frame`] protocol to N clients over a unix socket. It keeps running
 //! across client disconnects, so detach / `--detach` / reattach all work.
 //!
-//! This is the process that, in the remote backends, runs *inside* the
-//! sandbox (it is `pillbox` in `pty-host` mode). A per-attach transport
-//! (docker exec / ssh / e2b) carries one client's frames between the local
-//! pump and one socket connection here. Locally we connect the pump to the
-//! socket directly.
+//! This is the process that runs *inside* the sandbox (it is `pillbox` in
+//! `pty-host` mode). The libkrun backend bridges its unix socket to the guest's
+//! vsock listener, so the local pump connects to this socket directly.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -273,14 +271,14 @@ fn spawn_pty_session(argv: &[String]) -> Result<PtySession> {
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     // CommandBuilder defaults cwd to $HOME when unset — but the agent must
-    // start in the workspace (the backend sets the host process's cwd, e.g.
-    // docker `-w /workspace/<name>`). Inherit it explicitly.
+    // start in the workspace (the backend sets this process's cwd to
+    // `/workspace/<name>`). Inherit it explicitly.
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
     // portable-pty switches to explicit-env mode the moment we set any var,
     // so inherit the full environment first (the agent needs HOME, PATH,
-    // and the secrets/env the backend injected via `docker run -e`), then
+    // and the secrets/env the backend injected), then
     // ensure a sane TERM.
     for (k, v) in std::env::vars() {
         cmd.env(k, v);

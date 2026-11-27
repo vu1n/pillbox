@@ -38,12 +38,12 @@
 //!   "started_at": "2026-05-23T13:37:00Z",  // → OTel span.start_time
 //!   "ended_at":   "2026-05-23T13:42:11Z",  // → OTel span.end_time (terminal only)
 //!   "agent_id": "claude",
-//!   "backend": "docker",
+//!   "backend": "libkrun",
 //!   "label": null,
 //!   "startup_ms": 421,
 //!   "startup_stages": [
-//!     { "name": "docker_preflight", "duration_ms": 31 },
-//!     { "name": "container_start", "duration_ms": 390 }
+//!     { "name": "vmm_spawn", "duration_ms": 31 },
+//!     { "name": "attach_ready", "duration_ms": 390 }
 //!   ],
 //!   // Terminal-event-only fields (null on started / dropped):
 //!   "status": "ok",                        // → OTel status.code ("ok" | "error")
@@ -96,11 +96,8 @@ use crate::pillbox::Pillbox;
 use crate::session::{self, Session};
 use crate::startup::StartupMetrics;
 
-// codex-serve is libkrun-only (docker rejects it), so the mapper + NDJSON drain
-// are consumed only under that feature (and by tests); allow dead-code otherwise.
 pub(crate) mod blob;
 pub(crate) mod capture;
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) mod codex_serve;
 mod jsonl;
 pub(crate) mod log;
@@ -120,13 +117,11 @@ pub(crate) use otel::genai::{
 /// [`ServerProfile`](crate::agents::ServerProfile) so the drain sites
 /// (`session watch`/`subscribe`/`ingest`) dispatch on data, not on the agent id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) enum EventsFormat {
     Sse,
     Ndjson,
 }
 
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 impl EventsFormat {
     /// Stable token for passing the format over argv to the detached §0 producer.
     pub(crate) fn as_str(self) -> &'static str {
@@ -148,7 +143,6 @@ impl EventsFormat {
 /// Drain a server agent's persisted capture (`reader`) into its durable log,
 /// dispatching on the capture [`EventsFormat`] — the single home for the
 /// format→drain mapping, shared by the live tailer and the post-hoc `ingest`.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn drain_server_capture<R: std::io::Read>(
     format: EventsFormat,
     reader: R,
@@ -162,7 +156,7 @@ pub(crate) fn drain_server_capture<R: std::io::Read>(
     }
 }
 
-/// Emit the root `session` span for a local-docker foreground run from
+/// Emit the root `session` span for a local foreground run from
 /// the host, at session start (see [`otel::emit_local_root_span`] for
 /// why up-front and why the host owns it). gen_ai + transcript child
 /// spans nest under it by shared trace/span id. No-op when no OTLP
@@ -173,7 +167,7 @@ pub(crate) fn emit_local_session_span(session_id: &str, start: std::time::System
 
 /// Whether an OTLP traces endpoint is configured (either the signal-
 /// specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or the base
-/// `OTEL_EXPORTER_OTLP_ENDPOINT`). The local-docker backend gates the
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`). A local run gates the
 /// host-side transcript tailer + root span on this so a plain run with
 /// no collector doesn't spawn a watcher thread for nothing.
 pub(crate) fn otlp_traces_configured() -> bool {
@@ -524,7 +518,7 @@ pub(crate) fn build_attributes(
         ("started_at", s_str(|s| &s.started_at)),
         ("ended_at", ended_at),
         ("agent_id", s_str(|s| &s.agent_id)),
-        ("backend", s_str(|s| &s.backend)),
+        ("backend", s_str(|s| s.substrate.label())),
         ("label", s_opt(|s| s.label.as_deref())),
         ("status", Some(AttrValue::Str(ty.status_code().to_string()))),
         ("reason", reason.map(AttrValue::Str)),

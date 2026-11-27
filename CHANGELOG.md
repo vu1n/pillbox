@@ -10,6 +10,50 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- Delete the Docker agent backend. `PILLBOX_BACKEND` accepts `libkrun` (the
+  default) and `managed`; `docker` is now a usage error (exit 2) that says the
+  backend was removed. Docker stays only as runner-image export plumbing
+  (`src/sandbox/oci.rs`, the one file that runs `docker`). The host vault lease
+  plane only the Docker backend fed is gone, so `pillbox sidecar` is an
+  egress-policy proxy that holds no credentials; the hidden `pty-relay` command
+  is removed.
+- Session and sandbox records store their substrate once, as a `[substrate]`
+  table. Records written before it still load: a docker or other removed
+  backend's record is listed and can be removed (pillbox prints the container it
+  left behind and never runs `docker` for it), but every other verb refuses it.
+  JSON output keeps the `backend`, `placement` and `sandbox_id` keys.
+- `--mcp`/`--mcp-token` work on the libkrun microVM for claude, codex and
+  opencode: an `http://` server on the host's loopback (`localhost` /
+  `127.0.0.1`) is forwarded to the guest at the gateway, and a remote server must
+  be `https://<dns-name>` on port 443 (its name joins the egress allowlist).
+  `https://` or `[::1]` on loopback is refused. Other agents and the managed tier
+  refuse `--mcp` instead of ignoring it.
+- **Downgrade breaks record listing:** a session or sandbox record written by
+  this version (any new record, or an old one this version rewrote) can't be
+  read by an older pillbox, so its `session list` / `sandbox list` fail until
+  those records are removed. A record whose `[substrate]` kind this version
+  doesn't know (written by a newer pillbox) is listed and removable, and is
+  written back unchanged; handle fields it doesn't know are kept too.
+- An unrecognized `PILLBOX_BACKEND` value now exits 2 instead of being ignored;
+  the valid values are unset, `libkrun` and `managed`.
+- A legacy docker record reports `placement: null` in JSON output.
+- JSON `sandbox_id` for a pre-existing record is re-serialized from the decoded handle: a managed handle stored with `do_session_id` reports `execution_session_id`, and a libkrun handle stored with `"rootfs":null` reports no `rootfs` key.
+- `session info` text shows one `substrate:` line instead of `backend:` and
+  `sandbox_id:` lines.
+- `pillbox sidecar` no longer answers 401 to bearer requests on provider hosts:
+  it holds no credentials and forwards them; provider OAuth token endpoints stay
+  refused (403).
+- `run --mount` and a preset `mount` are refused (exit 2) before anything
+  launches, on every caller (CLI, presets, dispatch, eval): the microVM takes no
+  extra host mounts, and since the Docker backend went nothing honored them.
+- A pillbox built without the `libkrun` feature is the in-guest tools build with
+  no substrate: `run`, `auth login`, `session score --in-sandbox`, `execution
+  verify-project`, `dispatch` and `eval` refuse with exit 2. `execution
+  verify-project` is now listed in that build's help (it refuses there).
+- CI lints the full (libkrun) build on Linux with a type-check-only `cargo
+  clippy`; the feature gate covers only code that names the libkrun module (16
+  `cfg` lines, down from 93).
+
 - The session packet (`pillbox.session-packet/1`) is now its own workspace
   crate, `pillbox-packet` (`crates/packet/`), with a standalone
   `pillbox-packet pack|unpack` binary that builds without the rest of pillbox

@@ -1,5 +1,5 @@
-//! Plain TCP host-loopback forward for the libkrun egress stack — the local-model
-//! escape hatch.
+//! Plain TCP host-loopback forwards for the libkrun egress stack — the local-model
+//! and host-MCP escape hatch.
 //!
 //! Where [`super::mitm`] terminates an allowlisted host's TLS and forwards to an
 //! external upstream, this is a **plaintext passthrough** from a guest TCP socket
@@ -7,11 +7,13 @@
 //! `127.0.0.1:11434`). The VMM child runs on the host, so `127.0.0.1` here IS the
 //! host. No TLS, no DNS pin, no credential swap — bytes relay as-is.
 //!
-//! **Opt-in only.** It is configured with a single port and deliberately punches a
-//! hole in the default-deny fence so a guest agent can reach a LOCAL model the host
-//! runs (no API throttle → real eval parallelism; the local-worker thesis). When no
-//! port is configured this module is inert. Guests route `gateway:PORT` here via the
-//! default route; a smoltcp listener on `PORT` accepts it and dials `127.0.0.1:PORT`.
+//! **Opt-in only.** It is configured with a set of ports, each one deliberately
+//! punching a hole in the default-deny fence: a LOCAL model the host runs (no API
+//! throttle → real eval parallelism; the local-worker thesis) or a host-loopback
+//! `--mcp` server. When no port is configured this module is inert. Guests route
+//! `gateway:PORT` here via the default route; a smoltcp listener on `PORT` accepts
+//! it and dials `127.0.0.1:PORT`. Each port keeps its own listener pool, so a busy
+//! port can't take another port's slots.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -28,6 +30,7 @@ const RELAY_BUF: usize = 65535;
 /// One pooled listener on the forward port, plus the host-side connection it
 /// relays to once a guest connects.
 pub(super) struct Forwarder {
+    port: u16,
     handle: SocketHandle,
     host: Option<TcpStream>,
     to_host: Vec<u8>, // guest→host bytes awaiting a (possibly WouldBlock) host write
@@ -36,14 +39,22 @@ pub(super) struct Forwarder {
     closing: bool,
 }
 
-/// Keep `POOL_MIN_FREE` listeners ready (up to `POOL_MAX`) on `port`.
-pub(super) fn replenish(forwarders: &mut Vec<Forwarder>, sockets: &mut SocketSet, port: u16) {
-    let free = forwarders
-        .iter()
+/// Keep `POOL_MIN_FREE` listeners ready on every port in `ports`.
+pub(super) fn replenish(forwarders: &mut Vec<Forwarder>, sockets: &mut SocketSet, ports: &[u16]) {
+    for &port in ports {
+        replenish_port(forwarders, sockets, port);
+    }
+}
+
+// The pool bound is per port, so one saturated forward never starves another.
+fn replenish_port(forwarders: &mut Vec<Forwarder>, sockets: &mut SocketSet, port: u16) {
+    let on_port = || forwarders.iter().filter(|f| f.port == port);
+    let free = on_port()
         .filter(|f| sockets.get::<tcp::Socket>(f.handle).state() == tcp::State::Listen)
         .count();
-    for _ in free..POOL_MIN_FREE {
-        if forwarders.len() >= POOL_MAX {
+    let total = on_port().count();
+    for added in 0..POOL_MIN_FREE.saturating_sub(free) {
+        if total + added >= POOL_MAX {
             break;
         }
         let s = tcp::Socket::new(
@@ -56,6 +67,7 @@ pub(super) fn replenish(forwarders: &mut Vec<Forwarder>, sockets: &mut SocketSet
         sock.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
         sock.listen(port).expect("listen local-forward port");
         forwarders.push(Forwarder {
+            port,
             handle,
             host: None,
             to_host: Vec::new(),
@@ -69,8 +81,9 @@ pub(super) fn replenish(forwarders: &mut Vec<Forwarder>, sockets: &mut SocketSet
 /// Drive every forwarder one tick: dial the host on a fresh connection, then relay
 /// bytes both ways with backpressure buffering (no rustls buffer to lean on here).
 /// Reset to listening when the connection closes.
-pub(super) fn drive(forwarders: &mut [Forwarder], sockets: &mut SocketSet, port: u16, diag: &Diag) {
+pub(super) fn drive(forwarders: &mut [Forwarder], sockets: &mut SocketSet, diag: &Diag) {
     for f in forwarders.iter_mut() {
+        let port = f.port;
         let sock = sockets.get_mut::<tcp::Socket>(f.handle);
 
         // Fresh accepted connection → dial the host loopback service once.
@@ -157,5 +170,53 @@ pub(super) fn drive(forwarders: &mut [Forwarder], sockets: &mut SocketSet, port:
             f.closing = false;
             let _ = sock.listen(port);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listening(forwarders: &[Forwarder], sockets: &SocketSet, port: u16) -> usize {
+        forwarders
+            .iter()
+            .filter(|f| f.port == port)
+            .filter(|f| sockets.get::<tcp::Socket>(f.handle).state() == tcp::State::Listen)
+            .count()
+    }
+
+    #[test]
+    fn every_port_gets_its_own_pool() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut forwarders = Vec::new();
+        replenish(&mut forwarders, &mut sockets, &[11434, 7777]);
+        assert_eq!(listening(&forwarders, &sockets, 11434), POOL_MIN_FREE);
+        assert_eq!(listening(&forwarders, &sockets, 7777), POOL_MIN_FREE);
+        // Replenishing again adds nothing: the pools are already full.
+        replenish(&mut forwarders, &mut sockets, &[11434, 7777]);
+        assert_eq!(forwarders.len(), 2 * POOL_MIN_FREE);
+    }
+
+    #[test]
+    fn a_saturated_port_does_not_starve_another() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut forwarders = Vec::new();
+        // Fill port A to its cap with busy (non-listening) sockets.
+        for _ in 0..POOL_MAX {
+            replenish(&mut forwarders, &mut sockets, &[1111]);
+            for f in forwarders.iter().filter(|f| f.port == 1111) {
+                sockets.get_mut::<tcp::Socket>(f.handle).abort();
+            }
+        }
+        assert_eq!(
+            forwarders.iter().filter(|f| f.port == 1111).count(),
+            POOL_MAX
+        );
+        replenish(&mut forwarders, &mut sockets, &[1111, 2222]);
+        assert_eq!(listening(&forwarders, &sockets, 2222), POOL_MIN_FREE);
+        assert_eq!(
+            forwarders.iter().filter(|f| f.port == 1111).count(),
+            POOL_MAX
+        );
     }
 }

@@ -10,8 +10,10 @@ use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 
-use super::files::FileLimits;
-use super::{canonical_digest, digest, snapshot, valid_digest, verifier, Verifier, MAX_TIMEOUT_MS};
+use crate::execution::files::FileLimits;
+use crate::execution::{
+    canonical_digest, digest, snapshot, valid_digest, verifier, ProbeExit, Verifier, MAX_TIMEOUT_MS,
+};
 use crate::sandbox::libkrun::repository::{self, VerifierInput, VmLimits};
 
 const VERSION: &str = "pillbox.project-verifier-probe/1";
@@ -109,17 +111,6 @@ struct ProbeOutput<'a> {
     observation: Option<Observation>,
     infrastructure_error: Option<String>,
 }
-
-#[derive(Debug)]
-pub(crate) struct ProbeExit;
-
-impl std::fmt::Display for ProbeExit {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("project verifier probe did not pass; see the JSON record")
-    }
-}
-
-impl std::error::Error for ProbeExit {}
 
 pub(crate) fn run(manifest_path: &Path, repository: &Path) -> Result<()> {
     ensure!(
@@ -284,8 +275,8 @@ fn receive_report(
 
 #[cfg(test)]
 mod tests {
-    use super::super::VerifierDefinition;
     use super::*;
+    use crate::execution::VerifierDefinition;
     use serde_json::json;
 
     fn manifest() -> serde_json::Value {

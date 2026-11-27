@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Build the pillbox runner image — the source rootfs for the local backends
-# (libkrun materializes its microVM rootfs from it; the deprecated docker
-# backend runs it directly). This is the one-stop way to UPDATE THE BUNDLED
+# Build the pillbox runner image — the source rootfs libkrun exports its
+# microVM rootfs from. This is the one-stop way to UPDATE THE BUNDLED
 # AGENTS: `--update` resolves the latest version of each agent harness, rewrites
 # the version pins in runner/Dockerfile, rebuilds, and prints the versions
 # actually baked into the image.

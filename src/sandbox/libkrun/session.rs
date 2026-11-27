@@ -15,7 +15,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::agents::{
     resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec,
@@ -25,6 +24,7 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::sandbox::substrate::LibkrunHandle;
 use crate::sandbox::{Caps, SandboxBackend, Started};
 use crate::startup::StartupTimer;
 use crate::workspace::{SnapshotHandle, WorkspaceBackend};
@@ -46,7 +46,7 @@ impl SandboxBackend for LibkrunBackend {
         request: &crate::execution::ExecuteRequest,
         owner: &mut crate::execution::store::OwnedInvocation,
     ) -> Result<crate::execution::Completion> {
-        crate::execution::local::execute(resolved, repository, request, owner)
+        crate::execution::microvm::local::execute(resolved, repository, request, owner)
     }
 
     /// The microVM family: KVM-isolation features are uniquely libkrun's
@@ -69,8 +69,19 @@ impl SandboxBackend for LibkrunBackend {
         }
     }
 
-    fn id(&self) -> &'static str {
-        crate::session::BACKEND_LIBKRUN
+    fn kind(&self) -> crate::sandbox::SubstrateKind {
+        crate::sandbox::SubstrateKind::Libkrun
+    }
+
+    fn live(&self, session: &crate::session::Session) -> Box<dyn crate::sandbox::LiveSession> {
+        Box::new(LibkrunLiveSession::new(session.clone()))
+    }
+
+    fn target(
+        &self,
+        record: &crate::sandboxes::Sandbox,
+    ) -> Result<Box<dyn crate::sandbox::SandboxTarget>> {
+        Ok(super::sandbox_vm::target(record))
     }
 
     fn spawn_sandbox(
@@ -81,13 +92,35 @@ impl SandboxBackend for LibkrunBackend {
         super::sandbox_vm::spawn(resolved, req)
     }
 
+    fn verify_project(&self, probe: &Path, repository: &Path) -> Result<()> {
+        crate::execution::microvm::probe::run(probe, repository)
+    }
+
+    fn login(&self, spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
+        super::login::login(spec, resolved, home)
+    }
+
+    fn score_in_sandbox(
+        &self,
+        resolved: &Pillbox,
+        workspace: &Path,
+        cmd: &str,
+        egress_allow: &[String],
+        drop_privileges: bool,
+    ) -> Result<(i32, String)> {
+        score_in_sandbox(resolved, workspace, cmd, egress_allow, drop_privileges)
+    }
+
+    fn host_checks(&self) -> Vec<crate::doctor::Check> {
+        super::host::doctor_checks()
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return run_structured(spec, opts, resolved);
         }
         // Server-integration agents run headless + are driven/read over their HTTP
-        // API through a vsock port-forward — a distinct path with no PTY (mirrors
-        // docker's split). The two share `launch_server_vm`; this picks the
+        // API through a vsock port-forward — a distinct path with no PTY. The two share `launch_server_vm`; this picks the
         // per-agent builder (codex-serve drives `codex app-server` via the in-guest
         // bridge; opencode runs `opencode serve`). PTY agents fall through below.
         if spec.integration == Integration::Server {
@@ -97,11 +130,11 @@ impl SandboxBackend for LibkrunBackend {
                 run_server(spec, opts, resolved)
             };
         }
-        // `--vault` is a no-op on libkrun (accepted for CLI parity with docker):
-        // OAuth creds are *always* env-forked + MITM-swapped here, and egress is
-        // always sole-fenced — there's no non-vault mode to switch on. A vaulted
-        // `--with` (handled in `prepare_launch`) auto-enables the API-key swap on
-        // its own, exactly like docker, no `--vault` required.
+        // `--vault` is a no-op on libkrun: OAuth creds are *always* env-forked +
+        // MITM-swapped here, and egress is always sole-fenced — there's no
+        // non-vault mode to switch on. A vaulted `--with` (handled in
+        // `prepare_launch`) auto-enables the API-key swap on its own, no `--vault`
+        // required.
 
         let run_started = std::time::SystemTime::now();
         let session_id = crate::session::Session::new_id();
@@ -114,19 +147,19 @@ impl SandboxBackend for LibkrunBackend {
 
         // Detach: spawn the VM to outlive the CLI + record the session, then return.
         // libkrun keeps the vault on detach (the MITM lives in the child, not the
-        // parent), unlike local Docker. Reattach/teardown go through the session
+        // parent). Reattach/teardown go through the session
         // record. Foreground (below) supervises + pumps the terminal inline.
         if opts.detach {
-            return run_detached(spec, resolved, &session_id, &opts, launch, startup);
+            return launch_detached(spec, resolved, &session_id, &opts, launch, startup);
         }
 
         // §0: tail the agent's transcript from the host-side creds clone into the
-        // durable §0 sink (the same producer docker uses; no guest emitter).
+        // durable §0 sink (no guest emitter).
         // A local log-open failure stays loud but falls back to OTLP-only
         // observability. Spawned before the child so it's ready when the agent
         // first writes.
         let log = crate::events::log::SessionLog::open_or_warn(resolved, &session_id);
-        let tailer = crate::events::transcripts::spawn_session_observability(
+        let tailer = crate::events::transcripts::local::spawn_session_observability(
             log,
             &session_id,
             spec.id,
@@ -188,8 +221,6 @@ impl ForegroundHooks for RunHooks<'_> {
         let started_session = crate::session::Session {
             id: self.session_id.to_string(),
             label: None,
-            backend: crate::session::BACKEND_LIBKRUN.to_string(),
-            sandbox_id: String::new(),
             pty_pid: 0,
             agent_id: self.spec.id.to_string(),
             started_at: crate::session::now_rfc3339(),
@@ -198,7 +229,7 @@ impl ForegroundHooks for RunHooks<'_> {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: self.guest_workspace.to_string(),
-            placement: crate::session::Placement::Local,
+            substrate: crate::sandbox::Substrate::Libkrun(None),
             server: None,
             requested_execution: None,
         };
@@ -456,6 +487,7 @@ impl PendingVm {
     /// The handle a record stores to find and tear this VM down later.
     pub(super) fn handle(&self, pid: i32) -> LibkrunHandle {
         LibkrunHandle {
+            extra: Default::default(),
             sock: self.sock.to_string_lossy().into_owned(),
             pid,
             creds: self.boot_share.to_string_lossy().into_owned(),
@@ -543,7 +575,7 @@ pub(super) fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) ->
     // and the CA install silently no-op'd, leaving codex's rustls to reject the
     // vault MITM cert with `UnknownIssuer`. Prepend the sbin dirs so it resolves,
     // and warn (not `|| true`) so a real failure is visible instead of silent.
-    // Mirrors the docker entrypoint fix (runner/entrypoint.sh).
+    // Same fix as the runner image's entrypoint (runner/entrypoint.sh).
     format!(
         "set -e; {net}; \
          printf '%s' {ca_q} > {GUEST_CA_PATH}; \
@@ -636,8 +668,7 @@ pub(super) enum CaLifetime {
 /// `Ephemeral` caller mints a per-run CA in a tempdir discarded after the run —
 /// the guest reinstalls the cert every boot, so a stable CA buys it nothing, and
 /// ephemeral shrinks a leaked CA key's blast radius to a single run. A
-/// `Persistent` caller falls back to the per-pillbox dir (same trade as docker
-/// `--detach`, which doesn't support `--vault`).
+/// `Persistent` caller uses the per-pillbox dir.
 pub(super) fn provision_vault_ca(resolved: &Pillbox, lifetime: CaLifetime) -> Result<VaultCa> {
     let persistent = resolved.subdir_path("vault");
     let pinned = crate::vault::ca_cert_path_in(&persistent).exists();
@@ -664,7 +695,7 @@ pub(super) fn provision_vault_ca(resolved: &Pillbox, lifetime: CaLifetime) -> Re
 fn alt_auth_configured(resolved: &Pillbox, inputs: &LaunchInputs, env_var: &str) -> Result<bool> {
     let withs = resolve_with_entries(resolved, inputs.withs)?;
     // Plain secrets only — vaulted --with is rejected for Structured runs later.
-    let env = resolve_run_env(resolved, inputs.env_bundles, inputs.env_files, &withs, None)?;
+    let env = resolve_run_env(resolved, inputs.env_bundles, inputs.env_files, &withs)?;
     Ok(env.get(env_var).is_some_and(|value| !value.is_empty()))
 }
 
@@ -758,14 +789,12 @@ pub(super) fn launch_base(
 
     // Split vaulted `--with` (stub-swapped through the MITM by the creds step)
     // from plain entries (real value straight into the env). Plain entries +
-    // bundles/env-file compose via the shared resolver with no vault session (the
-    // docker path routes vaulted ones through a host-side `VaultSession` proxy,
-    // which libkrun has no equivalent of — its MITM lives in the VMM child and is
-    // fed swaps over stdin).
+    // bundles/env-file compose via the shared resolver; the vaulted ones reach the
+    // MITM in the VMM child, fed as swaps over stdin.
     let (vaulted, plain): (Vec<_>, Vec<_>) = resolve_with_entries(resolved, inputs.withs)?
         .into_iter()
         .partition(|w| w.meta.is_some());
-    let composed = resolve_run_env(resolved, inputs.env_bundles, inputs.env_files, &plain, None)?;
+    let composed = resolve_run_env(resolved, inputs.env_bundles, inputs.env_files, &plain)?;
     let mut guest_env: Vec<(String, String)> = boot::static_child_env();
     guest_env.extend(composed);
 
@@ -827,7 +856,7 @@ fn mint_with_swaps(
         // for keys whose public prefix isn't exactly 3 hyphen-segments (OpenAI
         // `sk-proj-…`, `sk-svcacct-…`), and that stub lands in the guest env. The
         // curated prefix also keeps the stub format-valid (e.g. GitHub `ghp_…`) so
-        // in-guest SDK validators accept it. (Matches the docker host-side path.)
+        // in-guest SDK validators accept it.
         let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
         swaps.push(WithSwap {
             env_var: w.env_var.clone(),
@@ -854,6 +883,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     } else {
         CaLifetime::Ephemeral
     };
+    let mcp = guest_mcp(spec, opts, resolved)?;
     let inputs = LaunchInputs::from(opts);
     let agent = authenticated_home(spec, &inputs, resolved, "run")?;
     let LaunchBase {
@@ -866,7 +896,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     } = launch_base(&inputs, resolved, ca_lifetime)?;
 
     // Pre-accept the agent's workspace-trust dialog on the live auth home before
-    // boot (claude); operates on host paths, like the docker path.
+    // boot (claude); operates on host paths.
     spec.prepare_workspace_or_warn(&agent.home, &guest_workspace);
 
     // Env fork (after the seed above so the clone inherits it): stubbed creds
@@ -884,6 +914,17 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }
     })?;
     guest_env.extend(stub_env);
+    let (mcp_files, mcp_argv, mcp_hosts, mcp_forward_ports) = match mcp {
+        Some(GuestMcp {
+            injection,
+            hosts,
+            forward_ports,
+        }) => {
+            guest_env.extend(injection.env);
+            (injection.files, injection.argv, hosts, forward_ports)
+        }
+        None => Default::default(),
+    };
 
     // The guest boot script: env exports, NIC + CA + workspace mount, then exec
     // the agent under the in-guest pty-host (Frame over vsock). Written into the
@@ -895,6 +936,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         .iter()
         .map(|s| s.to_string())
         .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
+        .chain(mcp_argv)
         .chain(opts.args.iter().cloned())
         .collect();
     let agent = agent_argv
@@ -909,7 +951,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let exports = boot::env_exports(&guest_env)?;
     let boot_script = format!("{exports}{preamble}; exec {pty_host} {agent}");
 
-    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script, &mcp_files)?;
+    place_mcp_files(&mcp_files, &creds_share)?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
@@ -943,10 +986,13 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             listen: opts.detach,
         }],
         egress: Some(EgressSpec::fence(
-            vault_egress_allowlist(&opts.egress_allow, &with_hosts),
+            vault_egress_allowlist(&opts.egress_allow, &with_hosts)
+                .into_iter()
+                .chain(mcp_hosts)
+                .collect(),
             egress_log.clone(),
             Some(ca.dir.to_string_lossy().into_owned()),
-            None, // vaulted agents: no local-model forward
+            mcp_forward_ports, // vaulted agents: no local-model forward, host MCP only
             refresh,
         )),
     };
@@ -1027,7 +1073,7 @@ fn env_fork_creds(
     // `auth_id` without a broker decider, so the `vault_capable`
     // gate just avoids the call for non-vaulted agents.
     if spec.vault_capable {
-        crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
+        crate::vault::refresh::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
     }
 
     let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(home, spec, &oauth_hosts)?;
@@ -1088,18 +1134,27 @@ fn env_fork_creds(
 /// real in a guest-readable channel is exfiltratable by a prompt-injected agent
 /// — fail fast rather than silently leak if a future change crosses channels.
 /// Raw env values are scanned pre-quoting (shell-quoting can mangle the needle,
-/// e.g. `'` → `'\''`); the rendered script catches argv/path interpolations.
+/// e.g. `'` → `'\''`); the rendered script catches argv/path interpolations;
+/// `guest_files` are the files placed into the guest home (MCP configs).
 pub(super) fn ensure_env_fork_sealed(
     swap_pairs: &[SwapPair],
     guest_env: &[(String, String)],
     boot_script: &str,
+    guest_files: &[crate::agents::mcp::GuestFile],
 ) -> Result<()> {
+    // No real half of a swap pair appears in any channel the guest can read: env, boot script, or a placed file.
     for pair in swap_pairs {
-        if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || boot_script.contains(&pair.real)
+        let needle = pair.real.as_bytes();
+        let in_file =
+            |bytes: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle);
+        if guest_env.iter().any(|(_, v)| v.contains(&pair.real))
+            || boot_script.contains(&pair.real)
+            || guest_files.iter().any(|f| in_file(&f.bytes))
         {
             bail!(
                 "libkrun env-fork violated: a real credential reached a guest-readable \
-                 channel (the boot script) — it must travel only via the MITM stdin swap"
+                 channel (the boot script or a file placed in the guest) — it must travel \
+                 only via the MITM stdin swap"
             );
         }
     }
@@ -1117,6 +1172,173 @@ fn vault_egress_allowlist(egress_allow: &[String], with_hosts: &[String]) -> Vec
         .chain(egress_allow.iter().cloned())
         .chain(with_hosts.iter().cloned())
         .collect()
+}
+
+/// A launch's `--mcp` attachments, ready for a libkrun guest: the agent's
+/// injection, the MCP hosts its egress fence must allow, and the host-loopback
+/// ports its egress must forward.
+struct GuestMcp {
+    injection: crate::agents::McpInjection,
+    hosts: Vec<String>,
+    forward_ports: Vec<u16>,
+}
+
+// Every libkrun launch path either honors `--mcp` through this or refuses it with a usage error, never ignores it.
+fn guest_mcp(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<Option<GuestMcp>> {
+    if opts.mcps.is_empty() && opts.mcp_tokens.is_empty() {
+        return Ok(None);
+    }
+    let Some(inject) = spec.mcp_inject else {
+        return Err(PillboxError::usage(
+            "run",
+            format!("`{}` does not support --mcp attachments", spec.id),
+        )
+        .into());
+    };
+    let (mut hosts, mut forward_ports) = (Vec::new(), Vec::new());
+    let mut attachments = Vec::with_capacity(opts.mcps.len());
+    for mcp in &opts.mcps {
+        let mut mcp = mcp.clone();
+        match mcp_route(&mcp)? {
+            McpRoute::Fence(host) => hosts.push(host),
+            McpRoute::HostLoopback { port, guest_url } => {
+                // Each forwarded port is an explicit, user-requested punch through the default-deny fence.
+                if !forward_ports.contains(&port) {
+                    forward_ports.push(port);
+                }
+                mcp.url = guest_url;
+            }
+        }
+        attachments.push(mcp);
+    }
+    let attachments = crate::agents::mcp::resolve_tokens(resolved, attachments, &opts.mcp_tokens)?;
+    Ok(Some(GuestMcp {
+        injection: inject(&attachments, GUEST_HOME)?,
+        hosts,
+        forward_ports,
+    }))
+}
+
+/// How a libkrun guest reaches one `--mcp` server.
+#[derive(Debug, PartialEq, Eq)]
+enum McpRoute {
+    /// An external server: its DNS name joins the egress allowlist.
+    Fence(String),
+    /// A server on the host's loopback: the egress forwards `gateway:port` to
+    /// `127.0.0.1:port`, and the guest sees `guest_url`.
+    HostLoopback { port: u16, guest_url: String },
+}
+
+/// Route one `--mcp` URL.
+// External MCP must be https://<dns-name>[:443] (the fence resolves allowlisted names and terminates only 443); http host-loopback MCP is forwarded.
+fn mcp_route(mcp: &crate::agents::McpAttachment) -> Result<McpRoute> {
+    let refuse = |why: &str| -> anyhow::Error {
+        PillboxError::usage(
+            "run",
+            format!(
+                "--mcp `{}` URL `{}` {why}; a microVM reaches an MCP server only at \
+                 https://<dns-name>[:443]/… or on the host's loopback \
+                 (http://localhost|127.0.0.1:PORT/…)",
+                mcp.name, mcp.url
+            ),
+        )
+        .into()
+    };
+    let (scheme, rest) = mcp.url.split_once("://").unwrap_or(("", &mcp.url));
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((u, hp)) => (Some(u), hp),
+        None => (None, authority),
+    };
+    let (host, port) = match host_port.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, after)) => (&host_port[..h.len() + 2], after.strip_prefix(':')),
+            None => return Err(refuse("has a malformed host")),
+        },
+        None => match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        },
+    };
+    let port = match port {
+        Some(p) => Some(
+            p.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| refuse("has an invalid port"))?,
+        ),
+        None => None,
+    };
+    if host.is_empty() {
+        return Err(refuse("has no host"));
+    }
+    let host_lower = host.to_ascii_lowercase();
+    // The forward dials the host's 127.0.0.1 only.
+    if host_lower == "[::1]" {
+        return Err(refuse(
+            "names the host's IPv6 loopback, but the forward reaches the host's 127.0.0.1; \
+             bind the server there and use localhost or 127.0.0.1",
+        ));
+    }
+    if matches!(host_lower.as_str(), "localhost" | "127.0.0.1") {
+        // The guest reaches the host as the gateway address, which no loopback server's certificate names.
+        if scheme != "http" {
+            return Err(refuse(
+                "is not http on the host's loopback: the guest reaches the host as the gateway \
+                 address so the server's certificate won't match; serve it over http on loopback",
+            ));
+        }
+        let port = port.unwrap_or(80);
+        // The gateway's own DNS and TLS listeners own these ports.
+        if port == egress::DNS_PORT || port == 443 {
+            return Err(refuse("uses a port the microVM gateway reserves (53, 443)"));
+        }
+        let userinfo = userinfo.map(|u| format!("{u}@")).unwrap_or_default();
+        let guest_url = format!("{scheme}://{userinfo}{}:{port}{tail}", egress::GATEWAY_IP);
+        return Ok(McpRoute::HostLoopback { port, guest_url });
+    }
+    if scheme != "https" {
+        return Err(refuse("is not https"));
+    }
+    if port.is_some_and(|p| p != 443) {
+        return Err(refuse("is not on port 443"));
+    }
+    if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(refuse("names an IP address"));
+    }
+    if crate::url_safety::is_loopback_host(host) {
+        return Err(refuse(
+            "names a loopback host other than localhost/127.0.0.1/[::1]",
+        ));
+    }
+    Ok(McpRoute::Fence(host.to_ascii_lowercase()))
+}
+
+/// Land an MCP injection's guest files in the cloned home share (mounted at
+/// [`GUEST_HOME`]), before the boot channel prepares the clone for the guest.
+fn place_mcp_files(files: &[crate::agents::mcp::GuestFile], home_share: &Path) -> Result<()> {
+    for file in files {
+        let rel = file
+            .guest_path
+            .strip_prefix(GUEST_HOME)
+            .and_then(|r| r.strip_prefix('/'))
+            .map(Path::new)
+            .filter(|r| {
+                r.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            })
+            .with_context(|| {
+                format!(
+                    "MCP file `{}` is not under the guest home `{GUEST_HOME}`",
+                    file.guest_path
+                )
+            })?;
+        // An MCP file may carry a bearer token: owner-only, even when it replaces one.
+        crate::guest_files::write(home_share, rel, &file.bytes, 0o600)
+            .with_context(|| format!("write MCP file `{}`", file.guest_path))?;
+    }
+    Ok(())
 }
 
 /// The guest env an agent with a Rust TLS stack needs to trust the vault CA:
@@ -1202,7 +1424,7 @@ pub(super) fn agent_launch_creds(
 /// after the record commits so repeated read commands never replay its rollout
 /// from byte zero. The guest pty-host listens (set by `prepare_launch` when
 /// `opts.detach`), so libkrun's bound socket persists for reattach.
-fn run_detached(
+fn launch_detached(
     spec: &AgentSpec,
     resolved: &Pillbox,
     session_id: &str,
@@ -1219,8 +1441,6 @@ fn run_detached(
         let session = crate::session::Session {
             id: session_id.to_string(),
             label: opts.label.clone(),
-            backend: crate::session::BACKEND_LIBKRUN.to_string(),
-            sandbox_id: serde_json::to_string(handle).context("encode libkrun handle")?,
             pty_pid: 0,
             agent_id: spec.id.to_string(),
             started_at: crate::session::now_rfc3339(),
@@ -1229,7 +1449,7 @@ fn run_detached(
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
             guest_cwd,
-            placement: crate::session::Placement::Local,
+            substrate: crate::sandbox::Substrate::Libkrun(Some(handle.clone())),
             server: None,
             requested_execution: None,
         };
@@ -1297,6 +1517,23 @@ struct ServerLaunch {
     bringup: BringUp,
 }
 
+/// A server agent's `--mcp` injection: files and env only, since the server
+/// entrypoint is pillbox's own script, not the agent argv.
+fn server_mcp(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<Option<GuestMcp>> {
+    let mcp = guest_mcp(spec, opts, resolved)?;
+    if mcp.as_ref().is_some_and(|m| !m.injection.argv.is_empty()) {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "`{}` server mode cannot pass MCP attachments as agent arguments",
+                spec.id
+            ),
+        )
+        .into());
+    }
+    Ok(mcp)
+}
+
 /// Boot a `Server`-integration agent in a detached microVM and record its
 /// session — the shared bring-up + teardown for opencode and codex-serve. The
 /// per-agent differences (guest script, events file, egress, bring-up calls)
@@ -1324,6 +1561,7 @@ fn launch_server_vm(
     let profile = spec
         .server
         .expect("launch_server_vm requires a Server-integration agent");
+    let mcp = server_mcp(spec, &opts, resolved)?;
 
     let inputs = LaunchInputs::from(&opts);
     let agent = authenticated_home(spec, &inputs, resolved, "run")?;
@@ -1342,6 +1580,25 @@ fn launch_server_vm(
     // Creds: CoW clone the *real* auth home (no stub — the agent authenticates to
     // its provider directly; the MITM forwards it untouched, empty swap).
     let creds_share = OwnedPath::new(cow_clone_home(&agent.home)?);
+    // The local-model port is an explicit opt-in punch through the default-deny fence, like each host-MCP port.
+    let mut forward_ports: Vec<u16> = launch.local_forward_port.into_iter().collect();
+    let mcp_hosts = match mcp {
+        Some(GuestMcp {
+            injection,
+            hosts,
+            forward_ports: mcp_ports,
+        }) => {
+            place_mcp_files(&injection.files, &creds_share)?;
+            guest_env.extend(injection.env);
+            for port in mcp_ports {
+                if !forward_ports.contains(&port) {
+                    forward_ports.push(port);
+                }
+            }
+            hosts
+        }
+        None => Vec::new(),
+    };
 
     // Guest boot script: env exports, then NIC + CA + workspace mount (the shared
     // preamble) and the agent's own server + vsock forward relay (the per-agent
@@ -1397,10 +1654,11 @@ fn launch_server_vm(
                 .map(str::to_string)
                 .chain(launch.egress_extra)
                 .chain(opts.egress_allow.iter().cloned())
+                .chain(mcp_hosts)
                 .collect(),
             super::egress_log_path(),
             Some(ca.dir.to_string_lossy().into_owned()),
-            launch.local_forward_port,
+            forward_ports,
             None, // opencode server mode: non-vault, holds its own real key
         )),
     };
@@ -1437,8 +1695,6 @@ fn launch_server_vm(
         let session = crate::session::Session {
             id: session_id.clone(),
             label: opts.label.clone(),
-            backend: crate::session::BACKEND_LIBKRUN.to_string(),
-            sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
             pty_pid: 0,
             agent_id: spec.id.to_string(),
             started_at: crate::session::now_rfc3339(),
@@ -1447,7 +1703,7 @@ fn launch_server_vm(
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
             guest_cwd: guest_workspace.clone(),
-            placement: crate::session::Placement::Local,
+            substrate: crate::sandbox::Substrate::Libkrun(Some(handle.clone())),
             server: Some(crate::session::ServerSession {
                 agent_session_id,
                 model: launch.model.clone(),
@@ -1474,7 +1730,7 @@ fn launch_server_vm(
         // Reparented: nothing host-side supervises this agent, so spawn the detached §0 PRODUCER —
         // it tails the guest capture → durable log forever, keeping the log live for every consumer
         // (list/diagnose/subscribe + telemetry exporters) with no explicit drain. Killed by
-        // kill_session. The libkrun analog of docker's always-on transcript tailer.
+        // kill_session.
         if let Err(e) = spawn_session_tailer(resolved, &session, spec) {
             eprintln!("pillbox: warning: detached session tailer did not start: {e:#}");
         }
@@ -1517,7 +1773,7 @@ fn fail_structured_launch<T>(
 ) -> Result<T> {
     // An unconfirmed shutdown still owns recovery state; never announce completion.
     if error
-        .downcast_ref::<super::repository::TeardownUnconfirmed>()
+        .downcast_ref::<crate::execution::TeardownUnconfirmed>()
         .is_some()
     {
         return Err(error);
@@ -1583,6 +1839,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         )
         .into());
     }
+    // Structured mode has no MCP wiring: refuse `--mcp`, never ignore it.
     if !opts.mcps.is_empty() || !opts.mcp_tokens.is_empty() {
         return Err(PillboxError::usage(
             "run",
@@ -1636,7 +1893,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
     let boot_script = format!("{exports}{preamble}; exec {argv} > {events_q}");
-    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script, &[])?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
@@ -1666,7 +1923,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
             allowlist,
             egress_log.clone(),
             Some(ca.dir.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             refresh,
         )),
     };
@@ -1685,8 +1942,6 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let mut session = crate::session::Session {
         id: session_id.clone(),
         label: opts.label.clone(),
-        backend: crate::session::BACKEND_LIBKRUN.to_string(),
-        sandbox_id: serde_json::to_string(&handle).context("encode structured libkrun handle")?,
         pty_pid: 0,
         agent_id: spec.id.to_string(),
         started_at: crate::session::now_rfc3339(),
@@ -1695,7 +1950,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         result_snapshot: None,
         expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
         guest_cwd: guest_workspace,
-        placement: crate::session::Placement::Local,
+        substrate: crate::sandbox::Substrate::Libkrun(Some(handle.clone())),
         server: None,
         requested_execution,
     };
@@ -1740,7 +1995,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let (status, vmm_diagnostic) = match execution {
         Ok(outcome) => outcome,
         Err(error) => {
-            if !error.is::<super::repository::TeardownUnconfirmed>() {
+            if !error.is::<crate::execution::TeardownUnconfirmed>() {
                 rootfs
                     .remove_stopped()
                     .with_context(|| format!("structured launch failed: {error:#}"))?;
@@ -2010,40 +2265,13 @@ fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Resul
     launch_server_vm(spec, opts, resolved, launch)
 }
 
-/// What a detached libkrun session stores in `Session::sandbox_id` (as JSON): the
-/// persistent attach socket (libkrun-bound for the guest's listen) to reattach to,
-/// the VMM child PID to signal on `rm`, and the CoW clones + spec file to scrub on
-/// `rm`. The detached child + these artifacts outlive the launching CLI.
-///
-/// A libkrun sandbox (`sandbox spawn`) stores the same handle, as JSON, in
-/// `Sandbox::backend_ref`; [`teardown_handle`] is the one teardown both use.
-#[derive(Serialize, Deserialize)]
-pub(super) struct LibkrunHandle {
-    /// Host unix socket libkrun binds for the guest's listening vsock port.
-    pub(super) sock: String,
-    /// The VMM child's pid at spawn (informational; teardown reaps by `spec`).
-    pub(super) pid: i32,
-    /// CoW creds/home share clone.
-    pub(super) creds: String,
-    /// CoW workspace share clone.
-    pub(super) workspace: String,
-    /// Persisted VmSpec path: the unique attribution key teardown reaps by.
-    pub(super) spec: String,
-    /// Private rootfs clone, removed once the VMM is confirmed stopped.
-    #[serde(default)]
-    pub(super) rootfs: Option<String>,
-}
-
 impl LibkrunHandle {
-    /// Decode the handle a detached/server libkrun session stored in its record.
+    /// The handle a detached/server libkrun session stored on its record.
     fn decode(session: &crate::session::Session) -> Result<Self> {
-        Self::parse(&session.sandbox_id)
-    }
-
-    /// Decode a handle from its stored JSON (a session's `sandbox_id`, a
-    /// sandbox's `backend_ref`).
-    pub(super) fn parse(raw: &str) -> Result<Self> {
-        serde_json::from_str(raw).context("decode libkrun handle")
+        match &session.substrate {
+            crate::sandbox::Substrate::Libkrun(Some(handle)) => Ok(handle.clone()),
+            _ => anyhow::bail!("session `{}` has no libkrun handle", session.id),
+        }
     }
 }
 
@@ -2173,22 +2401,22 @@ pub(crate) fn workspace_path(session: &crate::session::Session) -> Result<PathBu
 /// been mode-locked on the host, and root could `chmod` that lock off.
 /// The start marker is printed only once this setup succeeded.
 pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
-    let started = crate::commands::session::GRADER_STARTED_PRINTF;
+    let started = crate::commands::session::grader::GRADER_STARTED_PRINTF;
     if drop_privileges {
         // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
         // a `;` would let the marker (and the grader) run when the mount failed.
         format!(
             "{} && [ -x {runuser} ] && {started} && {runuser} -u nobody --preserve-environment -- sh -c {}",
-            crate::commands::session::dropped_grader_setup(),
+            crate::commands::session::grader::dropped_grader_setup(),
             super::shell_quote(cmd),
-            runuser = crate::commands::session::RUNUSER,
+            runuser = crate::commands::session::grader::RUNUSER,
         )
     } else {
         format!("{started} && {{ {cmd} ; }}")
     }
 }
 
-pub(crate) fn score_in_sandbox(
+fn score_in_sandbox(
     resolved: &Pillbox,
     workspace: &Path,
     cmd: &str,
@@ -2237,15 +2465,15 @@ pub(crate) fn score_in_sandbox(
             // like the grader started.
             format!(
                 "{setup} && [ -x {runuser} ] && {started}; set +e; {runuser} -u nobody --preserve-environment -- sh -c {quoted}",
-                setup = crate::commands::session::dropped_grader_setup(),
-                runuser = crate::commands::session::RUNUSER,
-                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                setup = crate::commands::session::grader::dropped_grader_setup(),
+                runuser = crate::commands::session::grader::RUNUSER,
+                started = crate::commands::session::grader::GRADER_STARTED_PRINTF,
                 quoted = shell_quote(cmd),
             )
         } else {
             format!(
                 "{started}; set +e; {cmd}",
-                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                started = crate::commands::session::grader::GRADER_STARTED_PRINTF,
             )
         };
         let script = format!(
@@ -2261,8 +2489,8 @@ pub(crate) fn score_in_sandbox(
             egress_allow.to_vec(),
             super::egress_log_path(),
             Some(ca.dir.to_string_lossy().into_owned()),
-            None, // grader: tightest fence, no local forward
-            None, // grader holds no credentials — nothing to refresh
+            Vec::new(), // grader: tightest fence, no local forward
+            None,       // grader holds no credentials — nothing to refresh
         ));
         // Point every TLS client at the single MITM CA cert. pip/curl/openssl/
         // requests ignore the system store by default; Node reads NODE_EXTRA_CA_CERTS.
@@ -2439,7 +2667,7 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 }
 
 /// How long to let a buffered `Input` frame traverse socket → guest pty-host →
-/// PTY before closing — mirrors the docker driver's settle. All in-VM once the
+/// PTY before closing. All in-VM once the
 /// frame is written (libkrun bridges the unix socket straight to the guest's
 /// listening pty-host, no exec cold-start), so it's short.
 const SEND_SETTLE: Duration = Duration::from_millis(300);
@@ -2623,7 +2851,7 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
         );
         if !killed.contains(&pgid) {
             super::repository::signal_group(pgid, libc::SIGKILL)
-                .context(super::repository::TeardownUnconfirmed)?;
+                .context(crate::execution::TeardownUnconfirmed)?;
             killed.push(pgid);
         }
     }
@@ -2632,13 +2860,13 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
         let mut alive = false;
         for group in &killed {
             alive |= super::repository::group_exists(*group)
-                .context(super::repository::TeardownUnconfirmed)?;
+                .context(crate::execution::TeardownUnconfirmed)?;
         }
         if !alive {
             return confirm_vmm_stopped(spec);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+            return Err(anyhow::Error::new(crate::execution::TeardownUnconfirmed)
                 .context("VMM process group survived session teardown"));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -2647,7 +2875,7 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
 
 pub(super) fn confirm_vmm_stopped(spec: &str) -> Result<()> {
     if !vmm_groups_for_spec(spec)?.is_empty() {
-        return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+        return Err(anyhow::Error::new(crate::execution::TeardownUnconfirmed)
             .context("VMM still serves its private filesystem"));
     }
     Ok(())
@@ -2661,11 +2889,11 @@ fn vmm_groups_for_spec(spec: &str) -> Result<Vec<(i32, i32)>> {
     let output = Command::new("ps")
         .args(["-axww", "-o", "pid=,pgid=,command="])
         .output()
-        .context(super::repository::TeardownUnconfirmed)
+        .context(crate::execution::TeardownUnconfirmed)
         .context("scan VMM ownership before filesystem cleanup")?;
     if !output.status.success() {
         return Err(
-            anyhow::Error::new(super::repository::TeardownUnconfirmed).context(format!(
+            anyhow::Error::new(crate::execution::TeardownUnconfirmed).context(format!(
                 "VMM ownership scan failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )),
@@ -3217,7 +3445,7 @@ mod tests {
         }
     }
     use crate::sandbox::LiveSession;
-    use crate::session::{Session, BACKEND_LIBKRUN};
+    use crate::session::Session;
 
     // The summary every foreground run (attached and structured) prints after its VMM exits.
     #[test]
@@ -3300,7 +3528,7 @@ mod tests {
             crate::session::write(&resolved, &session).unwrap();
             let mut log = crate::events::log::SessionLog::open(&resolved, &session.id).unwrap();
             let error = if unconfirmed {
-                anyhow::Error::new(super::super::repository::TeardownUnconfirmed)
+                anyhow::Error::new(crate::execution::TeardownUnconfirmed)
                     .context("injected shutdown failure")
             } else {
                 anyhow::anyhow!("injected startup failure")
@@ -3318,7 +3546,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 error
-                    .downcast_ref::<super::super::repository::TeardownUnconfirmed>()
+                    .downcast_ref::<crate::execution::TeardownUnconfirmed>()
                     .is_some(),
                 unconfirmed
             );
@@ -3358,16 +3586,15 @@ mod tests {
     /// discovery tolerates a not-yet-created dir.
     fn libkrun_pty_session() -> Session {
         let mut s = Session::test_fixture();
-        s.backend = BACKEND_LIBKRUN.to_string();
-        s.sandbox_id = serde_json::to_string(&LibkrunHandle {
+        s.substrate = crate::sandbox::Substrate::Libkrun(Some(LibkrunHandle {
+            extra: Default::default(),
             sock: "/nonexistent/pillbox-test-attach.sock".to_string(),
             pid: 0,
             creds: "/nonexistent/pillbox-test-creds".to_string(),
             workspace: "/nonexistent/pillbox-test-workspace".to_string(),
             spec: "/nonexistent/pillbox-test-spec.json".to_string(),
             rootfs: None,
-        })
-        .unwrap();
+        }));
         s
     }
 
@@ -3445,6 +3672,7 @@ mod tests {
             let spawned = SpawnedVm {
                 child,
                 handle: LibkrunHandle {
+                    extra: Default::default(),
                     sock: sock.to_string_lossy().into_owned(),
                     pid: group,
                     creds: creds.to_string_lossy().into_owned(),
@@ -3498,7 +3726,7 @@ mod tests {
         let mut handle = LibkrunHandle::decode(&session).unwrap();
         handle.spec.clear(); // Attribution missing: teardown cannot be confirmed.
         handle.rootfs = Some(root.to_string_lossy().into_owned());
-        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        session.substrate = crate::sandbox::Substrate::Libkrun(Some(handle));
         crate::session::write(&resolved, &session).unwrap();
         assert!(kill_session(&resolved, &session).is_err());
         assert!(crate::session::read(&resolved, &session.id)
@@ -3513,9 +3741,10 @@ mod tests {
     #[test]
     fn legacy_session_handle_has_no_owned_rootfs() {
         let mut session = libkrun_pty_session();
-        let mut legacy: serde_json::Value = serde_json::from_str(&session.sandbox_id).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&session.substrate.handle_text()).unwrap();
         legacy.as_object_mut().unwrap().remove("rootfs");
-        session.sandbox_id = legacy.to_string();
+        session.substrate = crate::sandbox::Substrate::from_legacy("libkrun", &legacy.to_string());
         assert!(LibkrunHandle::decode(&session).unwrap().rootfs.is_none());
     }
 
@@ -3877,5 +4106,287 @@ mod tests {
             parse_vmm_groups(&out, SPEC),
             vec![(9001, 9001), (9002, 9001)]
         );
+    }
+
+    fn mcp(name: &str, url: &str) -> crate::agents::McpAttachment {
+        crate::agents::McpAttachment::parse(&format!("{name}={url}")).unwrap()
+    }
+
+    fn mcp_opts(mcps: &[(&str, &str)], tokens: &[(&str, &str)]) -> RunOpts {
+        RunOpts {
+            mcps: mcps.iter().map(|(n, u)| mcp(n, u)).collect(),
+            mcp_tokens: tokens
+                .iter()
+                .map(|(n, s)| crate::agents::McpTokenSpec {
+                    mcp_name: n.to_string(),
+                    secret_name: s.to_string(),
+                })
+                .collect(),
+            ..RunOpts::default()
+        }
+    }
+
+    fn usage_message(err: anyhow::Error) -> String {
+        let usage = err
+            .downcast_ref::<PillboxError>()
+            .is_some_and(|e| matches!(e.category, crate::errors::ExitCategory::Usage));
+        assert!(usage, "expected a usage error, got: {err:#}");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn a_launch_without_mcp_gets_no_injection() {
+        let resolved = crate::pillbox::global();
+        assert!(
+            guest_mcp(&crate::agents::CLAUDE, &RunOpts::default(), &resolved)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_mcp_lands_a_guest_home_file_its_argv_and_the_fence_host() {
+        let resolved = crate::pillbox::global();
+        let opts = mcp_opts(&[("mem0", "https://MCP.Example.com/mcp")], &[]);
+        let GuestMcp {
+            injection,
+            hosts,
+            forward_ports,
+        } = guest_mcp(&crate::agents::CLAUDE, &opts, &resolved)
+            .unwrap()
+            .expect("an --mcp launch is injected");
+        let guest_path = format!("{GUEST_HOME}/.pillbox/mcp.json");
+        assert_eq!(
+            injection.argv,
+            vec!["--mcp-config".to_string(), guest_path.clone()]
+        );
+        assert!(injection.env.is_empty());
+        assert_eq!(hosts, vec!["mcp.example.com".to_string()]);
+        assert!(forward_ports.is_empty());
+
+        let share = tempfile::tempdir().unwrap();
+        place_mcp_files(&injection.files, share.path()).unwrap();
+        let host_file = share.path().join(".pillbox/mcp.json");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&host_file).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["mem0"]["url"],
+            "https://MCP.Example.com/mcp"
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&host_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn codex_mcp_token_travels_in_the_guest_env_never_argv() {
+        crate::test_util::with_isolated_home("libkrun-mcp-codex-token", || {
+            let resolved = crate::pillbox::global();
+            std::env::set_var("__PB_TEST_LIBKRUN_MCP_TOKEN", "mcp-secret-value");
+            crate::secrets::add(
+                &resolved,
+                crate::secrets::WriteScope::Resolved,
+                "MEM0_TOKEN",
+                crate::secrets::AddSource::EnvVar("__PB_TEST_LIBKRUN_MCP_TOKEN".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::remove_var("__PB_TEST_LIBKRUN_MCP_TOKEN");
+
+            let opts = mcp_opts(
+                &[("mem0", "https://mcp.example.com:443/mcp")],
+                &[("mem0", "MEM0_TOKEN")],
+            );
+            let GuestMcp {
+                injection, hosts, ..
+            } = guest_mcp(&crate::agents::CODEX, &opts, &resolved)
+                .unwrap()
+                .expect("an --mcp launch is injected");
+            assert!(injection.files.is_empty());
+            assert_eq!(hosts, vec!["mcp.example.com".to_string()]);
+            assert_eq!(
+                injection.env,
+                vec![(
+                    "PILLBOX_MCP_TOKEN_MEM0".to_string(),
+                    "mcp-secret-value".to_string()
+                )]
+            );
+            assert!(injection
+                .argv
+                .iter()
+                .any(|a| a.contains("bearer_token_env_var=\"PILLBOX_MCP_TOKEN_MEM0\"")));
+            assert!(injection
+                .argv
+                .iter()
+                .all(|a| !a.contains("mcp-secret-value")));
+        });
+    }
+
+    #[test]
+    fn opencode_server_mcp_is_a_file_and_its_config_env() {
+        let resolved = crate::pillbox::global();
+        let opts = mcp_opts(&[("smoke", "https://mcp.example.com/mcp")], &[]);
+        let GuestMcp { injection, .. } = server_mcp(&crate::agents::OPENCODE, &opts, &resolved)
+            .unwrap()
+            .expect("an --mcp launch is injected");
+        let guest_path = format!("{GUEST_HOME}/.pillbox/opencode-mcp.json");
+        assert_eq!(
+            injection.env,
+            vec![("OPENCODE_CONFIG".to_string(), guest_path.clone())]
+        );
+        assert_eq!(injection.files[0].guest_path, guest_path);
+        assert!(injection.argv.is_empty());
+    }
+
+    #[test]
+    fn mcp_is_refused_where_a_launch_cannot_carry_it() {
+        let resolved = crate::pillbox::global();
+        let opts = mcp_opts(&[("smoke", "https://mcp.example.com/mcp")], &[]);
+        // No adapter: the agent does not support --mcp.
+        let msg = usage_message(
+            guest_mcp(&crate::agents::CODEX_SERVE, &opts, &resolved)
+                .err()
+                .expect("codex-serve has no MCP adapter"),
+        );
+        assert!(msg.contains("does not support --mcp"), "{msg}");
+        // A server entrypoint carries no agent argv.
+        let argv_server = AgentSpec {
+            mcp_inject: Some(crate::agents::mcp::codex_inject),
+            ..crate::agents::OPENCODE
+        };
+        let msg = usage_message(
+            server_mcp(&argv_server, &opts, &resolved)
+                .err()
+                .expect("argv MCP on a server launch is refused"),
+        );
+        assert!(msg.contains("server mode"), "{msg}");
+        // A lone --mcp-token still counts as asking for MCP.
+        let tokens_only = mcp_opts(&[], &[("smoke", "S")]);
+        assert!(guest_mcp(&crate::agents::CODEX_SERVE, &tokens_only, &resolved).is_err());
+    }
+
+    #[test]
+    fn mcp_urls_the_microvm_cannot_reach_are_usage_errors() {
+        for (url, why) in [
+            ("http://mcp.example.com/mcp", "is not https"),
+            ("https://mcp.example.com:8443/mcp", "port 443"),
+            ("https://10.0.0.5/mcp", "IP address"),
+            ("https://[2001:db8::1]/mcp", "IP address"),
+            ("https://mem0.localhost/mcp", "loopback host other than"),
+            ("http://127.5.5.5:7777/mcp", "is not https"),
+            ("https://localhost/mcp", "certificate won't match"),
+            ("https://127.0.0.1:8443/mcp", "serve it over http"),
+            ("http://[::1]:9000/mcp/", "127.0.0.1"),
+            ("http://localhost:53/", "reserves"),
+            ("http://localhost:0/", "invalid port"),
+        ] {
+            let msg = usage_message(mcp_route(&mcp("x", url)).unwrap_err());
+            assert!(msg.contains(why), "{url}: {msg}");
+        }
+        assert_eq!(
+            mcp_route(&mcp("x", "https://user@Mcp.Example.com:443/a?b#c")).unwrap(),
+            McpRoute::Fence("mcp.example.com".into())
+        );
+    }
+
+    #[test]
+    fn host_loopback_mcp_is_forwarded_and_the_guest_sees_the_gateway() {
+        let gw = egress::GATEWAY_IP;
+        for (url, port, guest_url) in [
+            (
+                "http://localhost:7777/mcp?x=1",
+                7777,
+                format!("http://{gw}:7777/mcp?x=1"),
+            ),
+            ("http://127.0.0.1:8000", 8000, format!("http://{gw}:8000")),
+            ("http://LOCALHOST/", 80, format!("http://{gw}:80/")),
+            (
+                "http://u:p@localhost:8443/m",
+                8443,
+                format!("http://u:p@{gw}:8443/m"),
+            ),
+        ] {
+            assert_eq!(
+                mcp_route(&mcp("x", url)).unwrap(),
+                McpRoute::HostLoopback { port, guest_url },
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_mcp_port_joins_the_forward_set_and_its_config_names_the_gateway() {
+        let resolved = crate::pillbox::global();
+        let opts = mcp_opts(
+            &[
+                ("mem0", "http://localhost:7777/mcp"),
+                ("again", "http://127.0.0.1:7777/other"),
+                ("remote", "https://mcp.example.com/mcp"),
+            ],
+            &[],
+        );
+        let GuestMcp {
+            injection,
+            hosts,
+            forward_ports,
+        } = guest_mcp(&crate::agents::CLAUDE, &opts, &resolved)
+            .unwrap()
+            .expect("an --mcp launch is injected");
+        assert_eq!(forward_ports, vec![7777]);
+        assert_eq!(hosts, vec!["mcp.example.com".to_string()]);
+        let config: serde_json::Value = serde_json::from_slice(&injection.files[0].bytes).unwrap();
+        assert_eq!(
+            config["mcpServers"]["mem0"]["url"],
+            format!("http://{}:7777/mcp", egress::GATEWAY_IP)
+        );
+        assert_eq!(
+            config["mcpServers"]["remote"]["url"],
+            "https://mcp.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn the_seal_refuses_a_real_credential_in_any_guest_readable_channel() {
+        let pairs = [super::super::SwapPair {
+            stub: "stub-token".into(),
+            real: "real-vaulted-token".into(),
+            hosts: vec!["api.example.com".into()],
+        }];
+        let file = |bytes: &[u8]| crate::agents::mcp::GuestFile {
+            guest_path: format!("{GUEST_HOME}/.pillbox/mcp.json"),
+            bytes: bytes.to_vec(),
+        };
+        let clean_env = [("A".to_string(), "stub-token".to_string())];
+        let stub_file = file(br#"{"headers":{"Authorization":"Bearer stub-token"}}"#);
+        ensure_env_fork_sealed(&pairs, &clean_env, "exec agent", &[stub_file]).unwrap();
+
+        // An MCP token equal to a vaulted real credential, in the placed file.
+        let real_file = file(br#"{"headers":{"Authorization":"Bearer real-vaulted-token"}}"#);
+        assert!(ensure_env_fork_sealed(&pairs, &clean_env, "exec agent", &[real_file]).is_err());
+        // The same token through env (codex's MCP channel) or the script.
+        let real_env = [(
+            "PILLBOX_MCP_TOKEN_X".to_string(),
+            "real-vaulted-token".to_string(),
+        )];
+        assert!(ensure_env_fork_sealed(&pairs, &real_env, "exec agent", &[]).is_err());
+        assert!(ensure_env_fork_sealed(&pairs, &[], "exec agent real-vaulted-token", &[]).is_err());
+    }
+
+    #[test]
+    fn an_mcp_file_outside_the_guest_home_is_refused() {
+        let share = tempfile::tempdir().unwrap();
+        for guest_path in [
+            "/etc/pillbox/mcp.json".to_string(),
+            format!("{GUEST_HOME}/../etc/mcp.json"),
+            format!("{GUEST_HOME}x/mcp.json"),
+        ] {
+            let file = crate::agents::mcp::GuestFile {
+                guest_path,
+                bytes: b"{}".to_vec(),
+            };
+            assert!(place_mcp_files(&[file], share.path()).is_err());
+        }
+        assert_eq!(std::fs::read_dir(share.path()).unwrap().count(), 0);
     }
 }

@@ -18,13 +18,10 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, sandbox, session};
 
-mod grader;
+pub(crate) mod grader;
 pub(crate) mod stream;
 
-#[cfg(feature = "libkrun")]
-pub(crate) use grader::{dropped_grader_setup, GRADER_STARTED_PRINTF, RUNUSER};
-
-/// Pid file a detached §0 producer ([`run_detached_tailer`]) writes in the session
+/// Pid file a detached §0 producer ([`serve_detached_tailer`]) writes in the session
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
 /// the log fresh (and skip their own drain — the single-producer invariant).
 pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
@@ -73,8 +70,7 @@ impl DetachedProducerLock {
     }
 }
 
-/// The detached §0 PRODUCER for a reparented session (the libkrun analog of
-/// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
+/// The detached §0 PRODUCER for a reparented session. Re-exec'd as a bare subprocess at
 /// bring-up (`pillbox __session-tailer <dir> <capture> <source> <sid>`), it tails
 /// the guest's persistent capture file → maps → appends to the durable log
 /// until SIGTERM on teardown or the nested producer terminates. This keeps the log
@@ -82,7 +78,7 @@ impl DetachedProducerLock {
 /// `diagnose`/`subscribe` and the webhook/OTLP exporters — reads fresh data with
 /// no explicit drain. Takes paths (not a `Pillbox`) since the child has no cwd
 /// context. Sole producer: `subscribe`/`ingest` defer while it's alive.
-pub(crate) fn run_detached_tailer(
+pub(crate) fn serve_detached_tailer(
     session_dir: std::path::PathBuf,
     capture: std::path::PathBuf,
     source: crate::agents::DetachedTranscriptSource,
@@ -144,7 +140,6 @@ fn wait_for_discover_tailer(tailer: events::transcripts::TailerHandle) -> Result
 // The detached §0 producer is a libkrun-server affordance, so the consumers
 // (`LibkrunLiveSession::{event_source,ingest}` + `kill_session`) are all under
 // the `libkrun` feature; dead on a build without it.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
     let pid = std::fs::read_to_string(session_dir.join(TAILER_PID_FILE))
         .ok()?
@@ -157,43 +152,9 @@ pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
 /// Is a detached §0 producer currently alive for this session? Pid file + a signal-0 liveness probe.
 /// Readers (`subscribe`/`ingest`) use it to DEFER their own drain — only one writer may append to the
 /// log or events double.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
     tailer_pid(&session::session_dir_path(resolved, &s.id))
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
-}
-
-/// Run a grader in a one-shot microVM (`session score --in-sandbox`); feature-gated.
-#[cfg(feature = "libkrun")]
-fn libkrun_score_in_sandbox(
-    resolved: &Pillbox,
-    workspace: &std::path::Path,
-    cmd: &str,
-    egress_allow: &[String],
-    drop_privileges: bool,
-) -> Result<(i32, String)> {
-    let (code, raw) = sandbox::libkrun::score_in_sandbox(
-        resolved,
-        workspace,
-        cmd,
-        egress_allow,
-        drop_privileges,
-    )?;
-    Ok((code, grader::grader_output_after_start(code, &raw)?))
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_score_in_sandbox(
-    _resolved: &Pillbox,
-    _workspace: &std::path::Path,
-    _cmd: &str,
-    _egress_allow: &[String],
-    _drop_privileges: bool,
-) -> Result<(i32, String)> {
-    Err(PillboxError::usage(
-        "session score",
-        "--in-sandbox requires the libkrun feature (host grading: drop --in-sandbox)",
-    )
-    .into())
 }
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
@@ -524,8 +485,7 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     if let Some(label) = &s.label {
         println!("  label:        {label}");
     }
-    println!("  backend:      {}", s.backend);
-    println!("  sandbox_id:   {}", s.sandbox_id);
+    println!("  substrate:    {}", s.substrate);
     println!("  pty_pid:      {}", s.pty_pid);
     println!("  agent:        {}", s.agent_id);
     println!("  started_at:   {}", s.started_at);
@@ -609,7 +569,7 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         );
     }
     println!("  agent:        {}", s.agent_id);
-    println!("  backend:      {}", s.backend);
+    println!("  backend:      {}", s.substrate.label());
     println!("  started_at:   {}", s.started_at);
     println!(
         "  attached:     {}",
@@ -790,7 +750,7 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 
 /// The `session rm` success banner; managed sessions only have a local record to drop.
 pub(crate) fn removed_line(s: &session::Session) -> String {
-    if s.backend == session::BACKEND_MANAGED {
+    if s.substrate.kind() == Some(crate::sandbox::SubstrateKind::Managed) {
         format!("pillbox: ✓ managed session `{}` record removed.", s.id)
     } else {
         format!("pillbox: ✓ session `{}` removed.", s.id)
@@ -804,27 +764,11 @@ pub(crate) fn print_removed(s: &session::Session) {
 
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    // A backend this binary can construct → tear down its sandbox via the plane.
-    // A backend it can't (an unknown/removed remote backend, or a libkrun record
-    // on a build without the feature) can't have its sandbox reached, but the
-    // orphaned record must still be removable — drop it with a warning.
-    match sandbox::live_session(&s) {
-        Ok(live) => {
-            live.kill(resolved)?;
-            print_removed(&s);
-            Ok(())
-        }
-        Err(_) => {
-            eprintln!(
-                "pillbox: warning: session `{}` has an unsupported backend `{}` \
-                 (this binary can't reach its sandbox); dropping the orphaned record only.",
-                s.id, s.backend
-            );
-            session::delete(resolved, &s.id)?;
-            print_removed(&s);
-            Ok(())
-        }
-    }
+    // The plane tears the session down; a retired record's kill drops only the
+    // record and says on stderr what it left behind.
+    sandbox::live_session(&s)?.kill(resolved)?;
+    print_removed(&s);
+    Ok(())
 }
 
 fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
@@ -1542,13 +1486,16 @@ pub(crate) fn score(resolved: &Pillbox, id: &str, request: &ScoreRequest) -> Res
     // rubric's frame markers are interspersed, so capping here (tail-only) could
     // drop early criteria. `--in-sandbox` runs it in a one-shot microVM.
     let (code, raw) = if in_sandbox {
-        libkrun_score_in_sandbox(
-            resolved,
-            &grade_dir,
-            &exec_cmd,
-            grader_egress,
-            drop_privileges,
-        )?
+        let (code, raw) = sandbox::SubstrateKind::Libkrun
+            .backend()?
+            .score_in_sandbox(
+                resolved,
+                &grade_dir,
+                &exec_cmd,
+                grader_egress,
+                drop_privileges,
+            )?;
+        (code, grader::grader_output_after_start(code, &raw)?)
     } else {
         run_host_grader(&grade_dir, &exec_cmd)?
     };
@@ -1637,7 +1584,11 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
         );
         for s in &expired {
             let exp = s.expires_at.as_deref().unwrap_or("(none)");
-            println!("  {}  expires_at={exp}  backend={}", s.id, s.backend);
+            println!(
+                "  {}  expires_at={exp}  backend={}",
+                s.id,
+                s.substrate.label()
+            );
         }
         return Ok(());
     }
@@ -1761,23 +1712,29 @@ mod tests {
 
     #[test]
     fn removed_line_says_only_the_record_went_for_a_managed_session() {
+        use crate::sandbox::Substrate;
         let mut s = session::Session::test_fixture();
-        for (backend, line) in [
+        let managed = Substrate::Managed(crate::sandbox::managed::ManagedHandle {
+            extra: Default::default(),
+            endpoint: "https://w.example.workers.dev".into(),
+            execution_session_id: s.id.clone(),
+        });
+        for (substrate, line) in [
             (
-                session::BACKEND_MANAGED,
+                managed,
                 "pillbox: ✓ managed session `abc123def456` record removed.",
             ),
             (
-                session::BACKEND_LIBKRUN,
+                Substrate::Libkrun(None),
                 "pillbox: ✓ session `abc123def456` removed.",
             ),
             (
-                session::BACKEND_DOCKER,
+                Substrate::from_legacy("docker", "0123"),
                 "pillbox: ✓ session `abc123def456` removed.",
             ),
         ] {
-            s.backend = backend.to_string();
-            assert_eq!(removed_line(&s), line, "{backend}");
+            s.substrate = substrate;
+            assert_eq!(removed_line(&s), line, "{:?}", s.substrate);
         }
     }
 

@@ -19,9 +19,9 @@ OpenCode 2 is a new package, not `opencode-ai@2` (that package stays on the 1.x
 line), and its server API is a clean break from 1.x, so the adapter targets 2.x
 only. The managed Cloudflare/DigitalOcean paths keep their own OpenCode 1.x pins
 (`cloudflare-spike/Dockerfile`, `digitalocean/`) because they are sealed managed
-execution cohorts; they are not covered by this doc. opencode does not run on
-the deprecated Docker backend (`run` refuses every server agent there) and has
-no `sandbox agent` adapter; the OpenCode 1 Docker paths were deleted.
+execution cohorts; they are not covered by this doc. opencode runs only on the
+libkrun microVM and has no `sandbox agent` adapter; the OpenCode 1 Docker paths
+were deleted with the Docker backend.
 
 **`run` does NOT auto-send** the initial prompt: it brings up a ready session; the
 first prompt goes through `session send` like every turn, captured by the guest
@@ -100,7 +100,7 @@ Browser-loopback OAuth providers still need the callback port forwarded
 ## Tool-free text turns (`pillbox.text/2`)
 
 `pillbox text execute` drives one OpenCode turn in an invocation-owned microVM
-(`src/execution/text_opencode.rs`, `src/sandbox/libkrun/repository/opencode.rs`;
+(`src/execution/microvm/text_opencode.rs`, `src/sandbox/libkrun/repository/opencode.rs`;
 the contract is in [commands](commands.md#sealed-local-text-execution)). The guest
 driver starts `opencode serve`, creates one session, prompts it and relays each
 `/api/event` object to the host as a JSON line until that session's

@@ -3,7 +3,7 @@
 //! A sandbox is a detached VM whose guest runs `pillbox exec-host` on a listening
 //! vsock port; each `exec` dials the libkrun-bound host socket and speaks
 //! [`exec_channel`](crate::sandbox::exec_channel). Its record stores the
-//! [`LibkrunHandle`] JSON in `backend_ref`, and destroy is [`teardown_handle`] plus
+//! [`LibkrunHandle`] as its `Substrate::Libkrun`, and destroy is [`teardown_handle`] plus
 //! deleting the record.
 //!
 //! The VM takes the run path's [`launch_base`] prologue: a private rootfs clone, a
@@ -33,15 +33,17 @@ use crate::sandboxes::{self, Sandbox};
 use super::session::{
     agent_launch_creds, authenticated_home, ensure_env_fork_sealed, guest_launch_preamble,
     launch_base, spawn_reparented, standard_allowlist, teardown_handle, CaLifetime, LaunchBase,
-    LaunchCreds, LaunchInputs, LibkrunHandle, OwnedPath, PendingVm, VaultCa,
+    LaunchCreds, LaunchInputs, OwnedPath, PendingVm, VaultCa,
 };
 use super::{boot, krun_cache_dir, shell_quote, EgressSpec, Share, SwapPair, VmSpec, VsockAttach};
+use crate::sandbox::substrate::LibkrunHandle;
+use crate::sandbox::{RecordOnly, Substrate};
 
 /// Guest vsock port `exec-host` listens on. Distinct from the attach (1024) and
 /// forward (1025) ports.
 pub(super) const EXEC_PORT: u32 = 1026;
 
-/// The uid:gid an agent sandbox's commands run as (the docker `--user 1000:1000`).
+/// The uid:gid an agent sandbox's commands run as (the runner image's agent user).
 const AGENT_UID: u32 = 1000;
 
 /// How long spawn waits for the guest's exec channel to answer: VM boot plus the
@@ -89,14 +91,21 @@ fn sandbox_agents() -> Vec<&'static str> {
         .collect()
 }
 
-/// The live target for a libkrun sandbox record.
-pub(crate) fn target(record: &Sandbox) -> Result<Box<dyn SandboxTarget>> {
-    Ok(Box::new(LibkrunSandbox {
-        id: record.id.clone(),
-        handle: LibkrunHandle::parse(&record.backend_ref)
-            .with_context(|| format!("sandbox `{}`", record.id))?,
-        guest_workspace: record.guest_workspace.clone(),
-    }))
+/// The live target for a libkrun sandbox record; one with no handle can only be
+/// dropped.
+pub(crate) fn target(record: &Sandbox) -> Box<dyn SandboxTarget> {
+    match &record.substrate {
+        Substrate::Libkrun(Some(handle)) => Box::new(LibkrunSandbox {
+            id: record.id.clone(),
+            handle: handle.clone(),
+            guest_workspace: record.guest_workspace.clone(),
+        }),
+        _ => Box::new(RecordOnly {
+            record: record.clone(),
+            why: "has no libkrun handle".into(),
+            left: "nothing it ran was torn down".into(),
+        }),
+    }
 }
 
 /// Everything [`launch`] needs, built before any VMM exists.
@@ -172,7 +181,7 @@ fn prepare(resolved: &Pillbox, agent: Option<&AgentSpec>, workspace: &Path) -> R
             allowlist,
             super::egress_log_path(),
             Some(ca.dir.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             refresh,
         ),
     );
@@ -234,7 +243,7 @@ fn sealed_boot_script(
             exec_host = boot::exec_host_cmd(EXEC_PORT, Some(uid)),
         )
     };
-    ensure_env_fork_sealed(swap_pairs, guest_env, &script)?;
+    ensure_env_fork_sealed(swap_pairs, guest_env, &script, &[])?;
     Ok(script)
 }
 
@@ -291,9 +300,8 @@ fn launch(
             })?;
             let record = Sandbox {
                 id: id.to_string(),
-                backend: sandboxes::BACKEND_LIBKRUN.into(),
-                backend_ref: serde_json::to_string(handle).context("encode libkrun handle")?,
-                image: crate::docker::resolve_runner_image(resolved).0,
+                substrate: Substrate::Libkrun(Some(handle.clone())),
+                image: crate::sandbox::oci::resolve_runner_image(resolved).0,
                 agent: agent.map(|spec| spec.id.to_string()),
                 workspace: req.workspace.display().to_string(),
                 workspace_clone: Some(handle.workspace.clone()),
@@ -529,7 +537,13 @@ mod tests {
             vec!["/bin/sh".into()],
             Path::new("/ws-clone"),
             Path::new("/k/exec.sock"),
-            EgressSpec::fence(vec!["api.anthropic.com".into()], None, None, None, None),
+            EgressSpec::fence(
+                vec!["api.anthropic.com".into()],
+                None,
+                None,
+                Vec::new(),
+                None,
+            ),
         );
         assert_eq!(spec.vsock.len(), 1);
         assert_eq!(spec.vsock[0].port, EXEC_PORT);
@@ -661,6 +675,7 @@ mod tests {
         let spec = dir.join("pillbox-krun-spec-test.json");
         std::fs::write(&spec, "{}").unwrap();
         LibkrunHandle {
+            extra: Default::default(),
             sock: dir.join("exec.sock").to_string_lossy().into_owned(),
             pid: 0,
             creds: creds.to_string_lossy().into_owned(),
@@ -741,8 +756,7 @@ mod tests {
             let handle = handle_in(dir.path());
             let record = Sandbox {
                 id: Sandbox::new_id(),
-                backend: sandboxes::BACKEND_LIBKRUN.into(),
-                backend_ref: serde_json::to_string(&handle).unwrap(),
+                substrate: Substrate::Libkrun(Some(handle.clone())),
                 image: "pillbox:latest".into(),
                 agent: Some("claude".into()),
                 workspace: "/work/app".into(),

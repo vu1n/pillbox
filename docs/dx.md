@@ -1,8 +1,8 @@
 # Developer experience — the bundle is the product
 
 > **Scope.** pillbox is **local-first**: the backend is the libkrun microVM
-> (the default build; see [libkrun-sandbox.md](./libkrun-sandbox.md)) — Docker
-> is deprecated and only reachable via `PILLBOX_BACKEND=docker`. This doc covers
+> (the default build; see [libkrun-sandbox.md](./libkrun-sandbox.md)); the
+> Docker backend was removed. This doc covers
 > the local-first inner loops and the drive/§0 surface. "Remote" is the
 > managed/Cloudflare tier ([managed-tier.md](./managed-tier.md)), a different
 > shape; mentions of it here are forward-looking, not current.
@@ -164,7 +164,7 @@ frozen version is what the external optimization loop consumes and emits.
 
 ## Quick wins (cheap, high-value)
 
-- Local-run pre-handoff banner: `pillbox: running claude against myapp (docker)
+- Local-run pre-handoff banner: `pillbox: running claude against myapp (libkrun)
   — /workspace/myapp, vault: off`. Closes the silent mis-targeting footgun
   (~10 lines).
 - Give `HumanSink`/`JsonlSink` real arms for the three HITL payloads (today

@@ -2,9 +2,9 @@
 id: text-execution
 paths:
   - "src/commands/text.rs"
-  - "src/execution/text.rs"
-  - "src/execution/text_v2.rs"
-  - "src/execution/text_opencode.rs"
+  - "src/execution/microvm/text.rs"
+  - "src/execution/microvm/text_v2.rs"
+  - "src/execution/microvm/text_opencode.rs"
   - "src/execution/pi_text.rs"
   - "src/execution/claude_text.rs"
   - "src/execution/claude_text/**"
@@ -15,11 +15,11 @@ paths:
   - "scripts/smoke/claude-text-offline.py"
 entry:
   - "src/commands/text.rs:execute"
-  - "src/execution/text_v2.rs:TextRequestV2"
+  - "src/execution/microvm/text_v2.rs:TextRequestV2"
   - "src/execution/store.rs:InvocationStore"
 tests:
   - "src/commands/text.rs:text_claim_reuses_exact_request_and_interrupts_lost_owner"
-  - "src/execution/text_v2.rs:a_malformed_request_is_refused_before_any_claim"
+  - "src/execution/microvm/text_v2.rs:a_malformed_request_is_refused_before_any_claim"
   - "scripts/smoke/test_claude_text_bridge.py"
 ---
 

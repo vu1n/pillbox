@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use crate::agents::{self, RunOpts};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::Started;
+use crate::sandbox::{Started, SubstrateKind};
 
 /// The agent to run: an explicit `--agent`, else the descriptor cascade
 /// (project `pillbox.toml` → `~/.pillbox/global` → built-in `claude`).
@@ -28,8 +28,8 @@ pub(crate) fn resolve_agent_spec(
 }
 
 /// Bookmark forks run only on the local libkrun microVM backend.
-pub(crate) fn validate_bookmark_backend(opts: &RunOpts, backend: &str) -> Result<()> {
-    if opts.from_bookmark.is_some() && backend != crate::session::BACKEND_LIBKRUN {
+pub(crate) fn validate_bookmark_backend(opts: &RunOpts, kind: SubstrateKind) -> Result<()> {
+    if opts.from_bookmark.is_some() && kind != SubstrateKind::Libkrun {
         return Err(PillboxError::usage(
             "run",
             "bookmark forks require the local libkrun microVM backend",
@@ -95,6 +95,17 @@ pub(crate) fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
 /// [`Started::StructuredFinished`] with that `exit_code`: the session and its
 /// log are real, and the caller decides whether that is an error.
 pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) -> Result<Started> {
+    // A run flag the substrate can't honor is refused, never ignored.
+    if !opts.mounts.is_empty() {
+        return Err(PillboxError::usage(
+            "run",
+            "--mount (or a preset `mount`) isn't supported: the microVM takes no extra host mounts",
+        )
+        .with_next(
+            "drop --mount; put what the agent needs in the workspace or pass it with --with/--env",
+        )
+        .into());
+    }
     let spec = resolve_agent_spec(resolved, agent)?;
     if let Some(meta) = &resolved.meta {
         if opts.name.is_none() {
@@ -112,8 +123,9 @@ pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) 
 
     apply_default_workspace(resolved, &mut opts);
 
-    let backend = crate::sandbox::select_backend();
-    validate_bookmark_backend(&opts, backend.id())?;
+    let kind = SubstrateKind::selected()?;
+    validate_bookmark_backend(&opts, kind)?;
+    let backend = kind.backend()?;
     if !opts.memory {
         return backend.run(spec, opts, resolved);
     }
@@ -154,7 +166,8 @@ fn started_lines(started: &Started, json: bool) -> Vec<String> {
         Started::Detached(session) => vec![
             format!(
                 "pillbox: ✓ session `{}` started in background ({})",
-                session.id, session.backend
+                session.id,
+                session.substrate.label()
             ),
             format!("  Next: pillbox session attach {}", session.id),
         ],
@@ -228,11 +241,11 @@ pub(crate) fn render_started(started: &Started, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ServerSession, Session, BACKEND_DOCKER, BACKEND_LIBKRUN};
+    use crate::session::{ServerSession, Session};
 
     /// The `run --json` envelope, byte for byte as the backends printed it
     /// before they returned [`Started`] instead.
-    const FIXTURE_ENVELOPE: &str = r#"{"session":{"agent_id":"claude","attached_pid":null,"backend":"docker","base_snapshot":null,"expires_at":null,"id":"abc123def456","label":"test","placement":"local","pty_pid":0,"result_snapshot":null,"sandbox_id":"sb_test","started_at":"2026-05-23T13:37:00Z"},"version":1}"#;
+    const FIXTURE_ENVELOPE: &str = r#"{"session":{"agent_id":"claude","attached_pid":null,"backend":"libkrun","base_snapshot":null,"expires_at":null,"id":"abc123def456","label":"test","placement":"local","pty_pid":0,"result_snapshot":null,"sandbox_id":"","started_at":"2026-05-23T13:37:00Z"},"version":1}"#;
 
     fn usage_reason(err: anyhow::Error) -> String {
         err.downcast::<PillboxError>().unwrap().to_string()
@@ -260,6 +273,23 @@ mod tests {
     }
 
     #[test]
+    fn a_run_with_an_extra_mount_is_refused_before_launch() {
+        crate::test_util::with_isolated_home("run-mount-refused", || {
+            let opts = RunOpts {
+                mounts: vec!["/a:/b".into()],
+                ..RunOpts::default()
+            };
+            let err = start(&crate::pillbox::global(), Some("claude"), opts).unwrap_err();
+            let pillbox = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+            assert!(
+                matches!(pillbox.category, crate::errors::ExitCategory::Usage),
+                "{err}"
+            );
+            assert!(err.to_string().contains("--mount"), "{err}");
+        });
+    }
+
+    #[test]
     fn run_request_refuses_json_without_a_persisted_session() {
         let claude = agents::lookup("run", "claude").unwrap();
         let foreground = RunOpts::default();
@@ -277,9 +307,7 @@ mod tests {
     }
 
     fn libkrun_fixture() -> Session {
-        let mut s = Session::test_fixture();
-        s.backend = BACKEND_LIBKRUN.to_string();
-        s
+        Session::test_fixture()
     }
 
     #[test]
@@ -306,15 +334,6 @@ mod tests {
     #[test]
     fn human_banners_match_the_backend_banners() {
         // One detached banner for every backend, naming the session's backend.
-        let docker = Session::test_fixture();
-        assert_eq!(docker.backend, BACKEND_DOCKER);
-        assert_eq!(
-            started_lines(&Started::Detached(docker), false),
-            vec![
-                "pillbox: ✓ session `abc123def456` started in background (docker)",
-                "  Next: pillbox session attach abc123def456",
-            ]
-        );
         assert_eq!(
             started_lines(&Started::Detached(libkrun_fixture()), false),
             vec![

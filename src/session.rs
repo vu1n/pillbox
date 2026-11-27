@@ -13,12 +13,12 @@
 //! a project pillbox would mislead the user about which workspace is
 //! mounted in the running sandbox.
 //!
-//! ## Backend coverage
+//! ## Substrate
 //!
-//! The local `docker` and `libkrun` backends mint sessions today. They
-//! reattach through the same shared attach transport (frame protocol +
-//! pump): docker over `docker exec`, libkrun over the persistent attach
-//! socket. The `backend` string drives dispatch in `commands::session`.
+//! Each record stores the [`Substrate`] it runs on (a libkrun microVM or the
+//! managed tier, with its handle) once, as a `[substrate]` table; the plane
+//! builds its live session from that value ([`crate::sandbox::live_session`]).
+//! Records written before the table existed migrate on read.
 //!
 //! ## Threat model
 //!
@@ -27,14 +27,14 @@
 //! Co-tenants on the same machine cannot read or write them.
 //!
 //! The fields, by sensitivity:
-//!   - `sandbox_id`: an opaque local backend handle (a Docker container
-//!     id, or a libkrun attach-socket path + VMM pid). Not a secret;
-//!     low-confidentiality config, not credential material.
+//!   - `substrate`: the backend handle (a libkrun attach-socket path +
+//!     VMM pid, or a managed Worker origin + execution session id). Not a
+//!     secret; low-confidentiality config, not credential material.
 //!   - `attached_pid`: a local process id; not a secret. See the
 //!     hardening in `main.rs::session_detach` for why we still
 //!     validate it (pid 0/1/-1/self are rejected, ESRCH is treated
 //!     as already-detached).
-//!   - `backend`, `agent_id`, `started_at`, `label`:
+//!   - `agent_id`, `started_at`, `label`:
 //!     user-supplied or derived metadata.
 //!
 //! No credentials live in this file. The vault path stays where
@@ -60,6 +60,7 @@ use crate::errors::PillboxError;
 use crate::paths::ensure_mode_0700;
 use crate::pillbox::Pillbox;
 use crate::registry::{self as reg, IdRegistry, Registry};
+use crate::sandbox::Substrate;
 
 /// Subdirectory under a pillbox's state dir holding session records.
 /// Mirrors `remotes/` and `secrets/` — one file per record, easy to
@@ -99,11 +100,6 @@ pub(crate) fn sessions_root_path(pb: &Pillbox) -> PathBuf {
 /// libkrun commit-guard watches this path: its existence is the "launch committed"
 /// signal that keeps a detached VMM from self-destructing. Pinned to `write`'s
 /// real path by a test (`record_path_matches_write`).
-///
-/// libkrun-only: its sole caller is the commit-guard wiring (`arm_commit_guard`),
-/// feature-gated — so without the feature this would be dead code (a `-D warnings`
-/// build error).
-#[cfg(feature = "libkrun")]
 pub(crate) fn record_path(pb: &Pillbox, id: &str) -> PathBuf {
     sessions_root_path(pb).join(format!("{id}.toml"))
 }
@@ -122,7 +118,7 @@ impl Registry for SessionRegistry {
         format!("{name}.toml")
     }
     fn parse(raw: &str, source: &Path) -> Result<Self::Record> {
-        let record: Session = toml::from_str(raw).map_err(|e| {
+        let record = decode(raw).map_err(|e| {
             PillboxError::config("session read", format!("{}: {e}", source.display()))
         })?;
         validate_storage_id(&record.id, "session read")?;
@@ -148,69 +144,12 @@ impl IdRegistry for SessionRegistry {
     }
 }
 
-/// Backend label written into the session record. Kept as a string
-/// (not an enum) on disk so a future binary that adds a backend can
-/// still read older sessions. Dispatch goes through [`Backend::parse`]
-/// so callers can match on a typed enum without resurrecting the
-/// stringly path each time.
-pub(crate) const BACKEND_DOCKER: &str = "docker";
-pub(crate) const BACKEND_LIBKRUN: &str = "libkrun";
-pub(crate) const BACKEND_MANAGED: &str = "managed";
-
-/// Typed view of the on-disk `backend` string. Returned by
-/// [`Backend::parse`]; `None` means a backend label this binary doesn't
-/// know about (older or hand-edited record). Callers report the raw
-/// label in the error so the user can grep for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Backend {
-    /// Local Docker — a detached `pillbox run --detach` against the host
-    /// daemon. `sandbox_id` is the container id; attach/rm act on the local
-    /// daemon directly.
-    Docker,
-    /// Local libkrun microVM — a detached `pillbox run --detach` (feature-gated
-    /// `libkrun`). `sandbox_id` carries the persistent attach socket path + the
-    /// VMM child PID; attach dials that socket, rm kills the child + scrubs the
-    /// CoW clones. Detach keeps the vault (the MITM lives in the child, not the
-    /// parent — unlike local Docker, which can't keep a host-side proxy alive).
-    Libkrun,
-    /// Managed Cloudflare tier — the session runs on a CF container placed by the
-    /// Cloudflare execution runtime, not on this host. `sandbox_id` carries the
-    /// Worker origin and execution session id (a JSON [`ManagedHandle`]); there's
-    /// no local process. Drive (`send`) uses the Worker's HTTP surface and copies
-    /// returned evidence into the local session log. See docs/managed-tier.md and
-    /// [`crate::sandbox::managed`].
-    Managed,
-}
-
-impl Backend {
-    pub(crate) fn parse(label: &str) -> Option<Self> {
-        match label {
-            BACKEND_DOCKER => Some(Backend::Docker),
-            BACKEND_LIBKRUN => Some(Backend::Libkrun),
-            BACKEND_MANAGED => Some(Backend::Managed),
-            _ => None,
-        }
-    }
-}
-
-/// Where a session physically runs — the dispatch axis attach/reattach/kill key
-/// off (docs/managed-tier.md §`Session` gains a `placement`). A *real* axis, not
-/// display sugar: a `Managed` session has no local sandbox to reach, so the plane
-/// routes its verbs to the Worker instead of a local container/VM. Stored
-/// as a string (not the [`Backend`] label) so a future placement that reuses a
-/// transport — or an old record that predates the field — round-trips cleanly.
-/// `Local` is the default for every record written before this field existed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Placement {
-    /// On this host — a Docker container or a libkrun microVM. The historical
-    /// (and default) case; attach/kill act on the local daemon/VMM directly.
-    #[default]
-    Local,
-    /// On the managed Cloudflare tier — a bounded turn in Cloudflare Sandbox.
-    /// Returned evidence is copied to the local session log; there is no local
-    /// process to signal or tear down.
-    Managed,
+/// Parse a session record, migrating a pre-substrate one (see
+/// [`crate::sandbox::substrate::migrate_legacy`]).
+fn decode(raw: &str) -> std::result::Result<Session, toml::de::Error> {
+    let mut table: toml::Table = toml::from_str(raw)?;
+    crate::sandbox::substrate::migrate_legacy(&mut table, "sandbox_id");
+    toml::Value::Table(table).try_into()
 }
 
 /// On-disk shape. Forward-compatible: serde will ignore unknown fields
@@ -226,14 +165,8 @@ pub(crate) struct Session {
     /// Surfaced in `session list` next to the id.
     #[serde(default)]
     pub(crate) label: Option<String>,
-    /// Backend kind — one of [`BACKEND_DOCKER`], [`BACKEND_LIBKRUN`].
-    pub(crate) backend: String,
-    /// Opaque handle the backend uses to find this session again.
-    /// For Docker: the container id. For libkrun: the persistent attach
-    /// socket path + VMM child PID.
-    pub(crate) sandbox_id: String,
-    /// PTY process id inside the backend. For Docker: 0 — the relay finds
-    /// the pty-host by socket path, not pid.
+    /// PTY process id inside the backend (0 when the pty-host is reached by
+    /// socket path, not pid).
     #[serde(default)]
     pub(crate) pty_pid: i64,
     /// Agent that's running inside (`claude` | `codex` | …).
@@ -279,19 +212,15 @@ pub(crate) struct Session {
     /// predate the field.
     #[serde(default)]
     pub(crate) guest_cwd: String,
-    /// Where this session physically runs (host-local vs the managed CF tier) —
-    /// the dispatch axis attach/reattach/kill route on. `Local` (the default)
-    /// for every record written before the managed tier existed, so old records
-    /// deserialize unchanged. A scalar string in TOML, so it sits above `server`
-    /// (a table) with the other scalars.
-    #[serde(default)]
-    pub(crate) placement: Placement,
+    /// What this session runs on, with the handle that finds it again — the one
+    /// stored answer to "which substrate runs this". The first table field.
+    ///
+    /// No scalar field may follow this table: TOML would parse it into
+    /// `[substrate]`. New scalar fields go above; new table/struct fields go below.
+    pub(crate) substrate: Substrate,
     /// Server-integration (opencode) state — `Some` iff the agent is a `Server`
     /// integration, `None` for PTY agents (claude/codex). Grouped so a PTY record
     /// can't carry a half-populated `(agent_session_id, model)` tail.
-    ///
-    /// No scalar field may follow this table: TOML would parse it into
-    /// `[server]`. New scalar fields go above; new table/struct fields go below.
     #[serde(default)]
     pub(crate) server: Option<ServerSession>,
     /// Harness-neutral request persisted before execution. Kept separate from
@@ -338,7 +267,7 @@ impl Session {
     ///
     /// ```ignore
     /// let mut s = Session::test_fixture();
-    /// s.backend = BACKEND_LIBKRUN.into();
+    /// s.substrate = Substrate::Libkrun(Some(handle));
     /// ```
     ///
     /// Kept `#[cfg(test)]` to keep the production binary slim.
@@ -347,8 +276,6 @@ impl Session {
         Self {
             id: "abc123def456".to_string(),
             label: Some("test".to_string()),
-            backend: BACKEND_DOCKER.to_string(),
-            sandbox_id: "sb_test".to_string(),
             pty_pid: 0,
             agent_id: "claude".to_string(),
             started_at: "2026-05-23T13:37:00Z".to_string(),
@@ -357,7 +284,7 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
-            placement: Placement::Local,
+            substrate: Substrate::Libkrun(None),
             server: None,
             requested_execution: None,
         }
@@ -376,16 +303,12 @@ impl Session {
         if let Some(label) = &self.label {
             o.insert("label".into(), label.clone().into());
         }
-        o.insert("backend".into(), self.backend.clone().into());
+        o.insert("backend".into(), self.substrate.label().into());
         // `placement` tells a consumer whether the session runs locally or on the
-        // managed tier — the axis `session attach`/`rm` route on. Always present
-        // (defaults to `local`) so an orchestrator can branch on it.
-        o.insert(
-            "placement".into(),
-            serde_json::to_value(self.placement)
-                .unwrap_or_else(|_| serde_json::Value::String("local".into())),
-        );
-        o.insert("sandbox_id".into(), self.sandbox_id.clone().into());
+        // managed tier. Always present so an orchestrator can branch on it: null
+        // for a retired record, which runs nowhere.
+        o.insert("placement".into(), self.substrate.placement().into());
+        o.insert("sandbox_id".into(), self.substrate.handle_text().into());
         o.insert("pty_pid".into(), self.pty_pid.into());
         o.insert("agent_id".into(), self.agent_id.clone().into());
         o.insert("started_at".into(), self.started_at.clone().into());
@@ -450,8 +373,8 @@ impl Session {
 }
 
 /// The `pillbox run --json` start envelope — the one pinned
-/// `{version:1, session:{…}}` shape for every backend and lifecycle (docker
-/// detach, libkrun detach, server-mode bring-up, structured and managed runs).
+/// `{version:1, session:{…}}` shape for every backend and lifecycle (libkrun
+/// detach, server-mode bring-up, structured and managed runs).
 /// Backends return the [`Session`]; only the CLI renders it, through this, so
 /// the schema can't drift between backends.
 pub(crate) fn started_json(session: &Session) -> String {
@@ -744,15 +667,14 @@ mod tests {
     use crate::test_util::with_isolated_home;
     use std::fs;
 
-    fn make(backend: &str) -> Session {
-        // Per-call overrides (id, backend, started_at) on top of the
+    fn make() -> Session {
+        // Per-call overrides (id, started_at) on top of the
         // shared `Session::test_fixture()`. Keeps the ambiguous-prefix /
         // list-ordering tests deterministic where the fixture's stable
         // fields wouldn't fit.
         let mut s = Session::test_fixture();
         s.id = Session::new_id();
         s.label = None;
-        s.backend = backend.to_string();
         s.pty_pid = 42;
         s.started_at = now_rfc3339();
         s
@@ -775,21 +697,50 @@ mod tests {
         }
     }
 
+    /// A pre-substrate record with `backend = "{backend}"`, `sandbox_id = '{handle}'`.
+    fn legacy(backend: &str, handle: &str, extra: &str) -> String {
+        format!(
+            "id = \"abc123def456\"\nbackend = \"{backend}\"\nsandbox_id = '{handle}'\n\
+             pty_pid = 0\nagent_id = \"claude\"\nstarted_at = \"2026-05-23T13:37:00Z\"\n{extra}"
+        )
+    }
+
     #[test]
-    fn placement_defaults_to_local_for_records_without_the_field() {
-        // Backward-compat: a record written before `placement` existed (no
-        // `placement` line) deserializes with `Placement::Local`, not an error.
-        let pre_field = r#"
-            id = "abc123def456"
-            backend = "docker"
-            sandbox_id = "container-1"
-            agent_id = "claude"
-            started_at = "2026-05-23T13:37:00Z"
-        "#;
-        let s: Session = toml::from_str(pre_field).expect("old record parses");
-        assert_eq!(s.placement, Placement::Local);
-        assert_eq!(s.requested_execution, None);
-        assert!(s.to_json_value().get("execution").is_none());
+    fn a_legacy_session_record_of_each_kind_loads_with_its_substrate_and_output_keys() {
+        let lk = r#"{"sock":"/tmp/x.sock","pid":1,"creds":"/tmp/c","workspace":"/tmp/w","spec":"/tmp/s.json"}"#;
+        let mg =
+            r#"{"endpoint":"https://w.example.workers.dev","execution_session_id":"abc123def456"}"#;
+        for (backend, handle, extra, placement) in [
+            ("docker", "0123456789abcdef", "", None),
+            ("libkrun", lk, "", Some("local")),
+            ("libkrun", "", "", Some("local")),
+            ("managed", mg, "placement = \"managed\"\n", Some("managed")),
+            ("e2b", "sb-1", "placement = \"local\"\n", None),
+        ] {
+            let s = decode(&legacy(backend, handle, extra)).expect("a legacy record parses");
+            assert_eq!(
+                s.substrate.kind().is_some(),
+                placement.is_some(),
+                "{backend}"
+            );
+            let json = s.to_json_value();
+            assert_eq!(json["backend"], backend, "{backend}");
+            assert_eq!(json["placement"], serde_json::json!(placement), "{backend}");
+            assert_eq!(json["sandbox_id"], handle, "{backend}");
+            assert_eq!(s.requested_execution, None);
+            assert!(json.get("execution").is_none());
+            // The next write stores the new shape, which reads back the same.
+            let rewritten = toml::to_string(&s).unwrap();
+            assert!(!rewritten.contains("sandbox_id"), "{rewritten}");
+            assert!(!rewritten.contains("placement"), "{rewritten}");
+            assert_eq!(decode(&rewritten).unwrap(), s, "{rewritten}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_record_missing_its_backend_still_fails_to_read() {
+        let raw = "id = \"abc123def456\"\nagent_id = \"claude\"\nstarted_at = \"x\"\n";
+        assert!(decode(raw).is_err());
     }
 
     #[test]
@@ -805,7 +756,7 @@ mod tests {
             agent_session_id = "ses_native"
             model = "openai/gpt-5.6-luna"
         "#;
-        let session: Session = toml::from_str(legacy).expect("legacy server record parses");
+        let session = decode(legacy).expect("legacy server record parses");
         assert_eq!(session.requested_execution, None);
         assert_eq!(
             session.to_json_value()["execution"]["requested"],
@@ -817,17 +768,26 @@ mod tests {
     }
 
     #[test]
-    fn placement_round_trips_managed_through_toml() {
+    fn the_substrate_table_precedes_the_server_table_and_round_trips() {
         let mut s = Session::test_fixture();
-        s.backend = BACKEND_MANAGED.to_string();
-        s.placement = Placement::Managed;
+        s.substrate = Substrate::Managed(crate::sandbox::managed::ManagedHandle {
+            extra: Default::default(),
+            endpoint: "https://w.example.workers.dev".into(),
+            execution_session_id: s.id.clone(),
+        });
+        s.server = Some(ServerSession {
+            agent_session_id: "ses_native".into(),
+            model: "openai/gpt-5.6-luna".into(),
+            temperature: None,
+        });
         let toml = toml::to_string(&s).unwrap();
-        assert!(toml.contains(r#"placement = "managed""#), "{toml}");
-        let back: Session = toml::from_str(&toml).unwrap();
-        assert_eq!(back.placement, Placement::Managed);
-        // `server` (a table) must still parse — `placement` is a scalar above it,
-        // so the table-ordering invariant the struct doc warns about holds.
-        assert_eq!(back.server, s.server);
+        let (substrate, server) = (
+            toml.find("[substrate]").expect("a substrate table"),
+            toml.find("[server]").expect("a server table"),
+        );
+        assert!(substrate < server, "{toml}");
+        assert!(toml.contains(r#"kind = "managed""#), "{toml}");
+        assert_eq!(decode(&toml).unwrap(), s);
     }
 
     #[test]
@@ -870,25 +830,19 @@ mod tests {
     }
 
     #[test]
-    fn backend_parse_round_trips_managed() {
-        assert_eq!(Backend::parse(BACKEND_MANAGED), Some(Backend::Managed));
-    }
-
-    #[test]
     fn write_and_read_round_trip() {
         with_isolated_home("session-rt", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             let back = read(&g, &s.id).unwrap().expect("present");
             assert_eq!(back.id, s.id);
-            assert_eq!(back.backend, BACKEND_DOCKER);
+            assert_eq!(back.substrate, s.substrate);
             assert_eq!(back.pty_pid, 42);
             assert!(back.attached_pid.is_none());
         });
     }
 
-    #[cfg(feature = "libkrun")]
     #[test]
     fn record_path_matches_write() {
         // The libkrun commit-guard self-destructs a detached VMM unless this exact
@@ -896,7 +850,7 @@ mod tests {
         // drift here would make every launch look "abandoned" and kill itself.
         with_isolated_home("session-record-path", || {
             let g = pillbox::global();
-            let s = make(BACKEND_LIBKRUN);
+            let s = make();
             let expected = record_path(&g, &s.id);
             assert!(!expected.exists(), "record must not exist before write");
             write(&g, &s).unwrap();
@@ -912,9 +866,9 @@ mod tests {
     fn list_is_stable_by_started_at() {
         with_isolated_home("session-list", || {
             let g = pillbox::global();
-            let mut a = make(BACKEND_DOCKER);
+            let mut a = make();
             a.started_at = "2026-01-01T00:00:00Z".into();
-            let mut b = make(BACKEND_DOCKER);
+            let mut b = make();
             b.started_at = "2026-02-01T00:00:00Z".into();
             write(&g, &b).unwrap(); // write newer first
             write(&g, &a).unwrap();
@@ -929,7 +883,7 @@ mod tests {
     fn resolve_accepts_prefix() {
         with_isolated_home("session-resolve", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             let prefix = &s.id[..6];
             let found = resolve(&g, prefix).unwrap();
@@ -941,7 +895,7 @@ mod tests {
     fn resolve_rejects_short_prefix() {
         with_isolated_home("session-short", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             let err = resolve(&g, "abc").unwrap_err().to_string();
             assert!(err.contains("too short"), "got: {err}");
@@ -954,9 +908,9 @@ mod tests {
             let g = pillbox::global();
             // Mint two ids that collide on a known prefix to make the test
             // deterministic.
-            let mut a = make(BACKEND_DOCKER);
+            let mut a = make();
             a.id = "abcdef000001".into();
-            let mut b = make(BACKEND_DOCKER);
+            let mut b = make();
             b.id = "abcdef000002".into();
             write(&g, &a).unwrap();
             write(&g, &b).unwrap();
@@ -973,7 +927,7 @@ mod tests {
     fn mark_attached_then_detached_roundtrips() {
         with_isolated_home("session-attach", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             mark_attached(&g, &s.id, 12345).unwrap();
             assert_eq!(read(&g, &s.id).unwrap().unwrap().attached_pid, Some(12345));
@@ -986,7 +940,7 @@ mod tests {
     fn delete_is_idempotent() {
         with_isolated_home("session-del", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             delete(&g, &s.id).unwrap();
             assert!(read(&g, &s.id).unwrap().is_none());
@@ -1003,7 +957,7 @@ mod tests {
         // in place by checking mtime stability.
         with_isolated_home("session-detach-noop", || {
             let g = pillbox::global();
-            let s = make(BACKEND_DOCKER);
+            let s = make();
             write(&g, &s).unwrap();
             let path = SessionRegistry::path_read(&g, &s.id);
             let mtime_a = fs::metadata(&path).unwrap().modified().unwrap();
@@ -1012,13 +966,6 @@ mod tests {
             let mtime_b = fs::metadata(&path).unwrap().modified().unwrap();
             assert_eq!(mtime_a, mtime_b, "mark_detached re-wrote a no-op");
         });
-    }
-
-    #[test]
-    fn backend_parse_round_trips_known_labels() {
-        assert_eq!(Backend::parse(BACKEND_DOCKER), Some(Backend::Docker));
-        assert_eq!(Backend::parse(BACKEND_LIBKRUN), Some(Backend::Libkrun));
-        assert_eq!(Backend::parse("nope"), None);
     }
 
     #[test]

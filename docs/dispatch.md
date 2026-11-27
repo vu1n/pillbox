@@ -569,9 +569,10 @@ treats them as deferred, not forgotten:
   segments. v1 pulls to a durable temp staging dir
   (`$TMPDIR/pillbox-dispatch-<run>/winner-<id>`), which the caller reads back from
   `pulled_to` (outside cwd, so it's never swept into a commit; reaped with `$TMPDIR`).
-- **Docker-backend dispatch** — dispatch grades inside the libkrun grader
-  microVM, so a docker build has nothing to grade with and `dispatch` refuses
-  to start. (`scripts/smoke/dispatch.sh` skips non-libkrun backends.)
+- **Dispatch without libkrun** — dispatch grades inside the libkrun grader
+  microVM, so a build without the libkrun feature has nothing to grade with and
+  `dispatch` refuses to start. (`scripts/smoke/dispatch.sh` skips non-libkrun
+  backends.)
 - **`files_changed` in the worker summary** — a per-worker diff-vs-base summary
   (the touched paths / a stat) is a natural evidence field, but needs a
   workspace-vs-`from_bookmark` diff op (rustic/git). The mining-critical evidence

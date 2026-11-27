@@ -1,40 +1,69 @@
 # Substrate plane — one `LiveSession` interface, N substrate handlers
 
-> **Status:** implemented (updated 2026-07-16). `SandboxBackend` +
+> **Status:** implemented (updated 2026-11-27). `SandboxBackend` +
 > `LiveSession` + `Caps` are the shipped plane; libkrun PTY drive/live tail and
 > the experimental foreground Cloudflare managed backend are wired through it.
-> The phase narrative below is retained as implementation history. Its old
-> "Docker as a co-equal local twin" framing is superseded:
-> libkrun is the one local backend and the Docker agent backend is pending
-> deletion.
+> The agent-run Docker backend is **deleted**: `PILLBOX_BACKEND=docker` is a
+> usage error, and old docker records are retired (listable, removable, never
+> driven). The phase narrative under "Migration order" is implementation
+> history.
 
 ## Why
 
-pillbox runs an agent on a *substrate*. Today there are two intended placements:
-**libkrun** is the default and only supported local agent backend; **managed**
-selects the experimental Cloudflare bounded Worker + Sandbox path with
-`PILLBOX_BACKEND=managed`. The Docker agent backend remains temporarily as
-deprecated code and a toolchain-free build fallback; it is not a product mode.
-
-The strategic decision (this is opinionated-for-our-own-use, not
-broad-compat):
+pillbox runs an agent on a *substrate*. There are two placements: **libkrun**
+is the default and only local agent backend; **managed** selects the
+experimental Cloudflare bounded Worker + Sandbox path with
+`PILLBOX_BACKEND=managed`.
 
 - **libkrun = the local compute substrate.** It is the default build and owns
   local isolation, PTY handoff, real egress fencing, and in-sandbox grading.
 - **Cloudflare = managed execution placement.** Cloudflare Sandbox's vendor DO
   owns container lifecycle; D1/R2 hold bounded claims/evidence; the caller's
   local `SessionLog` remains §0. The foreground backend is implemented.
-- **Docker agent backend = deprecated.** Docker is still used to materialize the
-  libkrun OCI rootfs and for auth plumbing while those dependencies are ported.
-  That does not make it a co-equal backend.
+- **Docker = runner-image plumbing only.** `src/sandbox/oci.rs` is the one file
+  that runs `docker`: it resolves the runner image and exports it as the
+  microVM rootfs. It never runs an agent.
 
-### The actual problem to fix
+### The actual problem it fixed
 
 The original problem was scattered backend-string dispatch for `send`,
 `attach`, `kill`, live tailing, server HTTP, grading, and ingest. The shipped
-fix makes the **live session** polymorphic and gates verbs through explicit
-capabilities. `select_backend()` and `live_session()` are the two dispatch
-points; command handlers no longer grow backend-specific match arms.
+fix makes the **live session** polymorphic, gates verbs through explicit
+capabilities, and stores a record's substrate once as a typed value.
+
+## Current shape
+
+- **Selection.** `SubstrateKind::selected()` (`src/sandbox/substrate.rs`) reads
+  `PILLBOX_BACKEND` once: unset or `libkrun` → libkrun, `managed` → managed,
+  `docker` → usage error (removed), anything else → usage error.
+- **One constructor.** `SubstrateKind::backend()` is the only place a substrate
+  kind becomes a `Box<dyn SandboxBackend>`. On the build without the `libkrun`
+  feature (the in-guest tools build) the libkrun arm is a usage error (exit 2):
+  that build has no substrate.
+- **Records store it once.** `Session.substrate` and `Sandbox.substrate` hold a
+  `Substrate`: `Libkrun(Option<LibkrunHandle>)`, `Managed(ManagedHandle)`, or
+  `Retired { backend, handle, why }` for a record left by a removed or unknown
+  backend (docker, e2b, …) or with an undecodable handle. On disk it is a
+  `[substrate]` table; records written before it migrate on read. The
+  `backend` / `placement` / `sandbox_id` output keys are derived from it.
+- **Dispatch.** `live_session(&Session)` and `sandbox_target(&Sandbox)` match
+  only on `substrate.kind()`: a kind goes through `kind.backend()?`, a retired
+  record gets a record-only handle that refuses every verb except
+  kill/rm/destroy, which drops the record and says what was left behind (for
+  docker: the container id and `docker rm -f <id>`). pillbox never runs
+  `docker` for a retired record.
+- **Substrate-only operations** that have no session record yet — `auth login`,
+  `session score --in-sandbox`, `execution verify-project`, repository
+  execution, and `doctor`'s host checks — are `SandboxBackend` methods with an
+  unsupported default, so callers reach them through the constructor rather
+  than naming the libkrun module.
+- **One build boundary.** Only `mod libkrun`, the libkrun arm of
+  `SubstrateKind::backend`, the code that names `crate::sandbox::libkrun` (the
+  `execution::microvm` drivers, the hidden `text` command, the VMM re-exec
+  entrypoints) and libkrun-only tests are gated on the feature — 16 `cfg`
+  lines in `src/`. Everything else compiles on every build; the crate-level
+  `allow(dead_code)` on the guest build is the only allowance, and CI lints the
+  full build on Linux with a type-check-only `cargo clippy`.
 
 ## The real axis: transport *families*, not backends
 
@@ -42,7 +71,6 @@ points; command handlers no longer grow backend-specific match arms.
 |---|---|---|---|
 | **Managed container** | bounded HTTP execution; container FS is server-side | **Cloudflare Containers/Sandbox** | structured drive + bounded evidence response |
 | **MicroVM** | vsock into an HVF/KVM microVM; FS opaque to the guest | **libkrun** (local) | PTY/server drive + local §0 |
-| **Deprecated container** | exec + PTY into a local OCI container | Docker agent backend (pending deletion) | compatibility residue only |
 
 Two more axes are **already abstracted** and stay as-is — orthogonal to this work:
 
@@ -50,12 +78,10 @@ Two more axes are **already abstracted** and stay as-is — orthogonal to this w
   managed evidence is copied there after a bounded execution response.
 - **Agent integration** (`Pty` ↔ `Server`): `Integration` + `ServerProfile`
   (`src/agents/mod.rs`), already a single source of truth. Every server agent
-  is libkrun-only: docker refuses any agent with a `ServerProfile`.
+  runs on libkrun.
 
-The remaining HTTP seam (`SandboxHttp` at `src/sandbox/http.rs`) is already
-backend-abstracted: libkrun's `opencode_http()` returns `Box<dyn SandboxHttp>`
-(docker has no implementation; it runs no server agents). This plan extends the
-same pattern to the one surface still doing string-match dispatch: the **PTY + lifecycle** surface.
+The HTTP seam (`SandboxHttp` at `src/sandbox/http.rs`) is backend-abstracted:
+libkrun's `opencode_http()` returns `Box<dyn SandboxHttp>`.
 
 ## Contract first (define the boundary before porting)
 
@@ -68,9 +94,8 @@ trait SandboxBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
     fn capabilities(&self) -> Caps;
 }
-// The single backend-dispatch point: build the plane handle for an EXISTING
-// resolved Session (what the command layer calls). A run-path-unifying `start()`
-// that launches directly into a LiveSession is deferred — not yet a trait method.
+// A new run: SubstrateKind::selected()?.backend()? — the one constructor.
+// An EXISTING record: build the plane handle from its stored substrate.
 fn live_session(session: &Session) -> Result<Box<dyn LiveSession>>;
 
 // The plane — every command calls these, backend-blind.
@@ -86,7 +111,7 @@ trait LiveSession {
     fn ingest(&self, resolved: &Pillbox) -> Result<usize>;       // cap-gated
 }
 
-// Plain struct, expressible in BOTH builds (docker-only and --features libkrun).
+// Plain struct, compiled on every build (with or without the libkrun feature).
 struct Caps {
     pty_drive: bool,          // session send into a PTY
     live_pty_tail: bool,      // live watch/subscribe/wait-idle for a PTY agent
@@ -100,7 +125,9 @@ struct Caps {
 }
 ```
 
-### Scattered symbol → trait method (the port map)
+### Scattered symbol → trait method (the port map, executed)
+
+The docker column of this map is gone with the Docker backend.
 
 | Current symbol | → `LiveSession` method |
 |---|---|
@@ -113,30 +140,31 @@ struct Caps {
 | `libkrun_ingest_events_file` | `ingest` (cap) |
 | `libkrun::session::workspace_path` (`libkrun_workspace_path`) | `workspace_path` |
 
-This also deletes the cfg-stub duplication in the command layer (each
-`libkrun_*` has a real + a `#[cfg(not(feature="libkrun"))]` stub today — e.g.
-`mod.rs:107/111`, `141/173`, `182/191`, `210/226`, `237/249`): the libkrun impl
-is gated once, and callers branch on `caps()`, not on the feature.
+This deleted the cfg-stub duplication in the command layer (each `libkrun_*`
+had a real + a `#[cfg(not(feature="libkrun"))]` stub): the libkrun impl is gated
+once, and callers branch on `caps()` or reach it through
+`SubstrateKind::backend`, not on the feature.
 
 ## Capability matrix (declare, don't chase)
 
-| Verb / capability | docker | libkrun | CF Containers (planned) |
-|---|---|---|---|
-| run / detach / attach | ✅ | ✅ | ✅ (container family) |
-| `send` (PTY drive) | ✅ | ⬜→**fill (Phase 4)** | ✅ |
-| live PTY tail (watch/subscribe/wait-idle) | ✅ | ⬜→**fill (Phase 4)** | ✅ |
-| server-mode (opencode/codex-serve) | ✅ (opencode) | ✅ | ✅ |
-| `sandbox spawn/exec/agent/destroy` | ❌ (deprecated; an old record can only be destroyed) | ✅ (`exec-host` over vsock, [sandboxes](features/sandboxes.md)) | ✅ (CF sandboxes *are* this) |
-| `--vault` cred swap | ✅ proxy-only | ✅ in-child | ✅ (proxy/worker) |
-| **real egress fence** | ❌ (declare Unsupported) | ✅ | ❌ likely |
-| `--detach` + `--vault` | ❌ | ✅ | TBD |
-| `score --in-sandbox` | ❌→**port** (`docker run --rm --network none`) | ✅ | ✅ |
-| `ingest` | n/a (tails live) | ✅ | n/a (tails live) |
-| sealed repository execution/3 | ❌ | Implementation in progress; [release gate](local-repository-execution.md) | ❌ |
+| Verb / capability | libkrun | managed (Cloudflare) |
+|---|---|---|
+| run / detach / attach | ✅ | foreground bounded turn |
+| `send` (PTY drive) | ✅ | ❌ (structured drive) |
+| live PTY tail (watch/subscribe/wait-idle) | ✅ | ❌ |
+| server-mode (opencode/codex-serve) | ✅ | ✅ (one bounded opencode turn) |
+| `sandbox spawn/exec/agent/destroy` | ✅ (`exec-host` over vsock, [sandboxes](features/sandboxes.md)) | ❌ (a record can only be destroyed) |
+| `--vault` cred swap | ✅ in-child | worker-side |
+| **real egress fence** | ✅ | ❌ |
+| `--detach` + `--vault` | ✅ | ❌ |
+| `score --in-sandbox` | ✅ | ❌ |
+| `ingest` | ✅ | n/a (response appended to §0) |
+| `--mcp` | ✅ (host loopback forwarded at the gateway; https on 443 joins the allowlist) | ❌ refused |
+| sealed repository execution/3 | Implementation in progress; [release gate](local-repository-execution.md) | ❌ |
 
-KVM-only isolation (real fence, in-VM MITM) stays **uniquely libkrun** — and CF
-Containers will likely decline it too. That asymmetry is correct and permanent;
-the plane *exposes* it via `Caps`, it does not chase it.
+KVM-only isolation (real fence, in-VM MITM) stays **uniquely libkrun**. That
+asymmetry is correct and permanent; the plane *exposes* it via `Caps`, it does
+not chase it.
 
 ## Migration order (atomic diffs, port-then-delete, smoke-green each step)
 
@@ -148,10 +176,10 @@ libkrun PTY parity, CF) builds on it.
 - [ ] **Phase 2 — delete dispatch.** Replace the 8 match sites with `live_session(&session)?` + `caps()` checks, then remove the `Backend::parse` arms:
       `src/commands/session/mod.rs:88,239,576,701,769,993`;
       `src/commands/session/stream.rs:36,56`.
-      ~~Move `sandbox spawn/exec/agent` behind `caps().long_lived_exec`.~~ Done differently: `commands/sandbox.rs` spawns through `select_backend().spawn_sandbox` and drives a record through `sandbox_target`; libkrun is the only backend declaring `long_lived_exec`.
+      ~~Move `sandbox spawn/exec/agent` behind `caps().long_lived_exec`.~~ Done differently: `commands/sandbox.rs` spawns through `SubstrateKind::selected()?.backend()?.spawn_sandbox` and drives a record through `sandbox_target`; libkrun is the only backend declaring `long_lived_exec`.
       Carry-overs the port must preserve: (1) the `detached_tailer_alive` guard now lives *inside* `LibkrunLiveSession::{event_source,ingest}`, so delete the command-layer copies (`stream.rs:39`, `session_ingest`) rather than double-guarding; (2) `session_subscribe`'s `$PILLBOX_EVENTS_WEBHOOK` exporter — attached today when the tailer `is_some()` (`stream.rs:97`) — must still be wired off `event_source()`'s returned `Option<TailerHandle>`; (3) server-send routing (the http-prompt path that runs *before* the backend match) is orthogonal to `LiveSession::send` (the PTY-drive verb) — a server session must keep going through `http()`, not `.send()`.
       *(End of spine: one plane, dispatch deleted, behavior unchanged.)*
-- [ ] **Phase 3 — flip default.** `select_backend()` defaults to libkrun (where available); docker recast in docs/`doctor` as the container-family compat backend, not the default. Rework `doctor` (it probes the Docker daemon + image, `src/doctor.rs:134`) so a libkrun-default host isn't told "Docker not running."
+- [x] **Phase 3 — flip default.** Libkrun is the default substrate (the Docker backend was later deleted). Rework `doctor` (it probes the Docker daemon + image, `src/doctor.rs:134`) so a libkrun-default host isn't told "Docker not running."
 - [ ] **Phase 4 — fill libkrun+PTY drive (in scope; see below).** vsock `send` + live transcript tailing for claude/codex/pi on libkrun, so `Caps{ pty_drive, live_pty_tail }` flip true. This is the IDE/ADE surface — required, not optional.
 - [x] **Phase 5 — experimental.** CF Sandbox backend = one `LiveSession` impl
   using bounded HTTP execution; returned evidence is appended to local §0.
@@ -229,24 +257,23 @@ command layer doesn't change, only libkrun's impl flips `pty_drive` +
 ## Non-goals (v1)
 
 - Building the CF Containers backend (Phase 5, own plan).
-- Deleting docker (it's the container-family reference).
 - Touching the §0 contract or event placement.
-- Real egress fencing on docker (declare Unsupported; libkrun owns it).
+
+(Deleting the Docker backend was a v1 non-goal; it was later deleted outright.)
 
 ## Risks
 
-- **libkrun becomes near-sole local substrate** → its host fragility becomes
-  load-bearing with no docker fallback. Hardened **opportunistically, in-area**
+- **libkrun is the sole local substrate** → its host fragility is
+  load-bearing. Hardened **opportunistically, in-area**
   alongside the phases — see "Hardening libkrun host fragility" below.
-- **Feature gating:** `LiveSession`/`Caps` must compile in a docker-only build;
-  only the libkrun impl is `#[cfg(feature="libkrun")]`.
+- **Feature gating:** `LiveSession`/`Caps` compile on every build; only the
+  libkrun impl is `#[cfg(feature="libkrun")]`.
 - **Single-writer / seq authority** (the `record_input` dual-writer caveat,
   `mod.rs:799`) is unchanged by this work — note, don't fix here.
 
 ## Hardening libkrun host fragility (opportunistic, in-area)
 
-When libkrun becomes the default (Phase 3) it's the near-sole local substrate
-with **no docker fallback** — so its known host-fragility failure modes turn
+libkrun is the sole local substrate — so its known host-fragility failure modes turn
 into "pillbox is broken" for a user. **Do these as you're already editing the
 relevant file**, not as a separate phase; each maps to a code area a plane phase
 already touches. Guiding principle: **fail loud with a diagnosis + a `Next:`
@@ -273,18 +300,19 @@ Three known failure modes (host-side, **not** pillbox bugs) and where to catch t
    - *Area:* `kill_session` + `session prune` (Phases 1/2).
    - *Fix:* launch each VMM child in its own process group (`pre_exec` `setsid`/`setpgid`); `kill_session` kills the **group** (`killpg`), not just the pid; add a sweep that reaps orphaned `__krun-vmm` groups when the session list is empty.
 
-**`doctor` becomes backend-aware (Phase 3).** Today it only probes Docker
-(`doctor.rs:134-183`) — on a libkrun-default host it would wrongly fail "Docker
-not running." Make it report the active backend; for libkrun add: virtualization
-present (`/dev/kvm` on Linux, HVF on macOS), runtime deps resolve (#1), disk
-headroom (#2), no orphaned VMM groups (#3). Docker demotes to an optional
-"compat backend present?" check.
+**`doctor` is substrate-aware (done).** It reports the selected substrate and
+fails when this build can't run it; the selected backend adds its host checks
+(`SandboxBackend::host_checks` — for libkrun: virtualization present, runtime
+deps resolve (#1), disk headroom (#2), orphaned VMM count (#3)). Whether the
+runner image is available for rootfs export is an optional check.
 
 ## Verify (every phase)
 
 ```sh
-cargo fmt --all && cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features libkrun -- -D warnings
-cargo test && cargo test --features libkrun
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings                       # full build, type-check only
+cargo clippy --workspace --no-default-features --all-targets -- -D warnings # in-guest build
+cargo test --workspace --no-default-features --all-targets
+cargo test --all-targets --features libkrun   # macOS with the libkrun toolchain
 scripts/smoke/run.sh        # libkrun pre-merge gate (CI is unit-only)
 ```

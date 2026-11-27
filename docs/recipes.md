@@ -2,9 +2,8 @@
 
 > **Note:** pillbox is **local-only**. The old remote recipes (`--remote` /
 > `docker://` / `e2b://` / `ssh://`) have been removed; "remote" returns later
-> as a managed/Cloudflare tier with a different shape. Local runs use the Docker
-> backend by default, or the [libkrun](./libkrun-sandbox.md) microVM via
-> `PILLBOX_BACKEND=libkrun`.
+> as a managed/Cloudflare tier with a different shape. Local runs use the
+> [libkrun](./libkrun-sandbox.md) microVM; the Docker backend was removed.
 
 Copy-paste flows for common tasks. For the full command reference see
 [AGENTS.md](../AGENTS.md); for the why behind secrets see
@@ -103,21 +102,10 @@ If you want hard failure on conflict, drop the `|| true`.
 
 ## Mounting an extra directory into the sandbox
 
-`--mount` is forwarded straight to `docker -v`, so the syntax is
-`HOST:GUEST[:opts]`.
-
-```sh
-# Read-only AWS creds
-pillbox run --mount ~/.aws:/home/pillbox/.aws:ro
-
-# Sibling repo at /workspace/sibling (in addition to cwd)
-pillbox run --mount ~/work/sibling-repo:/workspace/sibling
-
-# SSH agent socket (Linux). Stash the var name first; pillbox looks
-# it up at run time so the recipe stays sandbox-safe.
-pillbox secret add SSH_AUTH_SOCK --from-env SSH_AUTH_SOCK
-pillbox run --mount $SSH_AUTH_SOCK:/ssh-agent --with SSH_AUTH_SOCK=SSH_AUTH_SOCK
-```
+`--mount HOST:GUEST` (and a preset `mount`) is refused with exit 2 before
+anything launches: the microVM takes no extra host mounts, and the guest sees
+only its workspace clone and its auth-home clone. Put what the
+agent needs in the workspace, or pass it with `--with`/`--env`.
 
 The agent's working directory inside the sandbox is always
 `/workspace/<name>` where `name` defaults to `basename(cwd)` (override
@@ -125,17 +113,18 @@ with `--name`).
 
 ## Multi-repo workspace
 
+The microVM shares exactly one host directory, the workspace (`--mount` is
+refused). Put the repos side by side under one directory and make that the
+workspace:
+
 ```sh
-cd ~/work/primary
-pillbox run \
-  --name primary \
-  --mount ~/work/lib-a:/workspace/lib-a \
-  --mount ~/work/lib-b:/workspace/lib-b \
-  --env stage
+# ~/work/stack/{primary,lib-a,lib-b}
+pillbox run --workspace ~/work/stack --name stack --env stage
 ```
 
-Inside the sandbox: `/workspace/primary`, `/workspace/lib-a`,
-`/workspace/lib-b`, all writable. The agent starts in `primary`.
+Inside the sandbox: `/workspace/stack/primary`, `/workspace/stack/lib-a`,
+`/workspace/stack/lib-b`, in the run's copy-on-write clone of `~/work/stack`.
+The agent starts in `/workspace/stack`.
 
 ## Reading a stored secret out for another tool
 
@@ -169,16 +158,10 @@ that — fields will be added freely, the version bumps on restructure.
 
 ## Running on the libkrun microVM backend
 
-By default `pillbox run` uses the local Docker backend. To run inside a
-local microVM instead, opt in with `PILLBOX_BACKEND=libkrun` (needs
-libkrun installed, plus a codesign on macOS):
-
-```sh
-PILLBOX_BACKEND=libkrun pillbox run
-```
-
-Everything else — secrets, env, vault, the session surface,
-detach/reattach — works the same. See
+`pillbox run` runs inside a local libkrun microVM — the default and only
+local backend (needs libkrun installed, plus a codesign on macOS:
+`scripts/lk-build.sh`). `PILLBOX_BACKEND=managed` selects the experimental
+managed tier instead; `PILLBOX_BACKEND=docker` is refused. See
 [libkrun-sandbox.md](./libkrun-sandbox.md) for setup details.
 
 ## Detached background session + reattach

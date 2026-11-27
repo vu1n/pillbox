@@ -25,10 +25,9 @@ fn resolve_streaming_session(
 ) -> Result<(String, Option<events::transcripts::TailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
         // Gate on the *capability*, not on catching every error: a backend that
-        // can host-tail this session (docker a PTY one, libkrun a server one)
-        // spawns the tailer and lets a genuine failure (registry miss, IO)
-        // propagate loud; one that can't (a libkrun PTY session, an
-        // unknown/removed backend) degrades to reading the existing log. Catching
+        // can host-tail this session (libkrun) spawns the tailer and lets a
+        // genuine failure (registry miss, IO) propagate loud; one that can't (a
+        // retired record) degrades to reading the existing log. Catching
         // every `event_source` error instead would silently swallow a real failure
         // as "no live tail" — and break `wait-idle`. The source is reopened
         // per-caller below, so only the tailer guard is kept here.
@@ -45,7 +44,7 @@ fn resolve_streaming_session(
                     eprintln!(
                         "pillbox: note: live event tailing isn't available for this `{}` \
                          session; reading the existing log",
-                        s.backend
+                        s.substrate.label()
                     );
                     None
                 }
@@ -54,7 +53,7 @@ fn resolve_streaming_session(
                 eprintln!(
                     "pillbox: note: this binary can't reach the `{}` backend; \
                      reading the existing log",
-                    s.backend
+                    s.substrate.label()
                 );
                 None
             }
@@ -571,7 +570,7 @@ mod tests {
             // An unreachable backend reads the existing log (no tailer), so the
             // wait runs through `subscribe` without a VM.
             let mut s = crate::session::Session::test_fixture();
-            s.backend = "retired".into();
+            s.substrate = crate::sandbox::Substrate::from_legacy("e2b", "sb-1");
             crate::session::write(&pb, &s).unwrap();
             let mut log = crate::events::log::SessionLog::open(&pb, &s.id).unwrap();
             log.append(&[
@@ -632,7 +631,7 @@ mod tests {
             let pb = crate::pillbox::global();
             // Unreachable backend: no tailer, so the log stays exactly as written.
             let mut s = crate::session::Session::test_fixture();
-            s.backend = "retired".into();
+            s.substrate = crate::sandbox::Substrate::from_legacy("e2b", "sb-1");
             crate::session::write(&pb, &s).unwrap();
             let mut log = crate::events::log::SessionLog::open(&pb, &s.id).unwrap();
             log.append(&[Event::session(

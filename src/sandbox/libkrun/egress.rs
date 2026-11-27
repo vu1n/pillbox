@@ -47,12 +47,12 @@ pub(super) struct EgressSpec {
     /// Host path of the vault CA dir. When set, the child loads the CA (key stays
     /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
     pub(super) ca_dir: Option<String>,
-    /// Opt-in local-model forward: relay `gateway:PORT` → host `127.0.0.1:PORT`
-    /// (e.g. ollama on 11434), so a guest agent reaches a model the host runs.
-    /// Deliberately punches the default-deny fence; set only when a local worker
-    /// is requested. `None` = no forward. See [`super::local_forward`].
+    /// Opt-in host-loopback forwards: relay `gateway:PORT` → host `127.0.0.1:PORT`
+    /// for each port (a local model such as ollama on 11434, a host `--mcp`
+    /// server). Each deliberately punches the default-deny fence; empty = no
+    /// forward. See [`super::local_forward`].
     #[serde(default)]
-    pub(super) local_forward_port: Option<u16>,
+    pub(super) local_forward_ports: Vec<u16>,
     /// Broker JIT refresh: when set, the in-VMM MITM rotates the real OAuth token near
     /// its expiry (the guest never refreshes — far-future stub expiry) and splices the
     /// fresh token into the live swap, so a session outliving the token lifetime keeps
@@ -72,14 +72,14 @@ impl EgressSpec {
         allowlist: Vec<String>,
         log_path: Option<String>,
         ca_dir: Option<String>,
-        local_forward_port: Option<u16>,
+        local_forward_ports: Vec<u16>,
         refresh: Option<RefreshSpec>,
     ) -> Self {
         Self {
             allowlist,
             log_path,
             ca_dir,
-            local_forward_port,
+            local_forward_ports,
             refresh,
             login: false,
         }
@@ -95,7 +95,7 @@ impl EgressSpec {
     ) -> Self {
         Self {
             login: true,
-            ..Self::fence(allowlist, log_path, ca_dir, None, None)
+            ..Self::fence(allowlist, log_path, ca_dir, Vec::new(), None)
         }
     }
 
@@ -112,10 +112,10 @@ pub(super) const GUEST_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 const GATEWAY_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0x01];
 /// The gateway = the proxy = our DNS server, all on this address. Allowlisted
 /// names resolve here so their TLS terminates at our MITM (L5b).
-const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+pub(super) const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const PREFIX_LEN: u8 = 24;
-const DNS_PORT: u16 = 53;
+pub(super) const DNS_PORT: u16 = 53;
 
 /// Shell commands the guest runs (before exec'ing the agent) to bring its NIC up
 /// and route DNS + egress through this stack. Kept here so the addressing lives
@@ -252,7 +252,7 @@ pub(super) fn run(fd: c_int, spec: EgressSpec, mut swap_pairs: Vec<CredSwap>) {
         allowlist,
         log_path: diag_path,
         ca_dir,
-        local_forward_port,
+        local_forward_ports,
         refresh,
         login,
     } = spec;
@@ -320,13 +320,15 @@ pub(super) fn run(fd: c_int, spec: EgressSpec, mut swap_pairs: Vec<CredSwap>) {
         super::mitm::replenish_listeners(&mut listeners, &mut sockets);
     }
     let mut forwarders: Vec<super::local_forward::Forwarder> = Vec::new();
-    if let Some(port) = local_forward_port {
-        super::local_forward::replenish(&mut forwarders, &mut sockets, port);
-    }
+    super::local_forward::replenish(&mut forwarders, &mut sockets, &local_forward_ports);
     diag.log(&format!(
         "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}, token-endpoints :{}); fence allowlist={allowlist:?}",
         if vault.is_some() { "443" } else { "off" },
-        local_forward_port.map_or_else(|| "off".to_string(), |p| p.to_string()),
+        if local_forward_ports.is_empty() {
+            "off".to_string()
+        } else {
+            format!("{local_forward_ports:?}")
+        },
         if login { "open (auth login)" } else { "rejected" },
     ));
 
@@ -357,10 +359,8 @@ pub(super) fn run(fd: c_int, spec: EgressSpec, mut swap_pairs: Vec<CredSwap>) {
             );
             super::mitm::replenish_listeners(&mut listeners, &mut sockets);
         }
-        if let Some(port) = local_forward_port {
-            super::local_forward::drive(&mut forwarders, &mut sockets, port, &diag);
-            super::local_forward::replenish(&mut forwarders, &mut sockets, port);
-        }
+        super::local_forward::drive(&mut forwarders, &mut sockets, &diag);
+        super::local_forward::replenish(&mut forwarders, &mut sockets, &local_forward_ports);
         thread::sleep(Duration::from_millis(2));
     }
 }
@@ -615,16 +615,17 @@ mod tests {
     #[test]
     fn only_the_login_constructor_opens_token_endpoints_and_the_spec_file_keeps_it() {
         let hosts = || vec!["platform.claude.com".to_string()];
-        let fence = EgressSpec::fence(hosts(), None, None, Some(11434), None);
+        let fence = EgressSpec::fence(hosts(), None, None, vec![11434, 7777], None);
         assert!(!fence.opens_token_endpoints());
         let login = EgressSpec::for_login(hosts(), None, Some("/ca".into()));
         assert!(login.opens_token_endpoints());
-        assert!(login.refresh.is_none() && login.local_forward_port.is_none());
+        assert!(login.refresh.is_none() && login.local_forward_ports.is_empty());
         // The VMM child reads the posture back from the spec file.
         for (spec, open) in [(fence, false), (login, true)] {
             let back: EgressSpec =
                 serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
             assert_eq!(back.opens_token_endpoints(), open);
+            assert_eq!(back.local_forward_ports, spec.local_forward_ports);
         }
     }
 

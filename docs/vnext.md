@@ -9,8 +9,8 @@
 >    `pillbox-cloudflare-shipped-the-stack`) or *pillbox-running-locally-on-the-
 >    VPS*. The SSH/e2b/`docker://` remote backends have been **removed** (the
 >    `remote` commands and `pillbox run --remote` are gone); pillbox is
->    **local-only** today (Docker default + libkrun opt-in), and "remote"
->    returns later as the managed tier.
+>    **local** on the libkrun microVM (the Docker backend is deleted), and
+>    "remote" returns as the managed tier.
 > 2. **Substrate: Docker → libkrun microVM.** The local runtime pivots to
 >    [libkrun-sandbox.md](./libkrun-sandbox.md) (secure VM boundary, fast, no
 >    daemon, macOS-native). [remotes-redesign.md](./archive/remotes-redesign.md) (the

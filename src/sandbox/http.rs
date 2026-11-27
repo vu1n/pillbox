@@ -10,8 +10,7 @@
 //! so the bridge speaks HTTP once and each backend supplies the transport:
 //!
 //! - **libkrun** — a real HTTP/1.1 client over a vsock socket the guest
-//!   forwards to `127.0.0.1:<port>`. Server agents are libkrun-only; docker
-//!   has no implementation.
+//!   forwards to `127.0.0.1:<port>`. Server agents are libkrun-only.
 //!
 //! Chosen over a generic "run a command in the sandbox" exec channel: the use
 //! cases need HTTP to one in-guest server, not arbitrary command exec, and the

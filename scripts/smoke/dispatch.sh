@@ -22,9 +22,8 @@ fail() { echo "  ✗ dispatch: $1"; exit 1; }
 
 # libkrun-only today: dispatch's grader resolves each worker's *live* workspace
 # in-process via `commands::session::workspace_of` (the session's
-# `LiveSession::workspace_path`), which only libkrun sessions provide. Docker dispatch needs a non-libkrun
-# workspace-resolution path (pull-then-score, or score-by-result-snapshot) —
-# deferred, see docs/dispatch.md. Skip (don't fail the suite) on docker.
+# `LiveSession::workspace_path`), which only libkrun sessions provide. Skip
+# (don't fail the suite) on any other backend.
 if [ "$BACKEND" != libkrun ]; then
   echo "  · dispatch smoke skipped — backend=$BACKEND not wired yet (libkrun-only grade path)"
   exit 0

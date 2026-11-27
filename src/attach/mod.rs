@@ -12,16 +12,12 @@
 //!   - [`screen`] — [`screen::ScreenModel`], the sandbox-side vt100 screen
 //!     used to serve a bounded ANSI snapshot on attach.
 //!
-//! Backends carry the identical [`frame::Frame`] codec over their own byte
-//! pipe — docker exec stdio (local), ssh stdio (ssh), a raw-pty `pty-relay`
-//! bridged through the Node helper (e2b) — driving it with the shared pump
-//! in [`pump`]. The session
-//! lifecycle is implemented per-backend as free functions
-//! (`reattach`/`kill_session` in `sandbox/*`), not a trait.
+//! The libkrun backend carries the [`frame::Frame`] codec over its persistent
+//! attach socket, driving it with the shared pump in [`pump`]. The session
+//! lifecycle is the backend's [`crate::sandbox::LiveSession`].
 
 pub(crate) mod driver;
 pub(crate) mod frame;
 pub(crate) mod host;
 pub(crate) mod pump;
-pub(crate) mod relay;
 pub(crate) mod screen;

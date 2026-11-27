@@ -15,6 +15,9 @@
 //!    from cwd or `--pillbox NAME`:
 //!    `run / secret / env / auth / vault / doctor / sidecar / version`.
 
+// The build without the libkrun feature is the in-guest tools build, with no substrate; its dead code is linted on the full build.
+#![cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
@@ -28,13 +31,13 @@ mod commands;
 mod config;
 mod contract;
 mod cost;
-mod docker;
 mod doctor;
 mod envs;
 mod errors;
 mod events;
 mod execution;
 mod gateway;
+mod guest_files;
 mod memory;
 mod paths;
 mod pillbox;
@@ -167,7 +170,7 @@ enum Command {
         /// Override the workspace mount-point name (`/workspace/<name>`).
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Extra bind mount. Repeatable. Forwarded to `docker run -v`.
+        /// Extra host bind mount. Refused: the microVM takes no extra host mounts.
         #[arg(long = "mount", value_name = "HOST:GUEST")]
         mounts: Vec<String>,
         /// Inject a stored secret as an env var. `NAME` binds to `NAME`;
@@ -190,15 +193,16 @@ enum Command {
         memory: bool,
         /// Attach a shared MCP server to the sandbox. NAME is the
         /// identifier the agent sees in its tool list; URL must be
-        /// http:// or https://. `localhost` / `127.0.0.1` are
-        /// rewritten to `host.docker.internal` so the sandbox can
-        /// reach host-bound servers. Repeatable.
+        /// http:// or https://. A microVM reaches an http:// server on the
+        /// host's loopback (localhost / 127.0.0.1:PORT, forwarded to the
+        /// guest at the gateway) or an https:// URL on port 443 with a DNS
+        /// host name, which joins its egress allowlist. Repeatable.
         #[arg(long = "mcp", value_name = "NAME=URL")]
         mcps: Vec<agents::McpAttachment>,
         /// Attach a bearer token to a `--mcp NAME=URL` from the
         /// pillbox secret store. NAME must match a `--mcp` entry;
         /// SECRET_NAME is the name passed to `pillbox secret add`.
-        /// Claude folds it into a 0600 tempfile as
+        /// Claude folds it into a 0600 guest config file as
         /// `headers.Authorization: Bearer <value>`; Codex stashes
         /// it in an env var and references it via
         /// `bearer_token_env_var`. Token values never land in argv
@@ -207,9 +211,8 @@ enum Command {
         mcp_tokens: Vec<agents::McpTokenSpec>,
         /// Start the agent and immediately return — keeps the session
         /// alive in the background. Reattach later with `pillbox session
-        /// attach <id>`. Local Docker / libkrun only today. (Local
-        /// --detach doesn't support --vault: the proxy can't outlive the
-        /// CLI; libkrun keeps the vault in the VMM child.)
+        /// attach <id>`. The libkrun microVM keeps the vault in its VMM
+        /// child, so `--detach` and `--vault` combine.
         #[arg(long)]
         detach: bool,
         /// Human label for the detached session (surfaced in `session
@@ -613,15 +616,6 @@ enum Command {
         #[arg(last = true, value_name = "CMD")]
         argv: Vec<String>,
     },
-    /// Internal: verbatim byte pump between a pty-host socket and stdio.
-    /// Run inside a sandbox by the per-attach transport (docker exec / ssh)
-    /// so one client's frames reach the pty-host. See docs/attach-transport.md.
-    #[command(hide = true)]
-    PtyRelay {
-        /// Unix socket the in-sandbox `pty-host` is listening on.
-        #[arg(long, value_name = "PATH")]
-        sock: String,
-    },
     /// Internal: guest-side opencode port-forward relay (libkrun; Linux-only).
     /// Listens on a vsock port and bridges each connection to an in-guest TCP
     /// port (the headless `opencode serve`), so the host speaks HTTP to a
@@ -672,15 +666,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // Internal re-exec entrypoint: the libkrun VMM child *becomes* the microVM.
-    // `krun_start_enter` doesn't return — it `exit()`s with the guest's code when
-    // the VM shuts down — so the backend spawns this hidden subprocess and
-    // supervises it from the parent (which keeps a live process for attach +
-    // cleanup). Not a user-facing command; argv is set by the backend.
+    // Internal re-exec entrypoints of the libkrun backend (the VMM child, the
+    // image-preparation guardian); returns only when argv names neither.
     #[cfg(feature = "libkrun")]
-    if std::env::args().nth(1).as_deref() == Some("__krun-vmm") {
-        crate::sandbox::libkrun::vmm_child_main(); // never returns
-    }
+    crate::sandbox::libkrun::child_main();
     // Internal re-exec entrypoint: the detached §0 PRODUCER for a reparented
     // session. Tails the guest capture → durable log forever (until SIGTERM on
     // teardown) so the log stays live for every consumer. argv set by the backend:
@@ -690,7 +679,7 @@ fn main() -> ExitCode {
         let code = match (a.get(2), a.get(3), a.get(4), a.get(5)) {
             (Some(dir), Some(cap), Some(source_token), Some(sid)) => {
                 match crate::agents::DetachedTranscriptSource::from_token(source_token) {
-                    Some(source) => match crate::commands::session::run_detached_tailer(
+                    Some(source) => match crate::commands::session::serve_detached_tailer(
                         dir.into(),
                         cap.into(),
                         source,
@@ -717,17 +706,12 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(code as u8);
     }
-    #[cfg(feature = "libkrun")]
-    if std::env::args().nth(1).as_deref() == Some("__repository-image") {
-        crate::sandbox::libkrun::repository::image_child_main();
-    }
     init_vault_trace();
     let cli = Cli::parse();
     let result = run(cli);
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        #[cfg(feature = "libkrun")]
-        Err(error) if error.is::<execution::probe::ProbeExit>() => ExitCode::from(1),
+        Err(error) if error.is::<execution::ProbeExit>() => ExitCode::from(1),
         Err(e) => errors::report(&e),
     }
 }
@@ -771,11 +755,13 @@ fn run(cli: Cli) -> Result<()> {
     let pillbox_arg = cli.pillbox.as_deref();
     match cli.command {
         Command::Execution { action } => {
-            #[cfg(feature = "libkrun")]
+            // The project verifier is sealed: it reads no pillbox, so it runs before resolution.
             if let commands::execution::ExecutionAction::VerifyProject { probe, repository } =
                 action
             {
-                return execution::probe::run(&probe, &repository);
+                return sandbox::SubstrateKind::Libkrun
+                    .backend()?
+                    .verify_project(&probe, &repository);
             }
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::execution::dispatch(&resolved, action)
@@ -1003,7 +989,7 @@ fn run(cli: Cli) -> Result<()> {
             println!(
                 "pillbox {} (runner image: {})",
                 env!("CARGO_PKG_VERSION"),
-                docker::default_runner_image()
+                sandbox::oci::default_runner_image()
             );
             Ok(())
         }
@@ -1082,7 +1068,6 @@ fn run(cli: Cli) -> Result<()> {
             )
             .into()),
         },
-        Command::PtyRelay { sock } => attach::relay::run(&sock),
         Command::VsockForward {
             vsock_port,
             to_port,
@@ -1136,7 +1121,7 @@ fn wizard_new(
         .as_deref()
         .unwrap_or("pillbox-runner:dev")
         .to_string();
-    let mut imgs = crate::docker::list_runner_images();
+    let mut imgs = crate::sandbox::oci::list_runner_images();
     if !imgs.contains(&pre) {
         imgs.insert(0, pre.clone());
     }
@@ -1512,18 +1497,17 @@ mod tests {
             assert_eq!(opts.workspace, expected);
             assert!(commands::run::validate_bookmark_backend(
                 &opts,
-                crate::session::BACKEND_LIBKRUN
+                crate::sandbox::SubstrateKind::Libkrun
             )
             .is_ok());
-            for backend in [
-                crate::session::BACKEND_DOCKER,
-                crate::session::BACKEND_MANAGED,
-            ] {
-                assert_eq!(
-                    commands::run::validate_bookmark_backend(&opts, backend).is_err(),
-                    opts.from_bookmark.is_some()
-                );
-            }
+            assert_eq!(
+                commands::run::validate_bookmark_backend(
+                    &opts,
+                    crate::sandbox::SubstrateKind::Managed
+                )
+                .is_err(),
+                opts.from_bookmark.is_some()
+            );
             assert_eq!(
                 std::fs::read_to_string(source.join("README")).unwrap(),
                 "uncommitted work"

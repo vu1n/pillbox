@@ -7,7 +7,7 @@
 //! self-heal — its expiry says year 2100). This driver runs in the VMM child (a host
 //! process) beside the egress poll loop: near the real token's expiry it rotates it
 //! through the SAME coordinated, at-most-once `TokenStore`
-//! ([`crate::vault::broker_jit_refresh`]) and splices the fresh access token into the
+//! ([`crate::vault::refresh::broker_jit_refresh`]) and splices the fresh access token into the
 //! live MITM swap — so the wire token stays fresh for arbitrarily long sessions while
 //! the guest still never refreshes.
 //!
@@ -86,11 +86,11 @@ pub(super) struct RefreshDriver {
 impl RefreshDriver {
     /// Arm the driver: locate the access pair by its stub and seed the expiry from the
     /// live creds. `None` (JIT stays disabled) when the stub matches no pair, or the
-    /// agent has no broker decider ([`crate::vault::broker_expiry`] → `None`), or
+    /// agent has no broker decider ([`crate::vault::refresh::broker_expiry`] → `None`), or
     /// the creds carry no usable expiry.
     pub(super) fn arm(ctx: RefreshCtx, swap_pairs: &[CredSwap], diag: &Diag) -> Option<Self> {
         let access_idx = swap_pairs.iter().position(|p| p.stub == ctx.access_stub)?;
-        let expires_at_ms = crate::vault::broker_expiry(&ctx.creds_path, &ctx.auth_id)?;
+        let expires_at_ms = crate::vault::refresh::broker_expiry(&ctx.creds_path, &ctx.auth_id)?;
         diag.log(&format!(
             "krun-egress: [refresh] broker JIT armed for `{}` (token expires in ~{}s)",
             ctx.auth_id,
@@ -165,7 +165,7 @@ impl RefreshDriver {
         let auth_id = self.auth_id.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = crate::vault::broker_jit_refresh(&creds_path, &auth_id)
+            let result = crate::vault::refresh::broker_jit_refresh(&creds_path, &auth_id)
                 .map(|(access, expires_at_ms)| (access.into_bytes(), expires_at_ms))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -267,7 +267,8 @@ mod tests {
     #[test]
     fn arm_seeds_expiry_from_live_creds_and_matches_the_access_pair() {
         let dir = tempfile::tempdir().unwrap();
-        let creds_path = dir.path().join("creds.json");
+        let creds_path = dir.path().join(".claude/.credentials.json");
+        std::fs::create_dir_all(creds_path.parent().unwrap()).unwrap();
         let future_ms = now_unix_ms() + 8 * 60 * 60 * 1000;
         std::fs::write(
             &creds_path,
@@ -292,7 +293,8 @@ mod tests {
     #[test]
     fn arm_seeds_codex_expiry_from_access_jwt() {
         let dir = tempfile::tempdir().unwrap();
-        let creds_path = dir.path().join("auth.json");
+        let creds_path = dir.path().join(".codex/auth.json");
+        std::fs::create_dir_all(creds_path.parent().unwrap()).unwrap();
         let future_ms = ((now_unix_ms() + 8 * 60 * 60 * 1000) / 1000) * 1000;
         let access = codex_jwt(future_ms);
         std::fs::write(

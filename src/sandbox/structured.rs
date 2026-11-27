@@ -178,7 +178,7 @@ impl Adapter {
         match self {
             Self::Pi(a) => a.run_argv(prompt),
             Self::Cursor(a) => a.run_argv(prompt),
-            // The libkrun guest runs as root: never the docker adapter's
+            // The libkrun guest runs as root: never the adapter's default
             // `--dangerously-skip-permissions` argv (claude refuses it as root).
             Self::Claude(a) => a.guest_root_argv(crate::agents::CLAUDE_STREAM.sandbox_args, prompt),
         }

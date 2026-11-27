@@ -46,18 +46,6 @@ class Case:
 
 
 CASES: dict[str, Case] = {
-    "docker-claude": Case(
-        "docker-claude",
-        "docker",
-        "claude",
-        "Docker backend, Claude PTY session",
-    ),
-    "docker-codex": Case(
-        "docker-codex",
-        "docker",
-        "codex",
-        "Docker backend, Codex PTY session",
-    ),
     "libkrun-claude": Case(
         "libkrun-claude",
         "libkrun",
@@ -98,7 +86,7 @@ def main() -> int:
     case_names = selected_cases(args)
     if not case_names:
         print(
-            "startup-bench: select at least one --case, --all-docker, --all-libkrun, or --all",
+            "startup-bench: select at least one --case, --all-libkrun, or --all",
             file=sys.stderr,
         )
         return 2
@@ -175,7 +163,6 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Case to run. Repeatable.",
     )
-    parser.add_argument("--all-docker", action="store_true", help="Run every Docker case.")
     parser.add_argument("--all-libkrun", action="store_true", help="Run every libkrun case.")
     parser.add_argument("--all", action="store_true", help="Run every known case.")
     parser.add_argument("--list-cases", action="store_true", help="List cases and exit.")
@@ -254,8 +241,6 @@ def selected_cases(args: argparse.Namespace) -> list[str]:
     names: list[str] = []
     if args.all:
         names.extend(CASES)
-    if args.all_docker:
-        names.extend(name for name, case in CASES.items() if case.backend == "docker")
     if args.all_libkrun:
         names.extend(name for name, case in CASES.items() if case.backend == "libkrun")
     names.extend(args.case)

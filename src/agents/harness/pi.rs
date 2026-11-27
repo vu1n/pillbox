@@ -76,7 +76,6 @@ impl Default for PiAdapter {
 }
 
 impl PiAdapter {
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn with_request(requested: RequestedRunProfile) -> Self {
         Self {
             requested: Some(requested),
@@ -85,7 +84,6 @@ impl PiAdapter {
     }
 
     /// The same adapter driving `prime-agent` instead of `pi`.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn prime_agent(requested: RequestedRunProfile) -> Self {
         Self {
             agent: "prime-agent",

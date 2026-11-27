@@ -1,5 +1,4 @@
-//! One-time workspace **ingest** for remote placements (`docker://`, k8s,
-//! managed): decide what crosses the wire the first time a workspace enters a
+//! One-time workspace **ingest** for remote placements (managed): decide what crosses the wire the first time a workspace enters a
 //! remote store. Per docs/remotes-redesign.md ("Workspace I/O" + Addendum),
 //! this is the *ingest* path only — the per-run path is rustic-fork-from-store
 //! + overlay-CoW, which moves no per-run bytes.
@@ -22,10 +21,9 @@
 //! Upholds invariant **I6 (sovereignty)**: nothing the user didn't intend leaves
 //! the machine.
 //!
-//! Built contract-first: the runtime consumer is the `docker://` container
-//! lifecycle (tar `plan_ingest().files` → `docker cp` into the container), which
-//! lands in the next slice. Tested now so the secret denylist is proven before
-//! anything ships bytes.
+//! Built contract-first: the ingest plan has no runtime consumer yet (tested now
+//! so the secret denylist is proven before anything ships bytes); the libkrun
+//! workspace clone and the grader reuse its secret scrub.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

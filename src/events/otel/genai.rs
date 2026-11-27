@@ -13,7 +13,7 @@
 //! per pillbox run, parented to the sandbox-side session span via
 //! shared trace_id + the session's deterministic span_id). When the
 //! caller didn't plumb a session_id through (e.g. test fixtures,
-//! local-docker foreground without the wrapper), gen_ai spans fall
+//! a local foreground run without the wrapper), gen_ai spans fall
 //! back to a sandbox_id-rooted trace per lease.
 
 use std::time::SystemTime;
@@ -27,20 +27,19 @@ use opentelemetry::KeyValue;
 
 use super::spans::{derive_session_span_id, derive_trace_id, override_span_ids, tracer};
 
-/// One captured LLM API call. Built by the vault handler from the
-/// request/response pair it intercepts and handed off to
-/// [`emit_call_span`] when the response completes.
+/// One LLM API call. Built by the transcript synthesizer
+/// (`transcripts::synth`) from the agent's transcript and handed off to
+/// [`emit_call_span`].
 #[derive(Debug)]
 pub(crate) struct CallSpan {
-    /// Per-sandbox vault lease id. Always known. Surfaces as the
+    /// Sandbox id. Always known. Surfaces as the
     /// `pillbox.sandbox_id` attribute and is the trace_id fallback
     /// when `session_id` is absent.
     pub(crate) sandbox_id: String,
-    /// Pillbox-run session id when the orchestrator plumbed one
-    /// through (see [`crate::vault::RunContext`]). When `Some`, the
+    /// Pillbox-run session id. When `Some`, the
     /// span shares a trace with the session span emitted by
     /// [`super::spans`] and parents it; when `None`, the span roots
-    /// its own trace per sandbox lease.
+    /// its own trace per sandbox.
     pub(crate) session_id: Option<String>,
     /// `pillbox.mode` attribute — orchestration regime
     /// (`"interactive"`, `"detached"`, future modes). Omitted when
@@ -55,18 +54,13 @@ pub(crate) struct CallSpan {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) status_code: u16,
-    /// GenAI body-derived signals — populated by the response-body
-    /// SSE tap (Anthropic streaming) or by parsing the response body
-    /// JSON (non-streaming). All-`None` for endpoints that don't
-    /// carry these fields (e.g. `GET /v1/models`) or for error
-    /// responses with no usage block.
+    /// GenAI usage signals from the transcript. All-`None` when the
+    /// transcript carries no usage block.
     pub(crate) usage: GenAiUsage,
     /// Request-side conversation as a JSON array of `{role, content}` in
     /// Anthropic's native shape, emitted as `gen_ai.input.messages` (OTel
     /// GenAI semconv). Populated by the **transcript synth** (`synth.rs`) from
-    /// the agent's transcript history — NOT by the MITM proxy, which sets this
-    /// `None` (it no longer captures request bodies; see `vault/server.rs` and
-    /// `vault/genai_tap.rs`). Lets a collector render the conversation
+    /// the agent's transcript history. Lets a collector render the conversation
     /// (Raindrop Workshop's "Overview"), not just the span envelope.
     pub(crate) input_messages: Option<String>,
     /// Request `system` prompt (string or content-block array), JSON-

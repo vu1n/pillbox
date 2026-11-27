@@ -11,8 +11,8 @@
 //!   Server harnesses (opencode, codex-serve) have no stdout adapter and are
 //!   refused here; they run via `pillbox run`.
 //!
-//! Backend-blind: spawn goes through `select_backend()`, everything else through
-//! the record's `sandbox_target`.
+//! Backend-blind: spawn goes through the selected substrate's backend, everything
+//! else through the record's `sandbox_target`.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ use crate::contract::{
 };
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::{sandbox_target, select_backend, Destroyed, SandboxSpawn, SandboxTarget};
+use crate::sandbox::{sandbox_target, Destroyed, SandboxSpawn, SandboxTarget, SubstrateKind};
 use crate::sandboxes::{self, Sandbox};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SandboxAction) -> Result<()> {
@@ -72,7 +72,7 @@ fn spawn(
         None => std::env::current_dir()
             .map_err(|e| PillboxError::runtime("sandbox spawn", format!("resolve cwd: {e}")))?,
     };
-    let backend = select_backend();
+    let backend = SubstrateKind::selected()?.backend()?;
     if !backend.capabilities().long_lived_exec {
         return Err(backend.capabilities().unsupported("sandbox spawn"));
     }
@@ -370,7 +370,7 @@ fn destroy(resolved: &Pillbox, id: &str) -> Result<()> {
 fn sandbox_json(s: &Sandbox) -> serde_json::Value {
     let mut o = serde_json::Map::new();
     o.insert("id".into(), s.id.clone().into());
-    o.insert("backend".into(), s.backend.clone().into());
+    o.insert("backend".into(), s.substrate.label().into());
     o.insert("image".into(), s.image.clone().into());
     o.insert("workspace".into(), s.workspace.clone().into());
     if let Some(c) = &s.workspace_clone {
@@ -592,8 +592,7 @@ mod tests {
     fn list_json_reports_the_workspace_clone() {
         let mut s = Sandbox {
             id: "abcdef012345".into(),
-            backend: crate::sandboxes::BACKEND_LIBKRUN.into(),
-            backend_ref: "{}".into(),
+            substrate: crate::sandbox::Substrate::Libkrun(None),
             image: "pillbox:latest".into(),
             agent: None,
             workspace: "/work/app".into(),

@@ -40,10 +40,10 @@ pub(crate) fn guest_path() -> String {
     format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin")
 }
 
-/// Per-agent MCP config builder. Returns a fully-formed injection
-/// (live tempfile + docker mount + extra argv); `None` on
+/// Per-agent MCP config builder, given the attachments and the guest home.
+/// Returns the guest files, argv and env the substrate lands; `None` on
 /// `AgentSpec` means the agent doesn't support `--mcp` yet.
-pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
+pub(crate) type McpInjectFn = fn(&[McpAttachment], &str) -> Result<McpInjection>;
 
 /// How pillbox talks to an agent. Most agents are a TUI we wrap in a PTY and
 /// observe by scraping their transcript file ([`Integration::Pty`]); a few
@@ -268,8 +268,8 @@ pub struct AgentSpec {
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
     /// Build a per-run MCP config injection from `--mcp` flags.
-    /// `None` means this agent doesn't support `--mcp` yet —
-    /// the backend hard-errors at run time. Per-agent config-file
+    /// `None` means this agent doesn't support `--mcp` —
+    /// the backend refuses it with a usage error. Per-agent config-file
     /// mechanics differ enough (Claude `.mcp.json` vs Codex
     /// `config.toml`) that the rendering lives in the `mcp` module
     /// rather than in shared run code.
@@ -428,7 +428,9 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     login_hosts: CODEX.login_hosts,
     post_login_finalize: None,
     vault_capable: true,
-    mcp_inject: Some(mcp::codex_inject),
+    // The appserver-host bridge launches `codex app-server` itself, so there is
+    // no agent argv to carry codex's `-c mcp_servers.*` overrides.
+    mcp_inject: None,
     sandbox_args: &[],
     prepare_workspace: None,
     server: Some(ServerProfile {
@@ -937,8 +939,8 @@ pub(crate) struct RunOpts {
     pub(crate) memory_briefed: Vec<String>,
     /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
     /// boundary. Resolved against `mcp_tokens` in the sandbox
-    /// backend; the backend hard-errors if non-empty and the
-    /// resolved agent has no `mcp_inject`.
+    /// backend; the backend refuses them if the resolved agent has
+    /// no `mcp_inject` or the launch path can't carry them.
     pub(crate) mcps: Vec<McpAttachment>,
     /// `--mcp-token NAME=SECRET_NAME` entries. Each references a
     /// `--mcp NAME=URL` and a pillbox-stored secret; values are
@@ -1058,7 +1060,6 @@ pub(crate) fn resolve_run_env(
     env_bundles: &[String],
     env_files: &[PathBuf],
     withs: &[ResolvedWith],
-    mut vault: Option<&mut crate::vault::VaultSession>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     use std::collections::BTreeMap;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -1105,24 +1106,19 @@ pub(crate) fn resolve_run_env(
                 .with_next(format!("pillbox secret add {}", w.secret_name))
         })?;
 
-        let injected = match (w.meta.as_ref(), vault.as_deref_mut()) {
-            (Some(meta), Some(session)) => {
-                session.lease_api_key(&w.secret_name, real_value.trim_end(), meta)?
-            }
-            (Some(_meta), None) => {
-                return Err(PillboxError::runtime(
-                    "run",
-                    format!(
-                        "secret `{}` is marked vaulted but no vault session is active",
-                        w.secret_name
-                    ),
-                )
-                .into());
-            }
-            (None, _) => real_value,
-        };
+        // A vaulted secret is swapped by the launch's own vault, never composed into the env.
+        if w.meta.is_some() {
+            return Err(PillboxError::runtime(
+                "run",
+                format!(
+                    "secret `{}` is marked vaulted but no vault session is active",
+                    w.secret_name
+                ),
+            )
+            .into());
+        }
 
-        if let Some(_prev) = env.insert(w.env_var.clone(), injected) {
+        if let Some(_prev) = env.insert(w.env_var.clone(), real_value) {
             eprintln!(
                 "pillbox: note: {} shadowed by --with {}",
                 w.env_var, w.raw_entry
@@ -1131,35 +1127,6 @@ pub(crate) fn resolve_run_env(
     }
 
     Ok(env)
-}
-
-/// `docker run` args common to every local launch: host-gateway alias +
-/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head
-/// (`["-d"]` for the detached attach-transport flow).
-fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
-    let mut v: Vec<String> = stdio_prefix.iter().map(|s| (*s).into()).collect();
-    v.extend([
-        // Make `host.docker.internal` resolve on Linux. Docker Desktop
-        // already provides this alias and ignores the flag; vault and
-        // `--mcp` (and any future host-reachable feature) all rely on
-        // it being there unconditionally.
-        "--add-host".into(),
-        "host.docker.internal:host-gateway".into(),
-        "-e".into(),
-        format!("HOME={GUEST_HOME}"),
-        "-e".into(),
-        "TERM=xterm-256color".into(),
-        "-e".into(),
-        format!("PATH={}", guest_path()),
-    ]);
-    v
-}
-
-/// Detached base args for the attach-transport flow: `-d`, no `--rm`, so the
-/// pty-host container outlives the client and can be `docker exec`'d into
-/// and explicitly removed.
-pub(crate) fn base_docker_args_detached() -> Vec<String> {
-    base_docker_args_with(&["-d"])
 }
 
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
@@ -1189,7 +1156,7 @@ mod tests {
     use crate::pillbox;
     use crate::secrets::{AddSource, WriteScope};
     use crate::test_util::with_isolated_home;
-    use crate::vault::{HeaderScheme, OAuthAgent, VaultMeta, VaultSession};
+    use crate::vault::{HeaderScheme, VaultMeta};
 
     fn run_opts_with_withs(withs: Vec<&str>) -> RunOpts {
         RunOpts {
@@ -1216,149 +1183,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env =
-                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap();
+            let env = resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs).unwrap();
             assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
-        });
-    }
-
-    #[test]
-    fn resolve_run_env_swaps_vaulted_secret_for_stub() {
-        with_isolated_home("agents-vault", || {
-            let g = pillbox::global();
-            std::env::set_var("__PILLBOX_TEST_VAULTED", "sk-ant-api03-REAL");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "VAULTED_KEY",
-                AddSource::EnvVar("__PILLBOX_TEST_VAULTED".into()),
-                false,
-                Some(VaultMeta::new(
-                    "api.anthropic.com".into(),
-                    HeaderScheme::XApiKey,
-                    "sk-ant-api03-".into(),
-                )),
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_VAULTED");
-
-            let mut session = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
-            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(
-                &g,
-                &opts.env_bundles,
-                &opts.env_files,
-                &withs,
-                Some(&mut session),
-            )
-            .unwrap();
-
-            let injected = env.get("VAULTED_KEY").cloned().unwrap();
-            assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
-            assert_ne!(injected, "sk-ant-api03-REAL");
-        });
-    }
-
-    #[test]
-    fn resolve_run_env_mixed_vaulted_and_plain() {
-        with_isolated_home("agents-mix", || {
-            let g = pillbox::global();
-            std::env::set_var("__PILLBOX_TEST_MIX_P", "plain-val");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "MIX_PLAIN",
-                AddSource::EnvVar("__PILLBOX_TEST_MIX_P".into()),
-                false,
-                None,
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_MIX_P");
-            std::env::set_var("__PILLBOX_TEST_MIX_V", "ghp_REAL_token");
-            crate::secrets::add(
-                &g,
-                WriteScope::Resolved,
-                "MIX_VAULTED",
-                AddSource::EnvVar("__PILLBOX_TEST_MIX_V".into()),
-                false,
-                Some(VaultMeta::new(
-                    "api.github.com".into(),
-                    HeaderScheme::AuthorizationBearer,
-                    "ghp_".into(),
-                )),
-            )
-            .unwrap();
-            std::env::remove_var("__PILLBOX_TEST_MIX_V");
-
-            let mut session = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
-            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(
-                &g,
-                &opts.env_bundles,
-                &opts.env_files,
-                &withs,
-                Some(&mut session),
-            )
-            .unwrap();
-
-            assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
-            let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
-            assert!(stub.starts_with("ghp_"));
-            assert_ne!(stub, "ghp_REAL_token");
-        });
-    }
-
-    #[test]
-    fn vault_uses_per_run_ca_unless_a_stable_one_is_pinned() {
-        with_isolated_home("agents-perrun-ca", || {
-            let g = pillbox::global();
-            let vault_dir = g.subdir("vault").unwrap();
-
-            // No pinned CA → per-run ephemeral: the cert exists but lives in a
-            // tempdir, NOT under the pillbox's vault dir.
-            let s1 = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            assert!(s1.ca_cert_path().exists());
-            assert!(
-                !s1.ca_cert_path().starts_with(&vault_dir),
-                "ephemeral CA must not persist in the pillbox vault dir: {}",
-                s1.ca_cert_path().display()
-            );
-            drop(s1);
-
-            // Pin a stable CA → runs reuse it (cert path is inside the vault dir).
-            crate::vault::Ca::ensure(&vault_dir).unwrap();
-            let s2 = VaultSession::start(
-                None::<OAuthAgent>,
-                &g,
-                crate::vault::RunContext::default(),
-                crate::vault::EgressPolicy::default(),
-            )
-            .unwrap();
-            assert!(
-                s2.ca_cert_path().starts_with(&vault_dir),
-                "a pinned stable CA must be reused: {}",
-                s2.ca_cert_path().display()
-            );
         });
     }
 
@@ -1384,8 +1210,7 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let err =
-                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap_err();
+            let err = resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
         });

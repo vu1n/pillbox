@@ -15,6 +15,9 @@
 //!    from cwd or `--pillbox NAME`:
 //!    `run / secret / env / auth / vault / doctor / sidecar / version`.
 
+// The build without the libkrun feature is the in-guest tools build, with no substrate; its dead code is linted on the full build.
+#![cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
@@ -28,7 +31,6 @@ mod commands;
 mod config;
 mod contract;
 mod cost;
-mod docker;
 mod doctor;
 mod envs;
 mod errors;
@@ -190,15 +192,16 @@ enum Command {
         memory: bool,
         /// Attach a shared MCP server to the sandbox. NAME is the
         /// identifier the agent sees in its tool list; URL must be
-        /// http:// or https://. `localhost` / `127.0.0.1` are
-        /// rewritten to `host.docker.internal` so the sandbox can
-        /// reach host-bound servers. Repeatable.
+        /// http:// or https://. A microVM reaches a server on the host's
+        /// loopback (localhost / 127.0.0.1 / [::1]:PORT, forwarded to the
+        /// guest at the gateway) or an https:// URL on port 443 with a DNS
+        /// host name, which joins its egress allowlist. Repeatable.
         #[arg(long = "mcp", value_name = "NAME=URL")]
         mcps: Vec<agents::McpAttachment>,
         /// Attach a bearer token to a `--mcp NAME=URL` from the
         /// pillbox secret store. NAME must match a `--mcp` entry;
         /// SECRET_NAME is the name passed to `pillbox secret add`.
-        /// Claude folds it into a 0600 tempfile as
+        /// Claude folds it into a 0600 guest config file as
         /// `headers.Authorization: Bearer <value>`; Codex stashes
         /// it in an env var and references it via
         /// `bearer_token_env_var`. Token values never land in argv
@@ -613,15 +616,6 @@ enum Command {
         #[arg(last = true, value_name = "CMD")]
         argv: Vec<String>,
     },
-    /// Internal: verbatim byte pump between a pty-host socket and stdio.
-    /// Run inside a sandbox by the per-attach transport (docker exec / ssh)
-    /// so one client's frames reach the pty-host. See docs/attach-transport.md.
-    #[command(hide = true)]
-    PtyRelay {
-        /// Unix socket the in-sandbox `pty-host` is listening on.
-        #[arg(long, value_name = "PATH")]
-        sock: String,
-    },
     /// Internal: guest-side opencode port-forward relay (libkrun; Linux-only).
     /// Listens on a vsock port and bridges each connection to an in-guest TCP
     /// port (the headless `opencode serve`), so the host speaks HTTP to a
@@ -690,7 +684,7 @@ fn main() -> ExitCode {
         let code = match (a.get(2), a.get(3), a.get(4), a.get(5)) {
             (Some(dir), Some(cap), Some(source_token), Some(sid)) => {
                 match crate::agents::DetachedTranscriptSource::from_token(source_token) {
-                    Some(source) => match crate::commands::session::run_detached_tailer(
+                    Some(source) => match crate::commands::session::serve_detached_tailer(
                         dir.into(),
                         cap.into(),
                         source,
@@ -1003,7 +997,7 @@ fn run(cli: Cli) -> Result<()> {
             println!(
                 "pillbox {} (runner image: {})",
                 env!("CARGO_PKG_VERSION"),
-                docker::default_runner_image()
+                sandbox::oci::default_runner_image()
             );
             Ok(())
         }
@@ -1082,7 +1076,6 @@ fn run(cli: Cli) -> Result<()> {
             )
             .into()),
         },
-        Command::PtyRelay { sock } => attach::relay::run(&sock),
         Command::VsockForward {
             vsock_port,
             to_port,
@@ -1136,7 +1129,7 @@ fn wizard_new(
         .as_deref()
         .unwrap_or("pillbox-runner:dev")
         .to_string();
-    let mut imgs = crate::docker::list_runner_images();
+    let mut imgs = crate::sandbox::oci::list_runner_images();
     if !imgs.contains(&pre) {
         imgs.insert(0, pre.clone());
     }
@@ -1512,18 +1505,17 @@ mod tests {
             assert_eq!(opts.workspace, expected);
             assert!(commands::run::validate_bookmark_backend(
                 &opts,
-                crate::session::BACKEND_LIBKRUN
+                crate::sandbox::SubstrateKind::Libkrun
             )
             .is_ok());
-            for backend in [
-                crate::session::BACKEND_DOCKER,
-                crate::session::BACKEND_MANAGED,
-            ] {
-                assert_eq!(
-                    commands::run::validate_bookmark_backend(&opts, backend).is_err(),
-                    opts.from_bookmark.is_some()
-                );
-            }
+            assert_eq!(
+                commands::run::validate_bookmark_backend(
+                    &opts,
+                    crate::sandbox::SubstrateKind::Managed
+                )
+                .is_err(),
+                opts.from_bookmark.is_some()
+            );
             assert_eq!(
                 std::fs::read_to_string(source.join("README")).unwrap(),
                 "uncommitted work"

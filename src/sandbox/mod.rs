@@ -1,28 +1,33 @@
 //! Sandbox backends — the surface that actually runs a configured
 //! [`AgentSpec`] for `pillbox run`.
 //!
-//! The run path is split off of `AgentSpec` into a trait so we can pick
-//! at run time between the local backends. The deprecated remote backends
-//! (ssh/docker/e2b) were removed in the libkrun pivot — "remote" is
-//! becoming the managed/Cloudflare tier; until then pillbox is local-only.
+//! A new run is placed on the substrate [`SubstrateKind::selected`] picks, and
+//! [`SubstrateKind::backend`] is the one place a substrate becomes an
+//! implementation:
 //!
 //! - [`libkrun::LibkrunBackend`] — a local libkrun microVM (feature-gated
-//!   `libkrun`; the default on that build).
-//! - [`docker::DockerBackend`] — host Docker daemon (the no-KVM compat
-//!   backend; opt in via `PILLBOX_BACKEND=docker`).
+//!   `libkrun`; the default).
+//! - [`managed::ManagedBackend`] — the managed Cloudflare execution runtime
+//!   (`PILLBOX_BACKEND=managed`).
+//!
+//! A record's live session or sandbox target is built from the [`Substrate`] it
+//! stores ([`live_session`], [`sandbox_target`]).
 // QEMU is parked; keep the backend trait seam open for it.
 
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
-pub(crate) mod docker;
 pub(crate) mod exec_channel;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
 pub(crate) mod managed;
+pub(crate) mod oci;
 pub(crate) mod opencode;
 #[cfg(feature = "libkrun")]
 pub(crate) mod structured;
+pub(crate) mod substrate;
+
+pub(crate) use substrate::{Substrate, SubstrateKind};
 
 use std::path::PathBuf;
 
@@ -33,7 +38,7 @@ use crate::errors::PillboxError;
 use crate::events::transcripts::TailerHandle;
 use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
-use crate::session::{Backend, Session};
+use crate::session::Session;
 
 /// A child that outlives its launch call: a detached VMM or §0 tailer. The
 /// launch may run inside a long-lived caller (dispatch, eval), where an exited
@@ -179,11 +184,28 @@ pub(crate) trait SandboxBackend {
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
     fn capabilities(&self) -> Caps;
 
-    /// Stable backend identity (`BACKEND_DOCKER` / `BACKEND_LIBKRUN`) — the
-    /// explicit discriminant for code that must branch on *which* backend is
-    /// active, rather than inferring it from a capability bit (which silently
-    /// breaks the moment two backends share that capability).
-    fn id(&self) -> &'static str;
+    /// Which substrate this backend runs — the explicit discriminant for code that
+    /// must branch on *which* backend is active, rather than inferring it from a
+    /// capability bit (which silently breaks the moment two backends share one).
+    fn kind(&self) -> SubstrateKind;
+
+    /// The [`LiveSession`] for a record this backend's substrate runs. Called only
+    /// by [`live_session`], with a session whose substrate is [`Self::kind`].
+    fn live(&self, session: &Session) -> Box<dyn LiveSession>;
+
+    /// The [`SandboxTarget`] for a sandbox record this backend's substrate runs.
+    /// Called only by [`sandbox_target`]. A backend that never spawns sandboxes
+    /// can only drop such a record.
+    fn target(&self, record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
+        Ok(Box::new(RecordOnly {
+            record: record.clone(),
+            why: format!(
+                "is a {} record, which runs no sandboxes",
+                self.kind().label()
+            ),
+            left: "nothing it ran was torn down".into(),
+        }))
+    }
 
     /// Boot a long-lived exec target (`sandbox spawn`) and return its record,
     /// already written to the registry. The caller then addresses it through
@@ -252,47 +274,14 @@ pub(crate) trait ExecChannel {
     ) -> Result<i32>;
 }
 
-/// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
-/// on `record.backend`. A record nothing here can drive — the deprecated Docker
-/// backend's, an unknown backend's, or a libkrun record whose handle won't decode —
-/// resolves to a [`RecordOnly`] target: exec is refused, destroy drops the record.
+/// Build the [`SandboxTarget`] for a sandbox record from its stored substrate. A
+/// retired record resolves to a [`RecordOnly`] target: exec is refused, destroy
+/// drops the record and says what it left behind.
+// A record's substrate is turned into a backend only through SubstrateKind::backend.
 pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
-    match record.backend.as_str() {
-        crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(RecordOnly {
-            record: record.clone(),
-            why: "is docker-backed, and docker is deprecated".into(),
-            left: format!(
-                "its container `{}` was left running; pillbox no longer drives docker, remove it \
-                 with `docker rm -f {}`",
-                record.backend_ref, record.backend_ref
-            ),
-        })),
-        #[cfg(feature = "libkrun")]
-        crate::sandboxes::BACKEND_LIBKRUN => {
-            libkrun::sandbox_vm::target(record).or_else(|e| -> Result<Box<dyn SandboxTarget>> {
-                Ok(Box::new(RecordOnly {
-                    record: record.clone(),
-                    why: format!("has a libkrun handle that can't be decoded ({e:#})"),
-                    left: "any VM or files it named were not torn down".into(),
-                }))
-            })
-        }
-        // Usage (exit 2), like `live_session` for a libkrun record on this build.
-        // Not dropped: its VM may be live, and only a libkrun build can tear it down.
-        #[cfg(not(feature = "libkrun"))]
-        crate::sandboxes::BACKEND_LIBKRUN => Err(PillboxError::usage(
-            "sandbox",
-            format!(
-                "sandbox `{}` is libkrun-backed, but this pillbox was built without libkrun support",
-                record.id
-            ),
-        )
-        .into()),
-        other => Ok(Box::new(RecordOnly {
-            record: record.clone(),
-            why: format!("has an unknown backend `{other}`"),
-            left: "nothing it ran was torn down".into(),
-        })),
+    match record.substrate.kind() {
+        Some(kind) => kind.backend()?.target(record),
+        None => Ok(Box::new(RecordOnly::retired(record))),
     }
 }
 
@@ -304,6 +293,22 @@ struct RecordOnly {
     why: String,
     /// What destroy leaves behind, and the manual cleanup if any.
     left: String,
+}
+
+impl RecordOnly {
+    fn retired(record: &crate::sandboxes::Sandbox) -> Self {
+        let why = match &record.substrate {
+            Substrate::Retired { backend, why, .. } => {
+                format!("is a retired `{backend}` record ({why})")
+            }
+            _ => String::new(),
+        };
+        Self {
+            record: record.clone(),
+            why,
+            left: record.substrate.left_behind(),
+        }
+    }
 }
 
 impl SandboxTarget for RecordOnly {
@@ -446,59 +451,89 @@ pub(crate) trait LiveSession {
     fn kill(&self, resolved: &Pillbox) -> Result<()>;
 }
 
-/// Pick the local backend for one `pillbox run`. The deprecated remote backends
-/// (ssh/docker/e2b) were removed in the libkrun pivot — "remote" is becoming the
-/// managed/Cloudflare tier; until then pillbox is local-only. On a `libkrun`
-/// build the microVM is the default local substrate; Docker is the no-KVM compat
-/// opt-out via `PILLBOX_BACKEND=docker`. A build without the feature is always
-/// Docker (libkrun isn't compiled in).
-pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
-    // `PILLBOX_BACKEND=managed` opts into the managed Cloudflare execution
-    // runtime. It needs no host capability, so it's
-    // selectable on any build — but it requires the managed config env
-    // (`PILLBOX_MANAGED_URL`, …); the backend itself reports the gap if it's
-    // selected without it. Checked before the local-backend split so it wins on
-    // every build.
-    if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "managed") {
-        return Box::new(managed::ManagedBackend);
+/// Construct the [`LiveSession`] for an existing resolved [`Session`] from its
+/// stored substrate, so the command-layer control verbs (`send`/`attach`/`watch`/
+/// `kill`/…) dispatch through the plane. A retired record yields a
+/// [`RetiredSession`]: every verb is refused except `kill`, which drops the record.
+// A record's substrate is turned into a backend only through SubstrateKind::backend.
+pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
+    match session.substrate.kind() {
+        Some(kind) => Ok(kind.backend()?.live(session)),
+        None => Ok(Box::new(RetiredSession(session.clone()))),
     }
-    #[cfg(feature = "libkrun")]
-    if std::env::var_os("PILLBOX_BACKEND").is_none_or(|v| v != "docker") {
-        return Box::new(libkrun::LibkrunBackend);
-    }
-    Box::new(docker::DockerBackend)
 }
 
-/// Construct the [`LiveSession`] for an existing resolved [`Session`] — the one
-/// place that branches on `session.backend`, so the command-layer control verbs
-/// (`send`/`attach`/`watch`/`kill`/…) dispatch through the plane instead of each
-/// re-matching `Backend::parse`. Construction is just the cloned record; methods
-/// that need the resolved [`Pillbox`] take it per-call.
-pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
-    match Backend::parse(&session.backend) {
-        Some(Backend::Docker) => Ok(Box::new(docker::DockerLiveSession::new(session.clone()))),
-        #[cfg(feature = "libkrun")]
-        Some(Backend::Libkrun) => Ok(Box::new(libkrun::LibkrunLiveSession::new(session.clone()))),
-        // Managed needs no host capability, so it resolves on every build — the
-        // verbs are DO calls, not local-process ops.
-        Some(Backend::Managed) => Ok(Box::new(managed::ManagedLiveSession::new(session.clone()))),
-        // Usage (exit 2), not config — matches the per-verb wrappers this replaced,
-        // so a caller branching on exit code sees no drift for a libkrun record on a
-        // build without the feature.
-        #[cfg(not(feature = "libkrun"))]
-        Some(Backend::Libkrun) => Err(PillboxError::usage(
+/// A session record left by a removed or unknown backend, or with an undecodable
+/// handle (see [`Substrate::Retired`]): nothing about it can be driven.
+struct RetiredSession(Session);
+
+impl RetiredSession {
+    fn refuse(&self, verb: &str) -> anyhow::Error {
+        let why = match &self.0.substrate {
+            Substrate::Retired { why, .. } => why.as_str(),
+            _ => "",
+        };
+        PillboxError::usage(
             "session",
             format!(
-                "session `{}` is libkrun-backed, but this pillbox was built without libkrun support",
-                session.id
+                "`{verb}` isn't supported on session `{}`: it is a retired `{}` record ({why})",
+                self.0.id,
+                self.0.substrate.label()
             ),
         )
-        .into()),
-        None => Err(PillboxError::config(
-            "session",
-            format!("unknown session backend `{}`", session.backend),
-        )
-        .into()),
+        .with_next(format!(
+            "pillbox session rm {}  # drops the record",
+            self.0.id
+        ))
+        .into()
+    }
+}
+
+impl LiveSession for RetiredSession {
+    fn caps(&self) -> Caps {
+        Caps::default()
+    }
+
+    fn send(&self, _resolved: &Pillbox, _bytes: &[u8]) -> Result<()> {
+        Err(self.refuse("send"))
+    }
+
+    fn attach(&self, _resolved: &Pillbox) -> Result<()> {
+        Err(self.refuse("attach"))
+    }
+
+    fn spawn_log_tailer(&self, _resolved: &Pillbox) -> Result<Option<TailerHandle>> {
+        Err(self.refuse("watch"))
+    }
+
+    fn http(&self) -> Result<Box<dyn SandboxHttp>> {
+        Err(self.refuse("http"))
+    }
+
+    fn workspace_path(&self) -> Result<PathBuf> {
+        Err(self.refuse("workspace"))
+    }
+
+    fn ingest(&self, _resolved: &Pillbox) -> Result<usize> {
+        Err(self.refuse("ingest"))
+    }
+
+    // pillbox never runs anything for a retired record: kill only drops the record and says what is left.
+    fn kill(&self, resolved: &Pillbox) -> Result<()> {
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionDropped,
+            &self.0.id,
+            Some(&self.0),
+        );
+        crate::session::delete(resolved, &self.0.id)?;
+        eprintln!(
+            "pillbox: session `{}` is a retired `{}` record: dropped its record; {}",
+            self.0.id,
+            self.0.substrate.label(),
+            self.0.substrate.left_behind()
+        );
+        Ok(())
     }
 }
 
@@ -534,26 +569,6 @@ pub(crate) fn drive_server_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::BACKEND_DOCKER;
-
-    /// Removes `PILLBOX_BACKEND` on drop so the selection test can't leak its
-    /// override into another test (the env is process-global). Tests touching
-    /// it share the lock below.
-    struct BackendEnvGuard;
-    impl Drop for BackendEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("PILLBOX_BACKEND");
-        }
-    }
-
-    /// Serializes the env-mutating selection test against any other test that
-    /// reads/writes `PILLBOX_BACKEND` in this process.
-    static BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The stable `id()` of the backend `select_backend` picks.
-    fn selected_backend_id() -> &'static str {
-        select_backend().id()
-    }
 
     #[test]
     fn only_a_live_or_cleanly_finished_run_is_a_live_session() {
@@ -653,49 +668,25 @@ mod tests {
     }
 
     #[test]
-    fn select_backend_default_and_docker_opt_out() {
-        let _lock = BACKEND_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _guard = BackendEnvGuard;
-
-        std::env::remove_var("PILLBOX_BACKEND");
-        // Default build: always docker (libkrun isn't compiled in). libkrun
-        // build: the microVM is the default substrate.
-        #[cfg(not(feature = "libkrun"))]
-        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
+    fn the_selected_substrate_is_the_backend_kind_it_builds() {
+        let managed = SubstrateKind::Managed
+            .backend()
+            .expect("managed builds everywhere");
+        assert_eq!(managed.kind(), SubstrateKind::Managed);
         #[cfg(feature = "libkrun")]
-        assert_eq!(selected_backend_id(), "libkrun");
-
-        // `PILLBOX_BACKEND=docker` is the compat opt-out — docker on every build.
-        std::env::set_var("PILLBOX_BACKEND", "docker");
-        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
-
-        // An unrecognized value isn't the docker opt-out: it falls through to
-        // the build's default (libkrun on a libkrun build, docker otherwise).
-        std::env::set_var("PILLBOX_BACKEND", "libkrun");
-        #[cfg(not(feature = "libkrun"))]
-        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
-        #[cfg(feature = "libkrun")]
-        assert_eq!(selected_backend_id(), "libkrun");
-    }
-
-    #[test]
-    fn select_backend_picks_managed_on_opt_in() {
-        use crate::session::BACKEND_MANAGED;
-        let _lock = BACKEND_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _guard = BackendEnvGuard;
-        // `PILLBOX_BACKEND=managed` selects the managed tier on every build (it
-        // needs no host capability). Asserted via the stable `id()` discriminant,
-        // not a capability bit (two backends can share one).
-        std::env::set_var("PILLBOX_BACKEND", "managed");
-        assert_eq!(select_backend().id(), BACKEND_MANAGED);
+        assert_eq!(
+            SubstrateKind::Libkrun.backend().unwrap().kind(),
+            SubstrateKind::Libkrun
+        );
     }
 
     #[test]
     fn live_session_dispatches_managed_to_the_execution_runtime() {
-        use crate::session::{Placement, BACKEND_MANAGED};
         let mut s = Session::test_fixture();
-        s.backend = BACKEND_MANAGED.to_string();
-        s.placement = Placement::Managed;
+        s.substrate = Substrate::Managed(managed::ManagedHandle {
+            endpoint: "https://w.example.workers.dev".into(),
+            execution_session_id: s.id.clone(),
+        });
         let live = live_session(&s).expect("managed session resolves on every build");
         // Managed is server-mode (structured execution plus evidence retrieval),
         // with no host PTY — the honest profile the plane gates verbs on.
@@ -703,11 +694,10 @@ mod tests {
         assert!(!live.caps().pty_drive);
     }
 
-    fn sandbox_record(backend: &str) -> crate::sandboxes::Sandbox {
+    fn sandbox_record(substrate: Substrate) -> crate::sandboxes::Sandbox {
         crate::sandboxes::Sandbox {
             id: "abcdef012345".into(),
-            backend: backend.into(),
-            backend_ref: "container-abc".into(),
+            substrate,
             image: "pillbox:latest".into(),
             agent: None,
             workspace: "/work/app".into(),
@@ -719,13 +709,18 @@ mod tests {
         }
     }
 
-    /// Records nothing here can drive: docker's, an unknown backend's, and (on a
-    /// libkrun build) a libkrun record whose "container-abc" ref isn't a handle.
+    /// Records nothing here can drive: docker's, an unknown backend's, a libkrun
+    /// record whose "container-abc" ref isn't a handle, and a managed record (the
+    /// managed tier runs no sandboxes).
     fn undrivable_records() -> Vec<crate::sandboxes::Sandbox> {
-        let backends = [crate::sandboxes::BACKEND_DOCKER, "e2b"].into_iter();
-        #[cfg(feature = "libkrun")]
-        let backends = backends.chain([crate::sandboxes::BACKEND_LIBKRUN]);
-        backends.map(sandbox_record).collect()
+        ["docker", "e2b", "libkrun"]
+            .into_iter()
+            .map(|backend| sandbox_record(Substrate::from_legacy(backend, "container-abc")))
+            .chain([sandbox_record(Substrate::Managed(managed::ManagedHandle {
+                endpoint: "https://w.example.workers.dev".into(),
+                execution_session_id: "abcdef012345".into(),
+            }))])
+            .collect()
     }
 
     #[test]
@@ -751,9 +746,29 @@ mod tests {
                 assert!(
                     crate::sandboxes::resolve(&g, &record.id).is_err(),
                     "{} record survived destroy",
-                    record.backend
+                    record.substrate.label()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn a_retired_session_refuses_every_verb_but_kill_which_drops_only_the_record() {
+        crate::test_util::with_isolated_home("retired-session", || {
+            let g = crate::pillbox::global();
+            let mut s = Session::test_fixture();
+            s.substrate = Substrate::from_legacy("docker", "0123456789ab");
+            crate::session::write(&g, &s).unwrap();
+            let live = live_session(&s).expect("a retired record resolves");
+            assert_eq!(live.caps(), Caps::default());
+            let err = live.send(&g, b"hi").unwrap_err();
+            assert!(err.to_string().contains("retired `docker`"), "{err}");
+            assert!(err.downcast_ref::<PillboxError>().is_some());
+            assert!(live.attach(&g).is_err());
+            assert!(live.workspace_path().is_err());
+            assert!(live.ingest(&g).is_err());
+            live.kill(&g).unwrap();
+            assert!(crate::session::read(&g, &s.id).unwrap().is_none());
         });
     }
 
@@ -780,26 +795,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_session_dispatches_docker_to_pty_family() {
-        let mut s = Session::test_fixture();
-        s.backend = BACKEND_DOCKER.to_string();
-        let live = live_session(&s).expect("docker session resolves to a LiveSession");
-        // Docker is the full-PTY family — the factory must hand back the docker
-        // impl, identified here by its capability profile (not a type assert,
-        // since the return is a trait object).
-        assert!(
-            live.caps().pty_drive,
-            "docker LiveSession must report pty_drive == true"
-        );
-    }
-
     #[cfg(feature = "libkrun")]
     #[test]
     fn live_session_dispatches_libkrun_to_microvm_family() {
-        use crate::session::BACKEND_LIBKRUN;
-        let mut s = Session::test_fixture();
-        s.backend = BACKEND_LIBKRUN.to_string();
+        let s = Session::test_fixture();
         let live = live_session(&s).expect("libkrun session resolves to a LiveSession");
         assert!(
             live.caps().in_sandbox_grading,

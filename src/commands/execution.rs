@@ -112,7 +112,7 @@ fn execute(
         request.canonical_request()? == canonical,
         "closed request canonicalization changed"
     );
-    let backend = crate::sandbox::select_backend();
+    let backend = crate::sandbox::SubstrateKind::selected()?.backend()?;
     ensure!(
         backend.capabilities().repository_execution,
         "selected backend does not support sealed repository execution"

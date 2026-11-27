@@ -1,20 +1,18 @@
 //! `--mcp NAME=URL` shared-MCP attachment plumbing.
 //!
-//! Pillbox's job here is wiring only: parse the flag, rewrite
-//! host-local URLs so they're reachable from inside the sandbox,
-//! and render the per-agent config the user's persistent home
-//! would never see. The MCP server itself is somebody else's
+//! Pillbox's job here is wiring only: parse the flag and render
+//! the per-agent config the user's persistent home would never
+//! see, as a substrate-neutral [`McpInjection`] (guest files, argv,
+//! guest env) the launching substrate lands. The MCP server itself is somebody else's
 //! problem (host process, lifecycle, supervision, auth at the
 //! provider — all out of scope). See `docs/shared-mcp.md`.
 
-use std::io::Write;
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::errors::PillboxError;
-use crate::url_safety;
 
 /// One `--mcp NAME=URL` after parsing + URL rewriting. `token` is
 /// `None` at CLI-parse time and gets populated by
@@ -37,9 +35,8 @@ pub(crate) struct McpTokenSpec {
 }
 
 impl McpAttachment {
-    /// Parse a raw `--mcp` value. Returns the attachment with the
-    /// URL rewritten to `host.docker.internal` if the host
-    /// component was `localhost` or `127.0.0.1`.
+    /// Parse a raw `--mcp` value. The URL is kept as given; whether the
+    /// sandbox can reach it is the launching substrate's check.
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let (name, url) = raw
             .split_once('=')
@@ -55,7 +52,7 @@ impl McpAttachment {
         }
         Ok(Self {
             name: name.to_string(),
-            url: rewrite_localhost(url),
+            url: url.to_string(),
             token: None,
         })
     }
@@ -169,7 +166,7 @@ pub(crate) fn resolve_tokens(
 }
 
 /// Env var name codex's `bearer_token_env_var` references and that
-/// pillbox sets in the container env. Uppercases NAME and maps
+/// pillbox sets in the guest env. Uppercases NAME and maps
 /// `-` to `_` so the result is a portable env-var identifier.
 fn codex_env_var_name(name: &str) -> String {
     let mut out = String::with_capacity("PILLBOX_MCP_TOKEN_".len() + name.len());
@@ -214,51 +211,44 @@ impl FromStr for McpAttachment {
     }
 }
 
-/// What an agent adapter hands back to `DockerBackend` when `--mcp …`
-/// flags were passed. The shape covers both file-based loaders
-/// (Claude reads a JSON config file, so the adapter produces a
-/// tempfile + docker mount + `--mcp-config` argv) and CLI-flag
-/// loaders (Codex takes `-c mcp_servers.NAME.url=...`, so just
-/// argv — no tempfile, no mount). Live tempfile is held to keep
-/// the file on disk until the docker call returns.
-#[derive(Debug)]
-pub(crate) struct McpInjection {
-    _tempfile: Option<tempfile::NamedTempFile>,
-    pub(crate) docker_mount: Option<String>,
-    pub(crate) extra_argv: Vec<String>,
-    /// Container env vars the backend should `-e K=V`. Used by the
-    /// codex adapter to land bearer tokens out-of-band so they
-    /// never appear in argv (and so `ps` on the host can't see
-    /// them). Claude folds tokens into the 0600 tempfile JSON
-    /// directly and leaves this empty.
-    pub(crate) env_vars: Vec<(String, String)>,
+/// A file an MCP adapter needs inside the guest.
+pub(crate) struct GuestFile {
+    /// Absolute path in the guest (under the guest home the adapter was given).
+    pub(crate) guest_path: String,
+    /// File contents. May carry a bearer token, so the substrate writes it 0600.
+    pub(crate) bytes: Vec<u8>,
 }
 
-/// Adapter for Claude: write `--mcp` attachments to a tempfile, mount
-/// at `/etc/pillbox/mcp.json`, point `claude` at it with
+/// What an agent adapter hands the launching substrate when `--mcp …`
+/// flags were passed: files to place in the guest, extra agent argv, and
+/// guest env vars. File-based loaders (Claude's `--mcp-config`, OpenCode's
+/// `OPENCODE_CONFIG`) produce a file plus the argv/env that points at it;
+/// CLI-flag loaders (Codex's `-c mcp_servers.NAME.url=...`) produce argv only.
+pub(crate) struct McpInjection {
+    pub(crate) files: Vec<GuestFile>,
+    pub(crate) argv: Vec<String>,
+    /// Guest env vars. Bearer tokens travel here (or inside a 0600 file),
+    /// never in argv, so a process listing can't see them.
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// Adapter for Claude: render `--mcp` attachments to
+/// `<guest_home>/.pillbox/mcp.json` and point `claude` at it with
 /// `--mcp-config`. Additive with the persistent `~/.claude.json`
-/// config Claude loads from `/home/pillbox`.
-///
-/// The tempfile defaults to mode 0600 (mkstemp); today's
-/// `--mcp NAME=URL` values don't carry secrets, but a future
-/// `--mcp-token` flow would fold bearer headers into the rendered
-/// JSON, so the perms need to hold even before then.
-pub(crate) fn claude_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
-    let guest_path = "/etc/pillbox/mcp.json";
-    let mut tempfile = tempfile::Builder::new()
-        .prefix("pillbox-mcp-")
-        .suffix(".json")
-        .tempfile()
-        .context("create per-run MCP config tempfile")?;
-    tempfile
-        .as_file_mut()
-        .write_all(&claude_config_bytes(attachments))
-        .context("write per-run MCP config")?;
+/// config Claude loads from its home. Tokens are folded into the
+/// file's `headers`, so they stay out of argv.
+pub(crate) fn claude_inject(
+    attachments: &[McpAttachment],
+    guest_home: &str,
+) -> Result<McpInjection> {
+    let guest_path = format!("{guest_home}/.pillbox/mcp.json");
     Ok(McpInjection {
-        docker_mount: Some(format!("{}:{guest_path}:ro", tempfile.path().display())),
-        extra_argv: vec!["--mcp-config".into(), guest_path.into()],
-        _tempfile: Some(tempfile),
-        env_vars: Vec::new(),
+        files: vec![GuestFile {
+            guest_path: guest_path.clone(),
+            bytes: claude_config_bytes(attachments),
+        }],
+        argv: vec!["--mcp-config".into(), guest_path],
+        env: Vec::new(),
     })
 }
 
@@ -268,11 +258,12 @@ pub(crate) fn claude_inject(attachments: &[McpAttachment]) -> Result<McpInjectio
 /// so this is additive without touching the persistent home, and
 /// the URL never lands on disk.
 ///
-/// Codex MCP servers natively support HTTP — the same `url` field
-/// the smoke test uses for Claude. Bearer auth for a future
-/// `--mcp-token` flow lines up with codex's `bearer_token_env_var`
-/// natively, no extra plumbing needed.
-pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
+/// Codex MCP servers natively support HTTP. A `--mcp-token` lands in a
+/// guest env var that codex's `bearer_token_env_var` names.
+pub(crate) fn codex_inject(
+    attachments: &[McpAttachment],
+    _guest_home: &str,
+) -> Result<McpInjection> {
     let mut extra_argv = Vec::with_capacity(attachments.len() * 2);
     let mut env_vars = Vec::new();
     for a in attachments {
@@ -295,8 +286,7 @@ pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection
         if let Some(token) = &a.token {
             // Stash the token in an env var instead of inlining it
             // in `-c http_headers.Authorization="Bearer …"` — the
-            // env-var-indirection keeps the secret out of `ps` argv
-            // on the host. The env var name is unique per
+            // env-var-indirection keeps the secret out of argv. The env var name is unique per
             // attachment (collision-checked in `resolve_tokens`).
             let env = codex_env_var_name(&a.name);
             extra_argv.push("-c".into());
@@ -308,37 +298,32 @@ pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection
         }
     }
     Ok(McpInjection {
-        _tempfile: None,
-        docker_mount: None,
-        extra_argv,
-        env_vars,
+        files: Vec::new(),
+        argv: extra_argv,
+        env: env_vars,
     })
 }
 
-/// Adapter for OpenCode: write `--mcp` attachments to a tempfile as an
-/// `opencode.json` config with `mcp` entries, mount it read-only, and
-/// set `OPENCODE_CONFIG` env var to point at the guest path. OpenCode
-/// merges configs rather than replacing them, so this is additive with
-/// the user's global `~/.config/opencode/opencode.json` (which loads at
-/// lower precedence). Caveat: a project `opencode.json` in the mounted
-/// workspace loads at *higher* precedence than `OPENCODE_CONFIG`, so a
+/// Adapter for OpenCode: render `--mcp` attachments as an
+/// `opencode.json` config with `mcp` entries at
+/// `<guest_home>/.pillbox/opencode-mcp.json`, and set `OPENCODE_CONFIG`
+/// to it. OpenCode merges configs rather than replacing them, so this is
+/// additive with the user's global `~/.config/opencode/opencode.json`
+/// (which loads at lower precedence). Caveat: a project `opencode.json` in
+/// the workspace loads at *higher* precedence than `OPENCODE_CONFIG`, so a
 /// workspace MCP entry sharing a `--mcp` NAME would override ours.
-pub(crate) fn opencode_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
-    let guest_path = "/etc/pillbox/opencode-mcp.json";
-    let mut tempfile = tempfile::Builder::new()
-        .prefix("pillbox-opencode-mcp-")
-        .suffix(".json")
-        .tempfile()
-        .context("create per-run OpenCode MCP config tempfile")?;
-    tempfile
-        .as_file_mut()
-        .write_all(&opencode_config_bytes(attachments))
-        .context("write per-run OpenCode MCP config")?;
+pub(crate) fn opencode_inject(
+    attachments: &[McpAttachment],
+    guest_home: &str,
+) -> Result<McpInjection> {
+    let guest_path = format!("{guest_home}/.pillbox/opencode-mcp.json");
     Ok(McpInjection {
-        docker_mount: Some(format!("{}:{guest_path}:ro", tempfile.path().display())),
-        extra_argv: Vec::new(),
-        _tempfile: Some(tempfile),
-        env_vars: vec![("OPENCODE_CONFIG".into(), guest_path.into())],
+        files: vec![GuestFile {
+            guest_path: guest_path.clone(),
+            bytes: opencode_config_bytes(attachments),
+        }],
+        argv: Vec::new(),
+        env: vec![("OPENCODE_CONFIG".into(), guest_path)],
     })
 }
 
@@ -368,37 +353,13 @@ pub(crate) fn opencode_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
     serde_json::to_vec_pretty(&config).expect("in-memory JSON serialization is infallible")
 }
 
-/// Rewrite a loopback host in `url` to `host.docker.internal` so
-/// the sandbox can reach a host-bound server. Loopback set comes
-/// from [`url_safety::is_loopback_host`] (localhost, 127.0.0.0/8,
-/// `::1` / `[::1]`, `*.localhost`). Everything else — paths,
-/// query, fragment, userinfo, port, non-loopback host — passes
-/// through unchanged.
-fn rewrite_localhost(url: &str) -> String {
-    let Some(host) = url_safety::host_of(url) else {
-        return url.to_string();
-    };
-    if !url_safety::is_loopback_host(host) {
-        return url.to_string();
-    }
-    // `host` is a borrowed sub-slice of `url`, so pointer arithmetic
-    // gives us the exact splice points without re-scanning.
-    let host_start = host.as_ptr() as usize - url.as_ptr() as usize;
-    let host_end = host_start + host.len();
-    let mut out = String::with_capacity(url.len() + 16);
-    out.push_str(&url[..host_start]);
-    out.push_str("host.docker.internal");
-    out.push_str(&url[host_end..]);
-    out
-}
-
 /// JSON config Claude loads via `--mcp-config <path>`. Format
 /// per Claude Code's documented `mcpServers` schema; HTTP
 /// transport entries take `type: "http"` and `url`. When an
 /// attachment carries a token, it's folded into a `headers`
-/// map as `Authorization: Bearer <value>` — the tempfile is
-/// 0600 so the token stays off-disk-for-other-users and
-/// out-of-argv.
+/// map as `Authorization: Bearer <value>` — the guest file is
+/// 0600 so the token stays out of other users' reach and
+/// out of argv.
 pub(crate) fn claude_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
     let mut servers = serde_json::Map::new();
     for a in attachments {
@@ -425,61 +386,20 @@ pub(crate) fn claude_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    const HOME: &str = "/home/pillbox";
+
     #[test]
     fn parse_accepts_http_and_https() {
         let a = McpAttachment::parse("mem0=http://localhost:7777").unwrap();
         assert_eq!(a.name, "mem0");
-        assert_eq!(a.url, "http://host.docker.internal:7777");
+        assert_eq!(a.url, "http://localhost:7777");
 
         let b = McpAttachment::parse("memo=https://mem0.example.com/v1").unwrap();
         assert_eq!(b.url, "https://mem0.example.com/v1");
     }
 
     #[test]
-    fn parse_rewrites_127_0_0_1_and_localhost() {
-        assert_eq!(
-            McpAttachment::parse("x=http://127.0.0.1:8000").unwrap().url,
-            "http://host.docker.internal:8000"
-        );
-        assert_eq!(
-            McpAttachment::parse("x=http://localhost:8000/path?q=1")
-                .unwrap()
-                .url,
-            "http://host.docker.internal:8000/path?q=1"
-        );
-    }
-
-    #[test]
-    fn parse_rewrites_wider_loopback_set() {
-        // Anything in 127.0.0.0/8 is loopback — `--mcp x=127.5.5.5`
-        // used to silently pass through and break inside the sandbox.
-        assert_eq!(
-            McpAttachment::parse("x=http://127.5.5.5:7000/")
-                .unwrap()
-                .url,
-            "http://host.docker.internal:7000/"
-        );
-        // IPv6 loopback, bracketed with port.
-        assert_eq!(
-            McpAttachment::parse("x=http://[::1]:8080/mcp").unwrap().url,
-            "http://host.docker.internal:8080/mcp"
-        );
-        // IPv6 loopback, bracketed, no port.
-        assert_eq!(
-            McpAttachment::parse("x=http://[::1]/").unwrap().url,
-            "http://host.docker.internal/"
-        );
-        // `*.localhost` per RFC 6761 also resolves to loopback.
-        assert_eq!(
-            McpAttachment::parse("x=http://mem0.localhost:7777")
-                .unwrap()
-                .url,
-            "http://host.docker.internal:7777"
-        );
-    }
-
-    #[test]
-    fn parse_leaves_other_hosts_alone() {
+    fn parse_keeps_the_url_as_given() {
         assert_eq!(
             McpAttachment::parse("x=http://canopy.internal:9000/")
                 .unwrap()
@@ -530,24 +450,24 @@ mod tests {
         let attachments = vec![
             McpAttachment {
                 name: "smoke".into(),
-                url: "http://host.docker.internal:8000/mcp/".into(),
+                url: "https://mcp.example.com:8000/mcp/".into(),
                 token: None,
             },
             McpAttachment {
                 name: "mem0".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: None,
             },
         ];
-        let injection = codex_inject(&attachments).unwrap();
-        assert!(injection.docker_mount.is_none(), "codex needs no mount");
+        let injection = codex_inject(&attachments, HOME).unwrap();
+        assert!(injection.files.is_empty(), "codex needs no file");
         assert_eq!(
-            injection.extra_argv,
+            injection.argv,
             vec![
                 "-c".to_string(),
-                r#"mcp_servers.smoke.url="http://host.docker.internal:8000/mcp/""#.to_string(),
+                r#"mcp_servers.smoke.url="https://mcp.example.com:8000/mcp/""#.to_string(),
                 "-c".to_string(),
-                r#"mcp_servers.mem0.url="http://host.docker.internal:7777""#.to_string(),
+                r#"mcp_servers.mem0.url="https://mcp.example.com:7777""#.to_string(),
             ]
         );
     }
@@ -562,7 +482,9 @@ mod tests {
             url: r#"http://host"injected.toml=1/"#.into(),
             token: None,
         }];
-        let err = codex_inject(&bad).unwrap_err();
+        let Err(err) = codex_inject(&bad, HOME) else {
+            panic!("a TOML-meta URL must be refused");
+        };
         assert!(err.to_string().contains("codex `-c`"), "{err}");
     }
 
@@ -604,12 +526,12 @@ mod tests {
         let attachments = vec![
             McpAttachment {
                 name: "with_token".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: Some("sk-test-1234".into()),
             },
             McpAttachment {
                 name: "no_token".into(),
-                url: "http://host.docker.internal:8888".into(),
+                url: "https://mcp.example.com:8888".into(),
                 token: None,
             },
         ];
@@ -630,37 +552,37 @@ mod tests {
     fn codex_inject_with_token_emits_bearer_env_var_and_arg() {
         let attachments = vec![McpAttachment {
             name: "mem0".into(),
-            url: "http://host.docker.internal:7777".into(),
+            url: "https://mcp.example.com:7777".into(),
             token: Some("sk-test-1234".into()),
         }];
-        let injection = codex_inject(&attachments).unwrap();
+        let injection = codex_inject(&attachments, HOME).unwrap();
         // Argv has url override AND bearer_token_env_var override.
         assert!(
             injection
-                .extra_argv
+                .argv
                 .iter()
                 .any(|s| s.contains(r#"mcp_servers.mem0.url="#)),
             "argv missing url override: {:?}",
-            injection.extra_argv
+            injection.argv
         );
         assert!(
             injection
-                .extra_argv
+                .argv
                 .iter()
                 .any(|s| s
                     .contains(r#"mcp_servers.mem0.bearer_token_env_var="PILLBOX_MCP_TOKEN_MEM0""#)),
             "argv missing bearer_token_env_var override: {:?}",
-            injection.extra_argv
+            injection.argv
         );
-        // The token value lands in env_vars, NOT in argv.
+        // The token value lands in the guest env, NOT in argv.
         assert_eq!(
-            injection.env_vars,
+            injection.env,
             vec![(
                 "PILLBOX_MCP_TOKEN_MEM0".to_string(),
                 "sk-test-1234".to_string()
             )]
         );
-        for arg in &injection.extra_argv {
+        for arg in &injection.argv {
             assert!(
                 !arg.contains("sk-test-1234"),
                 "token leaked into argv: {arg}"
@@ -689,7 +611,7 @@ mod tests {
 
             let attachments = vec![McpAttachment {
                 name: "mem0".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: None,
             }];
             let tokens = vec![McpTokenSpec {
@@ -785,12 +707,12 @@ mod tests {
         let attachments = vec![
             McpAttachment {
                 name: "mem0".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: None,
             },
             McpAttachment {
                 name: "canopy".into(),
-                url: "http://host.docker.internal:7000".into(),
+                url: "https://mcp.example.com:7000".into(),
                 token: None,
             },
         ];
@@ -799,8 +721,8 @@ mod tests {
         let servers = parsed.get("mcpServers").unwrap().as_object().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers["mem0"]["type"], "http");
-        assert_eq!(servers["mem0"]["url"], "http://host.docker.internal:7777");
-        assert_eq!(servers["canopy"]["url"], "http://host.docker.internal:7000");
+        assert_eq!(servers["mem0"]["url"], "https://mcp.example.com:7777");
+        assert_eq!(servers["canopy"]["url"], "https://mcp.example.com:7000");
     }
 
     #[test]
@@ -808,12 +730,12 @@ mod tests {
         let attachments = vec![
             McpAttachment {
                 name: "mem0".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: None,
             },
             McpAttachment {
                 name: "canopy".into(),
-                url: "http://host.docker.internal:7000".into(),
+                url: "https://mcp.example.com:7000".into(),
                 token: None,
             },
         ];
@@ -822,8 +744,8 @@ mod tests {
         let servers = parsed.get("mcp").unwrap().as_object().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers["mem0"]["type"], "remote");
-        assert_eq!(servers["mem0"]["url"], "http://host.docker.internal:7777");
-        assert_eq!(servers["canopy"]["url"], "http://host.docker.internal:7000");
+        assert_eq!(servers["mem0"]["url"], "https://mcp.example.com:7777");
+        assert_eq!(servers["canopy"]["url"], "https://mcp.example.com:7000");
     }
 
     #[test]
@@ -831,12 +753,12 @@ mod tests {
         let attachments = vec![
             McpAttachment {
                 name: "with_token".into(),
-                url: "http://host.docker.internal:7777".into(),
+                url: "https://mcp.example.com:7777".into(),
                 token: Some("sk-test-1234".into()),
             },
             McpAttachment {
                 name: "no_token".into(),
-                url: "http://host.docker.internal:8888".into(),
+                url: "https://mcp.example.com:8888".into(),
                 token: None,
             },
         ];
@@ -854,30 +776,46 @@ mod tests {
     }
 
     #[test]
-    fn opencode_inject_sets_opencode_config_env_and_mount() {
+    fn opencode_inject_lands_a_config_file_under_the_guest_home_and_names_it() {
         let attachments = vec![McpAttachment {
             name: "smoke".into(),
-            url: "http://host.docker.internal:8000/mcp/".into(),
-            token: None,
+            url: "https://mcp.example.com:8000/mcp/".into(),
+            token: Some("sk-test-1234".into()),
         }];
-        let injection = opencode_inject(&attachments).unwrap();
-        assert!(injection.docker_mount.is_some());
-        assert!(
-            injection
-                .docker_mount
-                .as_ref()
-                .unwrap()
-                .contains("/etc/pillbox/opencode-mcp.json"),
-            "mount should target guest path: {:?}",
-            injection.docker_mount
-        );
-        assert_eq!(injection.extra_argv, Vec::<String>::new());
+        let injection = opencode_inject(&attachments, HOME).unwrap();
+        let [file] = injection.files.as_slice() else {
+            panic!("opencode needs exactly one config file");
+        };
+        assert_eq!(file.guest_path, "/home/pillbox/.pillbox/opencode-mcp.json");
+        assert_eq!(file.bytes, opencode_config_bytes(&attachments));
+        assert!(injection.argv.is_empty());
         assert_eq!(
-            injection.env_vars,
+            injection.env,
             vec![(
                 "OPENCODE_CONFIG".into(),
-                "/etc/pillbox/opencode-mcp.json".into()
+                "/home/pillbox/.pillbox/opencode-mcp.json".into()
             )]
         );
+    }
+
+    #[test]
+    fn claude_inject_points_mcp_config_at_its_guest_file_and_keeps_the_token_in_it() {
+        let attachments = vec![McpAttachment {
+            name: "mem0".into(),
+            url: "https://mcp.example.com/mcp".into(),
+            token: Some("sk-test-1234".into()),
+        }];
+        let injection = claude_inject(&attachments, HOME).unwrap();
+        let [file] = injection.files.as_slice() else {
+            panic!("claude needs exactly one config file");
+        };
+        assert_eq!(file.guest_path, "/home/pillbox/.pillbox/mcp.json");
+        assert_eq!(file.bytes, claude_config_bytes(&attachments));
+        assert_eq!(
+            injection.argv,
+            vec!["--mcp-config", "/home/pillbox/.pillbox/mcp.json"]
+        );
+        assert!(injection.env.is_empty());
+        assert!(injection.argv.iter().all(|a| !a.contains("sk-test-1234")));
     }
 }

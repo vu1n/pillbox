@@ -177,7 +177,7 @@ fn spec(
             vec![host.into()],
             None,
             Some(ca_dir.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             None,
         )),
         ownership: Some(repository::OwnershipSpec::bounded(owner, remaining_ms)),

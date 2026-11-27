@@ -38,12 +38,12 @@
 //!   "started_at": "2026-05-23T13:37:00Z",  // → OTel span.start_time
 //!   "ended_at":   "2026-05-23T13:42:11Z",  // → OTel span.end_time (terminal only)
 //!   "agent_id": "claude",
-//!   "backend": "docker",
+//!   "backend": "libkrun",
 //!   "label": null,
 //!   "startup_ms": 421,
 //!   "startup_stages": [
-//!     { "name": "docker_preflight", "duration_ms": 31 },
-//!     { "name": "container_start", "duration_ms": 390 }
+//!     { "name": "vmm_spawn", "duration_ms": 31 },
+//!     { "name": "attach_ready", "duration_ms": 390 }
 //!   ],
 //!   // Terminal-event-only fields (null on started / dropped):
 //!   "status": "ok",                        // → OTel status.code ("ok" | "error")
@@ -524,7 +524,7 @@ pub(crate) fn build_attributes(
         ("started_at", s_str(|s| &s.started_at)),
         ("ended_at", ended_at),
         ("agent_id", s_str(|s| &s.agent_id)),
-        ("backend", s_str(|s| &s.backend)),
+        ("backend", s_str(|s| s.substrate.label())),
         ("label", s_opt(|s| s.label.as_deref())),
         ("status", Some(AttrValue::Str(ty.status_code().to_string()))),
         ("reason", reason.map(AttrValue::Str)),

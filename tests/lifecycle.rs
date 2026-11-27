@@ -287,8 +287,8 @@ fn auth_list_reads_from_global_scope() {
 #[test]
 fn pillbox_toml_agent_field_picks_default() {
     // Without --agent, `pillbox run` should pick the descriptor's `agent`.
-    // We can't actually launch Docker, but the "no stored credentials"
-    // error mentions the resolved agent, which is enough to assert.
+    // The managed tier refuses every agent but opencode before any external
+    // access, naming the resolved agent, which is enough to assert.
     let home = TempDir::new().unwrap();
     let proj = TempDir::new().unwrap();
     assert_ok(
@@ -300,13 +300,16 @@ fn pillbox_toml_agent_field_picks_default() {
         "new eta",
     );
 
-    let out = run(home.path(), proj.path(), &["run"]);
-    // Will fail — either no Docker or no credentials. Either way the
-    // chosen agent must be codex.
+    let out = common::run_with_env(
+        home.path(),
+        proj.path(),
+        &[("PILLBOX_BACKEND", "managed")],
+        &["run"],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("codex") || stderr.contains("Docker") || stderr.contains("docker"),
-        "expected codex or docker reference; got: {stderr}"
+        stderr.contains("agent `codex`"),
+        "expected the resolved codex agent; got: {stderr}"
     );
     assert!(
         !stderr.contains("claude"),
@@ -332,7 +335,7 @@ fn bookmark_run_rejects_unsupported_backend_before_workspace_or_memory_work() {
         let out = common::run_with_env(
             home.path(),
             cwd.path(),
-            &[("PILLBOX_BACKEND", "docker")],
+            &[("PILLBOX_BACKEND", "managed")],
             &arguments,
         );
         assert_eq!(

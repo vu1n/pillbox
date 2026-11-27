@@ -139,7 +139,7 @@ impl WorkspaceConfig {
 pub(crate) struct RunnerConfig {
     /// Docker image reference (e.g. `ghcr.io/vu1n/pillbox-runner:vX.Y.Z`
     /// or a locally-built `pillbox:latest`). `None` falls back to the
-    /// CLI default — see [`crate::docker::default_runner_image`].
+    /// CLI default — see [`crate::sandbox::oci::default_runner_image`].
     /// Overridden by the `PILLBOX_RUNNER_IMAGE` env var.
     #[serde(default)]
     pub(crate) image: Option<String>,

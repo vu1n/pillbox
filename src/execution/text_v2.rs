@@ -438,8 +438,8 @@ fn resolve(
 
 /// The immutable id of the runner image this pillbox is configured to use.
 fn runner_image_id(pb: &Pillbox) -> Result<String> {
-    let (image, _) = crate::docker::resolve_runner_image(pb);
-    let id = crate::sandbox::libkrun::docker_image_id(&image)?;
+    let (image, _) = crate::sandbox::oci::resolve_runner_image(pb);
+    let id = crate::sandbox::oci::image_id(&image)?;
     ensure!(
         super::valid_digest(&id),
         "invalid runner image id for {image}"

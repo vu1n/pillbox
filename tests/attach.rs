@@ -3,12 +3,9 @@
 //! agent's output. **All `#[ignore]`d** — they spawn real subprocesses and are
 //! timing-sensitive, so they flake when the full `cargo test` suite saturates
 //! the CPU; run them deliberately on an idle machine with
-//! `cargo test --test attach -- --ignored` (the docker one also needs its
-//! external deps). They do not gate routine `cargo test`.
+//! `cargo test --test attach -- --ignored`. They do not gate routine `cargo test`.
 //!
 //!   - direct: a client on the pty-host's unix socket.
-//!   - relayed: a `pty-relay` child bridging that socket to its stdio (the
-//!     in-sandbox half of the docker transport, exercised without docker).
 //!
 //! The frame reader is hand-rolled (not the crate's `Frame`) so these also
 //! pin the wire format from the outside: `[type:u8][len:u32 BE][payload]`.
@@ -17,7 +14,7 @@ mod common;
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -112,7 +109,7 @@ fn connect_retry(sock: &std::path::Path) -> UnixStream {
 // agent) as subprocesses and waits on wall-clock windows. Reliable on an idle
 // machine, but flakes when the full `cargo test` suite saturates the CPU (the
 // subprocesses get starved past even the generous timeouts above). So it's
-// `#[ignore]`d — like the docker transport test below — and run deliberately:
+// `#[ignore]`d and run deliberately:
 // `cargo test --test attach -- --ignored`. It does NOT gate routine `cargo test`.
 #[test]
 #[ignore = "heavyweight + timing-sensitive; run with `cargo test --test attach -- --ignored`"]
@@ -125,116 +122,5 @@ fn direct_socket_attach_carries_agent_output() {
     assert!(
         found,
         "direct socket attach never carried the agent's marker output"
-    );
-}
-
-// Same as above — heavyweight, timing-sensitive, `#[ignore]`d out of the routine
-// gate; run with `cargo test --test attach -- --ignored`.
-#[test]
-#[ignore = "heavyweight + timing-sensitive; run with `cargo test --test attach -- --ignored`"]
-fn pty_relay_bridges_socket_to_stdio() {
-    let sock = unique_sock();
-    let _host = spawn_host(&sock);
-    // Wait until the host is listening, then run the relay against it.
-    let _ = connect_retry(&sock);
-    let mut relay = Command::new(common::pillbox_bin())
-        .args(["pty-relay", "--sock", sock.to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn pillbox pty-relay");
-    let stdout = relay.stdout.take().expect("relay stdout");
-    let _relay = KillOnDrop(relay);
-
-    let found = marker_seen(stdout);
-    let _ = std::fs::remove_file(&sock);
-    assert!(
-        found,
-        "pty-relay never bridged the host's framed output to stdio"
-    );
-}
-
-/// Full local-docker transport: launch the pty-host inside a real container,
-/// attach over a `docker exec` relay, and assert the agent's output + exit
-/// code propagate as frames. Ignored by default — needs docker + the runner
-/// image. Run: `cargo test --test attach -- --ignored`
-/// (override the image with `PILLBOX_TEST_RUNNER_IMAGE`).
-#[test]
-#[ignore = "requires docker + the runner image"]
-fn docker_transport_propagates_output_and_exit_code() {
-    const FRAME_EXIT: u8 = 8;
-    let image =
-        std::env::var("PILLBOX_TEST_RUNNER_IMAGE").unwrap_or_else(|_| "pillbox-runner:dev".into());
-    let sock = format!("/tmp/pb-it-{}.sock", std::process::id());
-
-    let cid = String::from_utf8(
-        Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "-w",
-                "/workspace",
-                &image,
-                "pillbox",
-                "pty-host",
-                "--sock",
-                &sock,
-                "--",
-                "bash",
-                "-c",
-            ])
-            // `pwd` proves the agent inherits the host's cwd (not $HOME).
-            .arg("pwd; printf 'PILLBOXPHASE2OK\\n'; sleep 1; exit 7")
-            .output()
-            .expect("docker run")
-            .stdout,
-    )
-    .expect("utf8 container id")
-    .trim()
-    .to_string();
-    assert!(!cid.is_empty(), "docker run -d produced no container id");
-
-    struct RmContainer(String);
-    impl Drop for RmContainer {
-        fn drop(&mut self) {
-            let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
-        }
-    }
-    let _rm = RmContainer(cid.clone());
-
-    // Relay over docker exec. Keep stdin open (hold the child) so the relay
-    // stays connected until the host closes after the Exit frame.
-    let mut relay = Command::new("docker")
-        .args(["exec", "-i", &cid, "pillbox", "pty-relay", "--sock", &sock])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("docker exec relay");
-    let mut stdout = relay.stdout.take().expect("relay stdout");
-    let _relay = KillOnDrop(relay);
-
-    let mut acc = Vec::new();
-    let mut exit_code = None;
-    while let Some((typ, payload)) = read_typed(&mut stdout) {
-        if typ == FRAME_EXIT && payload.len() == 4 {
-            exit_code = Some(i32::from_be_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]));
-        }
-        acc.extend_from_slice(&payload);
-    }
-
-    assert!(
-        acc.windows(MARKER.len()).any(|w| w == MARKER),
-        "agent output did not propagate through the docker transport"
-    );
-    assert!(
-        acc.windows(b"/workspace".len()).any(|w| w == b"/workspace"),
-        "agent did not start in the workspace cwd (got $HOME instead?)"
-    );
-    assert_eq!(
-        exit_code,
-        Some(7),
-        "agent exit code did not propagate as an Exit frame"
     );
 }

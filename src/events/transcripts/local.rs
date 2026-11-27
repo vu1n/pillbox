@@ -234,35 +234,6 @@ pub(crate) fn spawn_local_tailer(
     )
 }
 
-/// Tail an already-running session's transcript into `log` — for the gateway
-/// (`session subscribe`) to fill + stream a *detached* session's events while
-/// it serves, closing the drive (`session send`) + read loop on one session.
-/// Unlike [`spawn_local_tailer`] it does NOT exclude pre-existing files: the
-/// transcript may already be on disk (the agent's been running) or appear once
-/// a driver sends the first input. Host-side only (the transcript is on a
-/// bind-mounted home); `None` if the agent has no transcript parser.
-pub(crate) fn spawn_attach_tailer(
-    log: SessionLog,
-    home: &Path,
-    agent_id: &str,
-    guest_cwd: &str,
-    session_id: &str,
-) -> Option<TailerHandle> {
-    let harness = Harness::for_agent(agent_id)?;
-    let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
-    // Read-side filler takes the concrete local session log used by every
-    // placement.
-    Some(spawn_tailer(
-        TailPersistence::BestEffort(Some(log)),
-        watch_root,
-        scope_dir,
-        harness,
-        session_id.to_string(),
-        true,
-        Ok(HashSet::new()), // include existing — the session may already be running
-    ))
-}
-
 /// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
 /// newest not in `exclude`), then follow it into the sinks until stopped.
 fn spawn_tailer(

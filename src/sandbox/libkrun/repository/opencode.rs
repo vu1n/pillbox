@@ -148,7 +148,7 @@ fn spec(
             hosts.to_vec(),
             None,
             Some(ca_dir.to_string_lossy().into_owned()),
-            None,
+            Vec::new(),
             None,
         )),
         ownership: Some(OwnershipSpec {
@@ -388,7 +388,7 @@ mod tests {
         assert!(spec.shares.is_empty());
         let egress = spec.egress.unwrap();
         assert_eq!(egress.allowlist, ["api.z.ai", "models.dev"]);
-        assert!(egress.refresh.is_none() && egress.local_forward_port.is_none());
+        assert!(egress.refresh.is_none() && egress.local_forward_ports.is_empty());
         assert!(spec.ownership.unwrap().is_bounded());
         let mut wide = input();
         wide.hosts = vec!["*.example.com".into()];

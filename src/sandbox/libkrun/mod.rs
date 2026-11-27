@@ -1,7 +1,7 @@
 //! Local microVM backend (libkrun) — **feature-gated** (`libkrun`); Linux/KVM + macOS/HVF.
 //!
 //! The graduation of the `libkrun-boot` proof crate into a real [`SandboxBackend`]
-//! (feature-gated; the default build + Docker path stay untouched).
+//! (feature-gated).
 //! [`LibkrunBackend::run`] boots a microVM and runs the agent end-to-end: a
 //! CoW-cloned + secret-scrubbed workspace and the agent's auth home; the agent
 //! under an in-guest `pillbox pty-host` serving the `Frame` protocol over vsock
@@ -35,7 +35,6 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -60,7 +59,7 @@ mod vault;
 // The control verbs (attach/teardown/§0 accessors) are driven through the
 // `LiveSession` plane (`LibkrunLiveSession`); only the one-shot grader, which has
 // no session record to dispatch on, is still reached directly.
-pub(crate) use session::{score_in_sandbox, LibkrunLiveSession};
+pub(crate) use session::score_in_sandbox;
 
 // Host-capability probes shared by `doctor` and the launch preflight.
 pub(crate) use host::{
@@ -70,6 +69,7 @@ pub(crate) use host::{
 use crate::agents::AgentSpec;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::sandbox::oci;
 use crate::workspace::cow::{cow_clone_dir, CloneMethod};
 use egress::EgressSpec;
 
@@ -199,12 +199,11 @@ struct VsockAttach {
     listen: bool,
 }
 
-/// The local microVM backend. Selected for a local run when the `libkrun`
-/// feature is built in and `PILLBOX_BACKEND=libkrun` is set.
+/// The local microVM backend: the default substrate (`PILLBOX_BACKEND` unset or
+/// `libkrun`) on a build with the `libkrun` feature.
 ///
-/// Mirrors `docker::run`'s creds + workspace + env pipeline (share the
-/// agent's auth home, CoW-clone + secret-scrub the workspace, compose the run
-/// env), launches the agent under an in-guest pty-host serving the `Frame`
+/// Shares the agent's auth home, CoW-clones + secret-scrubs the workspace,
+/// composes the run env, launches the agent under an in-guest pty-host serving the `Frame`
 /// protocol over vsock (L4), and attaches a userspace egress stack with a DNS
 /// fence (L5a). The vault-v2 MITM (terminate + cred swap + forward) and §0 are
 /// the remaining slices — L5b consumes the DNS-pin this egress stack populates.
@@ -693,14 +692,12 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
             spec.id
         ),
     )
-    .with_next("retry on the docker backend: PILLBOX_BACKEND=docker")
     .into()
 }
 
 const ROOTFS_CACHE_VERSION: &str = "v5";
 const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v5";
 const MAX_ROOTFS_MARKER_BYTES: u64 = 1_024;
-const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
 
 /// Never hand a cached generation to a VMM; each caller owns a writable clone.
 fn materialize_rootfs(resolved: &Pillbox) -> Result<rootfs::PrivateRootfs> {
@@ -732,7 +729,7 @@ fn materialize_rootfs_base(
     resolved: &Pillbox,
     backing: &rootfs_backing::RootfsBacking,
 ) -> Result<PathBuf> {
-    let (image, _) = crate::docker::resolve_runner_image(resolved);
+    let (image, _) = oci::resolve_runner_image(resolved);
     let rootfs_root = backing.namespace(
         "rootfs",
         rootfs_backing::RootfsBacking::ordinary_deadline()?,
@@ -742,7 +739,7 @@ fn materialize_rootfs_base(
     // unreachable (daemon down, image pruned) we can't compute the live key, but
     // a prior materialization may already be on disk — boot from the newest
     // cached generation for this image rather than hard-failing on the daemon.
-    let image_id = match docker_image_id(&image) {
+    let image_id = match oci::image_id(&image) {
         Ok(id) => id,
         Err(_) => {
             if let Some(cache) = find_cached_rootfs(&rootfs_root, &image) {
@@ -771,41 +768,22 @@ fn materialize_rootfs_base(
         .with_context(|| format!("create {}", image_root.display()))?;
     eprintln!("pillbox: materializing runner rootfs from {image} (one-time)…");
 
-    let create = Command::new("docker")
-        .args(["create", &image])
-        .output()
-        .context("docker create (is the runner image present + docker running?)")?;
-    if !create.status.success() {
-        bail!(
-            "docker create {image} failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
-        );
-    }
-    let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    let cid = oci::create_container(&image)?;
     if let Err(cause) = std::fs::create_dir(&generation) {
-        let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+        oci::remove_container(&cid);
         return Err(cause).with_context(|| format!("create {}", generation.display()));
     }
     if let Err(cause) = std::fs::create_dir(&cache) {
-        let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+        oci::remove_container(&cid);
         let _ = std::fs::remove_dir(&generation);
         return Err(cause).with_context(|| format!("create {}", cache.display()));
     }
 
-    // Stream the container filesystem straight into the cache dir. Capture both
-    // commands' stdio: `docker rm` echoes the container id, and `run --json`'s
-    // machine-readable stdout must stay pure JSON (a leaked line corrupts the
-    // surface and the caller loses the session id).
-    let export = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "docker export {} | tar -C {} {ROOTFS_TAR_EXTRACT_FLAG} -",
-            shell_quote(&cid),
-            shell_quote(&cache.to_string_lossy())
-        ))
-        .output()
-        .map(|o| o.status);
-    let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+    // Stream the container filesystem straight into the cache dir. Both commands'
+    // stdio is captured: `run --json`'s machine-readable stdout must stay pure JSON
+    // (a leaked line corrupts the surface and the caller loses the session id).
+    let export = oci::export_container_into(&cid, &cache);
+    oci::remove_container(&cid);
     match export {
         Ok(s) if s.success() => {}
         // Clear the half-populated cache so the next run retries from scratch
@@ -829,22 +807,17 @@ fn materialize_rootfs_base(
 /// Accurate, actionable error when the runner image can't be resolved to an id
 /// AND no cached rootfs exists. libkrun builds its rootfs by `docker export`-ing
 /// the runner image, so a missing image is fatal here — but the *fix* differs by
-/// cause. Re-probe the daemon (the inspect in `docker_image_id` already failed)
+/// cause. Re-probe the daemon (the inspect in `oci::image_id` already failed)
 /// so we never tell a user with Docker running to "start Docker" when the real
 /// fix is a `docker pull` or pointing `[runner] image` at a cached tag. Replaces
 /// the old blanket "docker unavailable" message, which sent users down the wrong
 /// path on the far more common image-absent case.
 fn rootfs_unavailable_error(image: &str) -> anyhow::Error {
-    let stderr = Command::new("docker")
-        .args(["image", "inspect", image, "--format", "{{.Id}}"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-        .unwrap_or_default();
-    // Empty stderr ⇒ the `docker` invocation itself couldn't run (binary missing /
-    // exec error) ⇒ treat as unreachable, same as an explicit connect error.
-    let daemon_down = stderr.is_empty() || stderr.contains("Cannot connect to the Docker daemon");
-    let (summary, next) =
-        rootfs_unavailable_message(daemon_down, image, &crate::docker::list_runner_images());
+    let (summary, next) = rootfs_unavailable_message(
+        oci::daemon_unreachable(image),
+        image,
+        &oci::list_runner_images(),
+    );
     PillboxError::resource("rootfs materialize", summary)
         .with_next(next)
         .into()
@@ -927,24 +900,6 @@ fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
         }
     }
     best.map(|(cache, _)| cache)
-}
-
-pub(crate) fn docker_image_id(image: &str) -> Result<String> {
-    let out = Command::new("docker")
-        .arg("image")
-        .arg("inspect")
-        .arg(image)
-        .arg("--format")
-        .arg("{{.Id}}")
-        .output()
-        .with_context(|| format!("inspect runner image {image}"))?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    }
-    bail!(
-        "docker image inspect {image} failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
 }
 
 fn rootfs_image_ref_key(image: &str) -> String {
@@ -1149,9 +1104,10 @@ mod tests {
         env_fork_left_real_unstubbed, find_cached_rootfs, krun_cache_dir, oauth_swap_hosts,
         rootfs_generation_dir, rootfs_image_ref_key, rootfs_image_root, rootfs_marker_contents,
         rootfs_marker_matches, rootfs_unavailable_message, SwapPair, MAX_ROOTFS_MARKER_BYTES,
-        ROOTFS_CACHE_MARKER_MAGIC, ROOTFS_CACHE_VERSION, ROOTFS_TAR_EXTRACT_FLAG,
+        ROOTFS_CACHE_MARKER_MAGIC, ROOTFS_CACHE_VERSION,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
+    use crate::sandbox::oci::ROOTFS_TAR_EXTRACT_FLAG;
 
     fn codec_stub(
         provider_id: &str,

@@ -12,8 +12,6 @@
 //! location can't drift apart across call sites. Everything that does ride the
 //! cmdline must stay printable-ASCII-pure (tested).
 
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -47,13 +45,7 @@ pub(super) fn boot_channel(
     let script = format!("{}\n", content.trim_end_matches('\n'));
     // The script can carry plaintext secret values (env exports) — create it
     // owner-only from the start rather than chmod after the fact.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dir.join(BOOT_SCRIPT))
-        .and_then(|mut f| f.write_all(script.as_bytes()))
+    crate::guest_files::write(dir, Path::new(BOOT_SCRIPT), script.as_bytes(), 0o600)
         .context("write guest boot script")?;
     #[cfg(target_os = "macos")]
     if matches!(ownership, MountedShareOwnership::GuestRootClone) {

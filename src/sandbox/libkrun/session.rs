@@ -914,17 +914,16 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }
     })?;
     guest_env.extend(stub_env);
-    let (mcp_argv, mcp_hosts, mcp_forward_ports) = match mcp {
+    let (mcp_files, mcp_argv, mcp_hosts, mcp_forward_ports) = match mcp {
         Some(GuestMcp {
             injection,
             hosts,
             forward_ports,
         }) => {
-            place_mcp_files(&injection.files, &creds_share)?;
             guest_env.extend(injection.env);
-            (injection.argv, hosts, forward_ports)
+            (injection.files, injection.argv, hosts, forward_ports)
         }
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        None => Default::default(),
     };
 
     // The guest boot script: env exports, NIC + CA + workspace mount, then exec
@@ -952,7 +951,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let exports = boot::env_exports(&guest_env)?;
     let boot_script = format!("{exports}{preamble}; exec {pty_host} {agent}");
 
-    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script, &mcp_files)?;
+    place_mcp_files(&mcp_files, &creds_share)?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
@@ -1134,18 +1134,27 @@ fn env_fork_creds(
 /// real in a guest-readable channel is exfiltratable by a prompt-injected agent
 /// — fail fast rather than silently leak if a future change crosses channels.
 /// Raw env values are scanned pre-quoting (shell-quoting can mangle the needle,
-/// e.g. `'` → `'\''`); the rendered script catches argv/path interpolations.
+/// e.g. `'` → `'\''`); the rendered script catches argv/path interpolations;
+/// `guest_files` are the files placed into the guest home (MCP configs).
 pub(super) fn ensure_env_fork_sealed(
     swap_pairs: &[SwapPair],
     guest_env: &[(String, String)],
     boot_script: &str,
+    guest_files: &[crate::agents::mcp::GuestFile],
 ) -> Result<()> {
+    // No real half of a swap pair appears in any channel the guest can read: env, boot script, or a placed file.
     for pair in swap_pairs {
-        if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || boot_script.contains(&pair.real)
+        let needle = pair.real.as_bytes();
+        let in_file =
+            |bytes: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle);
+        if guest_env.iter().any(|(_, v)| v.contains(&pair.real))
+            || boot_script.contains(&pair.real)
+            || guest_files.iter().any(|f| in_file(&f.bytes))
         {
             bail!(
                 "libkrun env-fork violated: a real credential reached a guest-readable \
-                 channel (the boot script) — it must travel only via the MITM stdin swap"
+                 channel (the boot script or a file placed in the guest) — it must travel \
+                 only via the MITM stdin swap"
             );
         }
     }
@@ -1309,9 +1318,6 @@ fn mcp_route(mcp: &crate::agents::McpAttachment) -> Result<McpRoute> {
 /// Land an MCP injection's guest files in the cloned home share (mounted at
 /// [`GUEST_HOME`]), before the boot channel prepares the clone for the guest.
 fn place_mcp_files(files: &[crate::agents::mcp::GuestFile], home_share: &Path) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
     for file in files {
         let rel = file
             .guest_path
@@ -1328,23 +1334,9 @@ fn place_mcp_files(files: &[crate::agents::mcp::GuestFile], home_share: &Path) -
                     file.guest_path
                 )
             })?;
-        let host = home_share.join(rel);
-        if let Some(parent) = host.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
         // An MCP file may carry a bearer token: owner-only, even when it replaces one.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&host)
-            .and_then(|mut f| {
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                f.write_all(&file.bytes)
-            })
-            .with_context(|| format!("write MCP file {}", host.display()))?;
+        crate::guest_files::write(home_share, rel, &file.bytes, 0o600)
+            .with_context(|| format!("write MCP file `{}`", file.guest_path))?;
     }
     Ok(())
 }
@@ -1901,7 +1893,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
     let boot_script = format!("{exports}{preamble}; exec {argv} > {events_q}");
-    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script, &[])?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
@@ -4352,6 +4344,33 @@ mod tests {
             config["mcpServers"]["remote"]["url"],
             "https://mcp.example.com/mcp"
         );
+    }
+
+    #[test]
+    fn the_seal_refuses_a_real_credential_in_any_guest_readable_channel() {
+        let pairs = [super::super::SwapPair {
+            stub: "stub-token".into(),
+            real: "real-vaulted-token".into(),
+            hosts: vec!["api.example.com".into()],
+        }];
+        let file = |bytes: &[u8]| crate::agents::mcp::GuestFile {
+            guest_path: format!("{GUEST_HOME}/.pillbox/mcp.json"),
+            bytes: bytes.to_vec(),
+        };
+        let clean_env = [("A".to_string(), "stub-token".to_string())];
+        let stub_file = file(br#"{"headers":{"Authorization":"Bearer stub-token"}}"#);
+        ensure_env_fork_sealed(&pairs, &clean_env, "exec agent", &[stub_file]).unwrap();
+
+        // An MCP token equal to a vaulted real credential, in the placed file.
+        let real_file = file(br#"{"headers":{"Authorization":"Bearer real-vaulted-token"}}"#);
+        assert!(ensure_env_fork_sealed(&pairs, &clean_env, "exec agent", &[real_file]).is_err());
+        // The same token through env (codex's MCP channel) or the script.
+        let real_env = [(
+            "PILLBOX_MCP_TOKEN_X".to_string(),
+            "real-vaulted-token".to_string(),
+        )];
+        assert!(ensure_env_fork_sealed(&pairs, &real_env, "exec agent", &[]).is_err());
+        assert!(ensure_env_fork_sealed(&pairs, &[], "exec agent real-vaulted-token", &[]).is_err());
     }
 
     #[test]

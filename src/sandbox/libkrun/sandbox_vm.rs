@@ -243,7 +243,7 @@ fn sealed_boot_script(
             exec_host = boot::exec_host_cmd(EXEC_PORT, Some(uid)),
         )
     };
-    ensure_env_fork_sealed(swap_pairs, guest_env, &script)?;
+    ensure_env_fork_sealed(swap_pairs, guest_env, &script, &[])?;
     Ok(script)
 }
 

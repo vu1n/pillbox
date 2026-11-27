@@ -587,13 +587,16 @@ pub(crate) fn lookup(action: &'static str, id: &str) -> Result<&'static AgentSpe
 }
 
 fn finalize_claude_onboarding(home: &Path) -> Result<()> {
-    let path = home.join(".claude.json");
-    if !path.exists() {
+    // The `auth login` guest just had this home mounted read-write.
+    let rel = Path::new(".claude.json");
+    let path = home.join(rel);
+    let Some(raw) =
+        crate::guest_files::read(home, rel).with_context(|| format!("read {}", path.display()))?
+    else {
         return Ok(());
-    }
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    };
     let mut value: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
@@ -603,7 +606,8 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
     );
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
-    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    crate::guest_files::write(home, rel, serialized.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -611,34 +615,21 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 /// The authoritative auth home is never touched: stale rollouts are removed
 /// only from the clone, and only this run's unique guest workspace is trusted.
 fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
-    let sessions = home.join(".codex/sessions");
-    match fs::remove_dir_all(&sessions) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "clear cloned Codex transcript history {}",
-                    sessions.display()
-                )
-            });
-        }
-    }
+    crate::guest_files::remove_tree(home, Path::new(".codex/sessions"))
+        .context("clear cloned Codex transcript history")?;
 
     // Mutate the complete TOML document so unrelated settings and project
     // entries survive preparation of this one workspace.
-    let config_path = home.join(".codex/config.toml");
-    let mut config = match fs::read_to_string(&config_path) {
-        Ok(text) => text
+    let config_rel = Path::new(".codex/config.toml");
+    let config_path = home.join(config_rel);
+    let mut config = match crate::guest_files::read(home, config_rel)
+        .with_context(|| format!("read cloned Codex config {}", config_path.display()))?
+    {
+        Some(bytes) => String::from_utf8(bytes)
+            .context("cloned Codex config is not UTF-8")?
             .parse::<toml::Value>()
             .with_context(|| format!("parse cloned Codex config {}", config_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            toml::Value::Table(toml::map::Map::new())
-        }
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("read cloned Codex config {}", config_path.display()));
-        }
+        None => toml::Value::Table(toml::map::Map::new()),
     };
     let root = config
         .as_table_mut()
@@ -654,12 +645,13 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
         .as_table_mut()
         .context("cloned Codex project trust entry must be a TOML table")?;
     project.insert("trust_level".into(), toml::Value::String("trusted".into()));
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create cloned Codex config dir {}", parent.display()))?;
-    }
-    fs::write(&config_path, toml::to_string(&config)?)
-        .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
+    crate::guest_files::write(
+        home,
+        config_rel,
+        toml::to_string(&config)?.as_bytes(),
+        0o600,
+    )
+    .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
     Ok(())
 }
 
@@ -712,12 +704,16 @@ fn get_or_create_object<'a>(
 }
 
 fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
-    let path = home.join(".claude.json");
-    let mut value: serde_json::Value = if path.exists() {
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?
-    } else {
-        serde_json::json!({})
+    // The live agent home is mounted read-write into the `auth login` guest.
+    let rel = Path::new(".claude.json");
+    let path = home.join(rel);
+    let mut value: serde_json::Value = match crate::guest_files::read(home, rel)
+        .with_context(|| format!("read {}", path.display()))?
+    {
+        Some(raw) => {
+            serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?
+        }
+        None => serde_json::json!({}),
     };
     let root = value
         .as_object_mut()
@@ -730,7 +726,8 @@ fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
     entry.insert("hasCompletedProjectOnboarding".into(), true.into());
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
-    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    crate::guest_files::write(home, rel, serialized.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 

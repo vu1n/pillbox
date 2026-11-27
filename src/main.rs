@@ -37,6 +37,7 @@ mod errors;
 mod events;
 mod execution;
 mod gateway;
+mod guest_files;
 mod memory;
 mod paths;
 mod pillbox;

@@ -636,8 +636,11 @@ fn stub_oauth_creds(
     let clone = cow_clone_home(home)?;
     let mut pairs = Vec::new();
     let mut access_stub = None;
-    let creds_file = clone.join(spec.cred_sentinel);
-    if let Ok(text) = std::fs::read_to_string(&creds_file) {
+    let creds_rel = Path::new(spec.cred_sentinel.path());
+    let text = crate::guest_files::read(&clone, creds_rel)
+        .context("read the cloned credential file")?
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    if let Some(text) = text {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
             // The provider registry is the sole OAuth shape dispatch. Host-proxy
             // and libkrun stubbing are distinct codec operations because libkrun
@@ -655,9 +658,8 @@ fn stub_oauth_creds(
             }
             if !pairs.is_empty() {
                 let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
-                // The clone's file is already 0600 (clonefile preserves perms) and
-                // `write` truncates in place without changing them.
-                std::fs::write(&creds_file, body).context("write stubbed creds")?;
+                crate::guest_files::write(&clone, creds_rel, body.as_bytes(), 0o600)
+                    .context("write stubbed creds")?;
             }
         }
     }

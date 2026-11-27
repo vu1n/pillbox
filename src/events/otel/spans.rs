@@ -7,7 +7,7 @@
 //!   wrapper) so it has real duration; without it the log record
 //!   still ships, the span doesn't. The host's later `session.dropped`
 //!   is not a duplicate — the sandbox already closed the span.
-//! - **Host root, up-front** ([`emit_local_root_span`]): local-docker
+//! - **Host root, up-front** ([`emit_local_root_span`]): local
 //!   foreground runs have no wrapper, so the host opens the root span
 //!   itself at session start (Unset status) — see that fn for why
 //!   up-front rather than at exit.
@@ -91,7 +91,7 @@ fn emit_session_span(session_id: &str, start: SystemTime, status: Status, attrs:
     span.end();
 }
 
-/// Emit the root `session` span from the HOST for a local-docker
+/// Emit the root `session` span from the HOST for a local
 /// foreground run, at session *start*. The sandbox-only [`sink_emit`]
 /// path can't serve this case: foreground local runs have no wrapper,
 /// so no `PILLBOX_SESSION_STARTED_AT` and no `Emitter::Sandbox`

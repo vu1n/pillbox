@@ -56,15 +56,8 @@ mod session;
 pub(crate) mod text_harness;
 mod vault;
 
-// The control verbs (attach/teardown/§0 accessors) are driven through the
-// `LiveSession` plane (`LibkrunLiveSession`); only the one-shot grader, which has
-// no session record to dispatch on, is still reached directly.
-pub(crate) use session::score_in_sandbox;
-
-// Host-capability probes shared by `doctor` and the launch preflight.
-pub(crate) use host::{
-    disk_headroom, runtime_deps_present, virtualization_available, MIN_HEADROOM_BYTES,
-};
+// Host-capability probes the launch preflight shares with `doctor`.
+use host::{disk_headroom, runtime_deps_present, MIN_HEADROOM_BYTES};
 
 use crate::agents::AgentSpec;
 use crate::errors::PillboxError;
@@ -212,6 +205,23 @@ pub(crate) struct LibkrunBackend;
 /// Where the guest writes the vault CA cert (system trust dir → `update-ca-certificates`;
 /// also `NODE_EXTRA_CA_CERTS` for Node agents). The cert is public — the key never leaves the host.
 const GUEST_CA_PATH: &str = "/usr/local/share/ca-certificates/pillbox-vault.crt";
+
+/// The libkrun backend's internal re-exec entrypoints, dispatched on argv[1]
+/// before the CLI parses; returns only when argv names neither. Not user-facing
+/// commands: the backend sets their argv.
+///
+/// - `__krun-vmm`: the VMM child *becomes* the microVM. `krun_start_enter`
+///   doesn't return — it `exit()`s with the guest's code when the VM shuts down —
+///   so the backend spawns this hidden subprocess and supervises it from the
+///   parent (which keeps a live process for attach + cleanup).
+/// - `__repository-image`: the image-preparation guardian.
+pub(crate) fn child_main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("__krun-vmm") => vmm_child_main(),
+        Some("__repository-image") => repository::image_child_main(),
+        _ => {}
+    }
+}
 
 /// The VMM child (`pillbox __krun-vmm <spec.json>`). Reads the [`VmSpec`],
 /// configures a libkrun context (root + virtio-fs shares + exec), and enters it.

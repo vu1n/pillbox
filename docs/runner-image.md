@@ -1,10 +1,10 @@
 # Runner image
 
-> **Note (2026-06-01):** the image *contents* (the bundled agents + tools) carry
-> forward, but the **Docker-container framing** below is deprecated — under the
-> [libkrun pivot](./libkrun-sandbox.md) the OCI image becomes a **microVM rootfs**
-> (krunvm/crun-krun style), or a slimmer custom rootfs. Build/publish mechanics
-> change; what's *in* the image mostly doesn't.
+> **Note (2026-11-27):** the image is never run as a container by pillbox: the
+> Docker backend is deleted, and the OCI image is exported as the libkrun
+> **microVM rootfs** ([libkrun-sandbox.md](./libkrun-sandbox.md)). Docker builds
+> it and `src/sandbox/oci.rs` resolves and exports it; any container-run framing
+> below is history.
 
 The runner image is the OCI source that libkrun materializes as a microVM rootfs. Source lives in [`runner/Dockerfile`](../runner/Dockerfile);
 canonical amd64 and arm64 builds are published to GitHub Container Registry on
@@ -86,9 +86,9 @@ Plus the system tooling agents tend to reach for: `bash`,
 
 And **`pillbox` itself** at `/usr/local/bin/pillbox`, compiled from the
 repo in a multi-stage build. The in-sandbox pillbox runs the interactive
-attach pty-host (`pillbox pty-host`), the per-attach relay (`pillbox
-pty-relay`), and the event emitter / `session done` wrapper — the
-in-sandbox role both local backends rely on. Because the image
+attach pty-host (`pillbox pty-host`), the exec host, and the event
+emitter / `session done` wrapper — the in-guest role the libkrun microVM
+relies on. Because the image
 embeds the binary, it is rebuilt when `src/**` or `Cargo.{toml,lock}`
 change, not only on `runner/Dockerfile` edits.
 
@@ -222,7 +222,7 @@ image, pillbox CLI assumes:
   and bind-mounts the agent's persistent auth state there);
   the image doesn't need to pre-create that path.
 - `pillbox` on `$PATH` — the interactive attach transport launches
-  `pillbox pty-host` / `pillbox pty-relay` inside the sandbox. A
+  `pillbox pty-host` inside the sandbox. A
   version skew between host and in-sandbox pillbox is tolerated within
   a frame `PROTO_VERSION`; layer on the canonical image to stay matched.
 - `update-ca-certificates` available **and** an entrypoint that runs

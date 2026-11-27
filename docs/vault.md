@@ -1,10 +1,12 @@
 # Credential vault (`--vault`)
 
-> **Note (2026-06-01):** this describes the shipped stub-swap MITM. The
-> [libkrun pivot](./libkrun-sandbox.md) hardens it to **vault v2**: the real key
-> is substituted only on a **TLS handshake verified to an allowlisted host**
-> (binds the credential to the destination), with **default-deny egress**, living
-> in the guest's userspace egress stack instead of a per-container sidecar.
+> **Note (2026-11-27):** credential release lives only in the libkrun microVM's
+> egress stack (**vault v2**, see [libkrun-sandbox.md](./libkrun-sandbox.md)): the
+> real key is substituted only on a **TLS handshake verified to an allowlisted
+> host** (binds the credential to the destination), with sole-egress fencing, in
+> the supervised VMM child. The host lease plane the removed Docker backend used
+> is gone: `pillbox sidecar` is an egress-policy proxy that holds no credentials
+> and leases no stubs.
 
 The vault keeps real Anthropic OAuth tokens on the host while the
 sandboxed claude sees stubs. A pillbox-managed MITM HTTPS proxy swaps
@@ -29,7 +31,7 @@ after (blast radius = one run). An *opt-in stable* CA persists at
 `<state_dir>/vault/` if you run `pillbox vault ca` (e.g. to pre-trust it); when
 present, runs reuse it. A run inside project `myapp` would persist a stable CA at
 `~/.pillbox/projects/<key>/vault/pillbox-vault-ca.crt`; `--pillbox global` uses
-`~/.pillbox/global/vault/`. Leases never collide across pillboxes. See
+`~/.pillbox/global/vault/`. See
 [§Broker model](#broker-model-v2--the-policy-bound-egress-broker).
 
 > **Egress note:** by default the proxy MITMs only matched hosts
@@ -39,13 +41,9 @@ present, runs reuse it. A run inside project `myapp` would persist a stable CA a
 > closes that gap and is now shipped as **opt-in**: `pillbox run --vault --egress-deny`
 > blocks every host with no credential provider that isn't on `--egress-allow`
 > (the same allowlist arms the libkrun egress fence). Default-off preserves the
-> permissive behavior. See also [security.md](./security.md). The vault runs
-> **on the host** today:
-> the MITM proxy is an in-process server bound to a localhost port that
-> the sandbox reaches over the loopback bridge. Because it lives in the
-> CLI process, a vaulted run must stay in the foreground —
-> `--detach` + `--vault` is unsupported (the proxy can't outlive the
-> CLI).
+> permissive behavior. See also [security.md](./security.md). On libkrun the
+> MITM lives in the VMM child, not the CLI, so `--detach` + `--vault` combine:
+> the vault outlives the launching CLI with the VM.
 >
 > **Consequence for the swarm-memory scrub** ([swarm-memory.md](./swarm-memory.md)):
 > that pipeline exact-matches outbound content against the vault's *real* secret
@@ -86,13 +84,11 @@ pillbox run --vault
 pillbox run --agent codex --vault
 ```
 
-That's it. The first `--vault` run generates the CA at
-`<pillbox>/vault/pillbox-vault-ca.crt` and the matching private key,
-leases a per-sandbox stub pair, starts an in-process MITM proxy bound
-to a random localhost port, and wires `HTTPS_PROXY` +
-`NODE_EXTRA_CA_CERTS` into the container.
-
-The CA persists across runs — sandboxes share the trust root.
+That's it. A `--vault` run mints a CA (per run, unless a stable one exists — see
+above), env-forks the agent's auth home into a CoW clone with **stubbed** OAuth
+tokens, installs the CA in the guest (`NODE_EXTRA_CA_CERTS` + the system store),
+and hands the stub→real swap pairs to the MITM in the VMM child. The guest's DNS
+resolves allowlisted hosts to the gateway, so their TLS terminates in that MITM.
 
 ## What's vaulted
 
@@ -113,8 +109,8 @@ The CA persists across runs — sandboxes share the trust root.
 
 Two vault flavors:
 
-- **Agent OAuth** (`pillbox run --vault`): proxy provisions a stub credentials FILE bind-mounted over the agent's real auth file. One lease per `--vault` run.
-- **Secret API key** (`pillbox secret add NAME --vault` then `pillbox run --with NAME`): proxy provisions a stub VALUE injected as an env var in place of the real secret. One lease per vaulted `--with` per run.
+- **Agent OAuth** (`pillbox run --vault`; always on for libkrun): the guest's auth home is a CoW clone whose OAuth tokens are stubbed; the MITM swaps each stub for the real token on its bound host.
+- **Secret API key** (`pillbox secret add NAME --vault` then `pillbox run --with NAME`): the guest env carries a stub VALUE in place of the real secret; the MITM swaps it on the secret's `vault.host`.
 
 Both kinds coexist in the same run — e.g. `pillbox run --vault --with ANTHROPIC_API_KEY` runs the agent with vaulted OAuth tokens AND a vaulted API key on the same `api.anthropic.com` host. AnthropicProvider branches by header (`Authorization: Bearer` → OAuth, `x-api-key` → API key).
 
@@ -125,8 +121,8 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 > **Status:** built for **claude and codex** on both vault paths. Pre-run refresh
 > uses the shared `OAuthCodec` + `TokenStore` broker. The maintained libkrun MITM
 > also performs JIT refresh through that same broker for sessions that outlive an
-> access token. The deprecated host proxy retains pre-run refresh and rejects
-> guest token-endpoint requests rather than capturing their responses.
+> access token. The `pillbox sidecar` proxy rejects guest token-endpoint requests
+> rather than capturing their responses.
 
 The problem the in-proxy refresh design hit: if the guest agent refreshes its own
 OAuth token (a single-use `refresh_token` grant), pillbox has to intercept, swap,
@@ -159,8 +155,8 @@ The broker model removes the trigger: **the agent never refreshes.** Three piece
 3. **Guest rotation refusal.** Anthropic and Codex token endpoints are recognized
    by provider-owned matchers and return a local 403. The libkrun credentials file
    contains a shape-valid refresh stub, but there is no refresh-token release pair;
-   only the broker can read or POST the real refresh token. The host proxy likewise
-   has no response-side mutation or teardown persistence path. The libkrun MITM
+   only the broker can read or POST the real refresh token. The sidecar proxy
+   likewise has no response-side mutation or teardown persistence path. The libkrun MITM
    classifies every HTTP/1.1 request line on a connection until a WebSocket
    upgrade is answered `101`; after that the guest's frames relay raw (no swap),
    and guest bytes sent before a refused upgrade fail closed.
@@ -170,10 +166,9 @@ The broker model removes the trigger: **the agent never refreshes.** Three piece
 > **Status:** the decision core + CLI are **built** — `pillbox run --vault
 > --egress-deny [--egress-allow HOST]…` enforces default-deny at the proxy
 > (`src/vault/egress.rs`; off unless `--egress-deny`). The **libkrun backend
-> fence** is already sole-egress, and the **SSRF/DNS-rebind guard** is built on
-> **both** forward legs (libkrun's MITM and the docker broker's hudsucker dial),
-> as is the **per-run CA** (both backends). Remaining: only the **docker**
-> container-network fence (by design, not a TODO — see below). Design validated
+> fence** is sole-egress, and the **SSRF/DNS-rebind guard** is built on **both**
+> forward legs (libkrun's MITM and the sidecar proxy's hudsucker dial), as is the
+> **per-run CA**. Design validated
 > by a deep-research pass (`wmh2zb1y4`) — see
 > [§Prior art](#prior-art--adopt-vs-build).
 
@@ -207,7 +202,7 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   blinds SNI, domain-fronting), so it must be paired with the backend egress
   fence (below) and DNS/IP controls. **Built — `--vault --egress-deny`.**
 - **Destination-bound release** — a stub is only swapped on the host it's bound
-  to (a provider intercepts only its own host(s); a leased `--with` secret
+  to (a provider intercepts only its own host(s); a vaulted `--with` secret
   records its `vault.host`). A stub replayed on `evil.example` is never swapped
   *and* (under default-deny) blocked. **Already true; default-deny closes the
   exfil channel.**
@@ -218,26 +213,22 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   (`src/sandbox/libkrun/egress.rs`): the DNS fence NXDOMAINs every non-allowlisted
   name, allowlisted names resolve only to the in-VMM MITM gateway, and a
   hardcoded-IP / forged-SNI dial fails the pin gate — so all egress is *forced*
-  through the broker or fails closed. On **docker** only the proxy-level
-  default-deny applies — and *by design, not as a TODO*: docker's network can't
-  be cleanly egress-fenced (Docker Desktop runs containers in a LinuxKit VM with
-  no reachable host iptables; `--internal` severs the proxy path; DNS-only is
-  bypassable via IP-literals). So a proxy-ignoring/compromised agent on docker
-  *can* still dial direct — the run warns, and **libkrun is the airtight vaulted
-  backend** (it owns the egress leg). A transparent redirect is a convenience,
-  not a requirement.
+  through the broker or fails closed. A client behind `pillbox sidecar` gets
+  only the proxy-level default-deny: nothing stops a proxy-ignoring process
+  from dialing direct, which is why credential release lives only in libkrun
+  (it owns the egress leg).
 - **SSRF / DNS-rebind guard** — refuse to forward to a real-upstream IP in a
   private/loopback/link-local/CGNAT/ULA range (cloud metadata `169.254.169.254`,
   `10.0.0.0/8`, a LAN box, `::1`) — an allowlisted *name* that resolves inward.
   **Built on both forward legs** from one shared helper
   (`crate::vault::is_denied_egress_ip`, unit-tested): libkrun's MITM
-  `connect_upstream`, and the docker broker's connector — a filtering DNS
+  `connect_upstream`, and the sidecar proxy's connector — a filtering DNS
   resolver wired into hudsucker via `with_http_connector` (`src/vault/forward.rs`)
   so the dial drops denied IPs before connecting (no TOCTOU). The check sits at
-  the resolved IP, so the filtered set is exactly what gets dialed. (Docker's
-  *passthrough-tunnel* leg — non-intercepted CONNECT — is hudsucker's own raw
-  dial and stays unguarded; the airtight path is libkrun's network fence.)
-- **Per-run CA** — **Built (default), both backends.** A `--vault` run mints a
+  the resolved IP, so the filtered set is exactly what gets dialed. (The
+  sidecar's *passthrough-tunnel* leg — non-intercepted CONNECT — is hudsucker's
+  own raw dial and stays unguarded; the airtight path is libkrun's network fence.)
+- **Per-run CA** — **Built (default).** A `--vault` run mints a
   fresh CA in a tempdir and discards it after, so a leaked CA is valid only for
   that one run. The guest installs the cert per-boot regardless
   (`NODE_EXTRA_CA_CERTS` + the system store), so ephemeral costs nothing. A
@@ -246,8 +237,7 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   reports which mode is in effect. On libkrun, only **host-supervised**
   (foreground) runs and in-sandbox graders get the ephemeral CA; a **reparented**
   VM (`--detach` / server-mode) outlives the CLI, so a host tempdir would vanish
-  under it — those keep the persistent dir (the same trade as docker `--detach`,
-  which doesn't support `--vault`).
+  under it — those keep the persistent dir.
 - **Capability stubs** — stubs are high-entropy and looked up server-side.
   Caveat-based tokens (macaroons/biscuit) would bind {destination,session,expiry}
   cryptographically, but since pillbox keeps **all release decisions host-side**
@@ -300,56 +290,34 @@ implementing the `VaultProvider` trait in a new file under
 `src/vault/providers/` and registering it in `providers::registry()`.
 Server core doesn't change.
 
-A single shared `Registry` holds `sandbox_id → SandboxData` and
-`stub_token → sandbox_id` lookups across all providers. Stubs never
-collide because each provider has its own prefix.
+The providers are stateless: they mint stubs and recognize hosts and token
+endpoints. The stub→real pairs for one run live in that run's VMM child (the
+libkrun MITM), so there is no host-side registry of leases.
 
 ## How it works
 
 ```
-   host                                       guest (docker)
-  ┌─────────────────────────┐              ┌──────────────────────────┐
-  │ ~/.pillbox/global/auth/claude/ │ ──mount──▶   │ /home/pillbox/.claude/   │
-  │  .claude/               │              │  (real creds.json file)  │
-  │   .credentials.json     │              │                          │
-  │   (real OAuth tokens)   │              │                          │
-  └──────────────┬──────────┘              └──────────────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────┐              ┌──────────────────────────┐
-  │ vault Server            │              │ stub creds.json (tmp)    │
-  │ + per-sandbox lease     │ ──mount──▶   │ overlaid via -v file:    │
-  │ + stub JSON → tempfile  │              │  /home/pillbox/.claude/  │
-  └──────────────┬──────────┘              │  .credentials.json:ro    │
-                 │                         └──────────────────────────┘
-                 │
-                 │                         ┌──────────────────────────┐
-                 │                         │ HTTPS_PROXY=             │
-                 │                         │  http://host.docker.     │
-                 │                         │  internal:<port>         │
-                 │                         │ NODE_EXTRA_CA_CERTS=     │
-                 │                         │  /etc/pillbox-ca.crt     │
-                 │                         └──────────────┬───────────┘
-                 │                                        │
-                 │  ◀──── HTTPS via proxy ─────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────┐              ┌──────────────────────────┐
-  │ MITM intercept on       │              │  Anthropic upstream      │
-  │ api.anthropic.com /     │ ──TLS──▶     │  (real connection,       │
-  │ console.anthropic.com:  │              │   real token only here)  │
-  │  • stub → real outbound │              └──────────────────────────┘
-  │  • token endpoint → 403 │
-  │ Everything else: pass-  │
-  │ through (no MITM).      │
-  └─────────────────────────┘
+   host                                         guest (libkrun microVM)
+  ┌───────────────────────────────┐           ┌─────────────────────────────┐
+  │ ~/.pillbox/global/auth/claude │ CoW clone ▶│ /home/pillbox/.claude/      │
+  │  real OAuth tokens            │ + stubbed │  .credentials.json (STUBS,  │
+  └──────────────┬────────────────┘           │  expiresAt = 2100)          │
+                 │ real tokens                 └──────────────┬──────────────┘
+                 ▼                                            │ DNS: allowlisted
+  ┌───────────────────────────────┐                           │ hosts → gateway
+  │ VMM child (__krun-vmm)        │ ◀── TLS to the gateway ───┘
+  │  smoltcp egress stack + MITM  │     (guest trusts the per-run CA)
+  │  • leaf minted per allowed SNI│
+  │  • stub → real on its host    │ ──TLS──▶  provider upstream
+  │  • token endpoint → 403       │           (real token only here)
+  │  • non-allowlisted → NXDOMAIN │
+  └───────────────────────────────┘
 ```
 
-Stubs encode the sandbox id (e.g. claude:
-`sk-ant-oat01-<sandbox_id_compact><random>`, codex:
-`pb-codex-oat-<sandbox_id_compact><random>`) so the proxy can resolve
-them without binding to TCP source-port. A sandbox whose lease was
-dropped no longer resolves — re-using its stub from outside gets 401.
+The guest never holds a real credential: it sees stubs, and the only route out
+is the VMM child's egress stack. `pillbox sidecar` runs the same egress policy
+as a standalone host proxy for clients outside a microVM; it releases no
+credentials.
 
 ## Files on disk
 
@@ -365,24 +333,21 @@ Examples:
 - Global pillbox: `~/.pillbox/global/vault/`
 - Project pillbox: `~/.pillbox/projects/-Users-x-work-myapp/vault/`
 
-The CA cert is mounted read-only into the guest at
-`/etc/pillbox-ca.crt`. The private key never leaves the host.
+The CA cert is installed in the guest at `/etc/pillbox-ca.crt`. The
+private key never leaves the host (the VMM child is a host process).
 
-The per-run stub JSON lives in a tempfile that's deleted when the run
-exits.
+The stubbed credentials live in the run's CoW auth-home clone, scrubbed at
+teardown.
 
 ## Limits + caveats
 
-- **macOS / Docker Desktop only (tested).** The proxy assumes
-  `host.docker.internal` works for container→host networking. Linux
-  needs the `--add-host=host.docker.internal:host-gateway` flag, which
-  pillbox passes unconditionally — should work on recent Docker. Not
-  smoke-tested on Linux.
-- **MITM = trust pillbox.** The proxy holds your real OAuth tokens in
-  memory while the container runs. If pillbox is compromised, those
+- **macOS (libkrun/HVF) only (tested).** The vault lives in the libkrun
+  VMM child; see [libkrun-sandbox.md](./libkrun-sandbox.md).
+- **MITM = trust pillbox.** The VMM child holds your real OAuth tokens in
+  memory while the VM runs. If pillbox is compromised, those
   tokens are exposed.
-- **Only Anthropic hosts are intercepted.** Other HTTPS traffic flows
-  through unmodified (no certificate spoofing on those hosts).
+- **Only provider hosts are intercepted.** Other allowlisted HTTPS traffic
+  is relayed without a credential swap.
 - **Node.js path only.** `NODE_EXTRA_CA_CERTS` wires the CA into claude
   (a Node app). Non-Node agents would need a different trust strategy.
 

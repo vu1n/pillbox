@@ -100,11 +100,6 @@ pub(crate) fn sessions_root_path(pb: &Pillbox) -> PathBuf {
 /// libkrun commit-guard watches this path: its existence is the "launch committed"
 /// signal that keeps a detached VMM from self-destructing. Pinned to `write`'s
 /// real path by a test (`record_path_matches_write`).
-///
-/// libkrun-only: its sole caller is the commit-guard wiring (`arm_commit_guard`),
-/// feature-gated — so without the feature this would be dead code (a `-D warnings`
-/// build error).
-#[cfg(feature = "libkrun")]
 pub(crate) fn record_path(pb: &Pillbox, id: &str) -> PathBuf {
     sessions_root_path(pb).join(format!("{id}.toml"))
 }
@@ -847,7 +842,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "libkrun")]
     #[test]
     fn record_path_matches_write() {
         // The libkrun commit-guard self-destructs a detached VMM unless this exact

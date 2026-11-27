@@ -103,10 +103,9 @@ promises that a hosted sandbox cannot:
 
 ### Install and run locally
 
-The supported alpha path today is macOS/HVF. A Docker daemon is temporarily
-needed to pull and unpack the OCI runner image; the agent itself runs in the
-libkrun microVM, not in the Docker backend. The Docker agent backend is
-deprecated and receives no new features.
+The supported alpha path today is macOS/HVF. A Docker daemon is needed to pull
+and export the OCI runner image as the microVM rootfs; the agent itself always
+runs in the libkrun microVM. pillbox has no Docker agent backend.
 
 ```sh
 # libkrun runtime

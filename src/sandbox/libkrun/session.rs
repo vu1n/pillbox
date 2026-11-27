@@ -46,7 +46,7 @@ impl SandboxBackend for LibkrunBackend {
         request: &crate::execution::ExecuteRequest,
         owner: &mut crate::execution::store::OwnedInvocation,
     ) -> Result<crate::execution::Completion> {
-        crate::execution::local::execute(resolved, repository, request, owner)
+        crate::execution::microvm::local::execute(resolved, repository, request, owner)
     }
 
     /// The microVM family: KVM-isolation features are uniquely libkrun's
@@ -92,13 +92,35 @@ impl SandboxBackend for LibkrunBackend {
         super::sandbox_vm::spawn(resolved, req)
     }
 
+    fn verify_project(&self, probe: &Path, repository: &Path) -> Result<()> {
+        crate::execution::microvm::probe::run(probe, repository)
+    }
+
+    fn login(&self, spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
+        super::login::login(spec, resolved, home)
+    }
+
+    fn score_in_sandbox(
+        &self,
+        resolved: &Pillbox,
+        workspace: &Path,
+        cmd: &str,
+        egress_allow: &[String],
+        drop_privileges: bool,
+    ) -> Result<(i32, String)> {
+        score_in_sandbox(resolved, workspace, cmd, egress_allow, drop_privileges)
+    }
+
+    fn host_checks(&self) -> Vec<crate::doctor::Check> {
+        super::host::doctor_checks()
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return run_structured(spec, opts, resolved);
         }
         // Server-integration agents run headless + are driven/read over their HTTP
-        // API through a vsock port-forward — a distinct path with no PTY (mirrors
-        // docker's split). The two share `launch_server_vm`; this picks the
+        // API through a vsock port-forward — a distinct path with no PTY. The two share `launch_server_vm`; this picks the
         // per-agent builder (codex-serve drives `codex app-server` via the in-guest
         // bridge; opencode runs `opencode serve`). PTY agents fall through below.
         if spec.integration == Integration::Server {
@@ -108,11 +130,11 @@ impl SandboxBackend for LibkrunBackend {
                 run_server(spec, opts, resolved)
             };
         }
-        // `--vault` is a no-op on libkrun (accepted for CLI parity with docker):
-        // OAuth creds are *always* env-forked + MITM-swapped here, and egress is
-        // always sole-fenced — there's no non-vault mode to switch on. A vaulted
-        // `--with` (handled in `prepare_launch`) auto-enables the API-key swap on
-        // its own, exactly like docker, no `--vault` required.
+        // `--vault` is a no-op on libkrun: OAuth creds are *always* env-forked +
+        // MITM-swapped here, and egress is always sole-fenced — there's no
+        // non-vault mode to switch on. A vaulted `--with` (handled in
+        // `prepare_launch`) auto-enables the API-key swap on its own, no `--vault`
+        // required.
 
         let run_started = std::time::SystemTime::now();
         let session_id = crate::session::Session::new_id();
@@ -125,14 +147,14 @@ impl SandboxBackend for LibkrunBackend {
 
         // Detach: spawn the VM to outlive the CLI + record the session, then return.
         // libkrun keeps the vault on detach (the MITM lives in the child, not the
-        // parent), unlike local Docker. Reattach/teardown go through the session
+        // parent). Reattach/teardown go through the session
         // record. Foreground (below) supervises + pumps the terminal inline.
         if opts.detach {
             return launch_detached(spec, resolved, &session_id, &opts, launch, startup);
         }
 
         // §0: tail the agent's transcript from the host-side creds clone into the
-        // durable §0 sink (the same producer docker uses; no guest emitter).
+        // durable §0 sink (no guest emitter).
         // A local log-open failure stays loud but falls back to OTLP-only
         // observability. Spawned before the child so it's ready when the agent
         // first writes.
@@ -552,7 +574,7 @@ pub(super) fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) ->
     // and the CA install silently no-op'd, leaving codex's rustls to reject the
     // vault MITM cert with `UnknownIssuer`. Prepend the sbin dirs so it resolves,
     // and warn (not `|| true`) so a real failure is visible instead of silent.
-    // Mirrors the docker entrypoint fix (runner/entrypoint.sh).
+    // Same fix as the runner image's entrypoint (runner/entrypoint.sh).
     format!(
         "set -e; {net}; \
          printf '%s' {ca_q} > {GUEST_CA_PATH}; \
@@ -645,8 +667,7 @@ pub(super) enum CaLifetime {
 /// `Ephemeral` caller mints a per-run CA in a tempdir discarded after the run —
 /// the guest reinstalls the cert every boot, so a stable CA buys it nothing, and
 /// ephemeral shrinks a leaked CA key's blast radius to a single run. A
-/// `Persistent` caller falls back to the per-pillbox dir (same trade as docker
-/// `--detach`, which doesn't support `--vault`).
+/// `Persistent` caller uses the per-pillbox dir.
 pub(super) fn provision_vault_ca(resolved: &Pillbox, lifetime: CaLifetime) -> Result<VaultCa> {
     let persistent = resolved.subdir_path("vault");
     let pinned = crate::vault::ca_cert_path_in(&persistent).exists();
@@ -834,7 +855,7 @@ fn mint_with_swaps(
         // for keys whose public prefix isn't exactly 3 hyphen-segments (OpenAI
         // `sk-proj-…`, `sk-svcacct-…`), and that stub lands in the guest env. The
         // curated prefix also keeps the stub format-valid (e.g. GitHub `ghp_…`) so
-        // in-guest SDK validators accept it. (Matches the docker host-side path.)
+        // in-guest SDK validators accept it.
         let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
         swaps.push(WithSwap {
             env_var: w.env_var.clone(),
@@ -874,7 +895,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     } = launch_base(&inputs, resolved, ca_lifetime)?;
 
     // Pre-accept the agent's workspace-trust dialog on the live auth home before
-    // boot (claude); operates on host paths, like the docker path.
+    // boot (claude); operates on host paths.
     spec.prepare_workspace_or_warn(&agent.home, &guest_workspace);
 
     // Env fork (after the seed above so the clone inherits it): stubbed creds
@@ -1051,7 +1072,7 @@ fn env_fork_creds(
     // `auth_id` without a broker decider, so the `vault_capable`
     // gate just avoids the call for non-vaulted agents.
     if spec.vault_capable {
-        crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
+        crate::vault::refresh::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
     }
 
     let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(home, spec, &oauth_hosts)?;
@@ -1710,7 +1731,7 @@ fn launch_server_vm(
         // Reparented: nothing host-side supervises this agent, so spawn the detached §0 PRODUCER —
         // it tails the guest capture → durable log forever, keeping the log live for every consumer
         // (list/diagnose/subscribe + telemetry exporters) with no explicit drain. Killed by
-        // kill_session. The libkrun analog of docker's always-on transcript tailer.
+        // kill_session.
         if let Err(e) = spawn_session_tailer(resolved, &session, spec) {
             eprintln!("pillbox: warning: detached session tailer did not start: {e:#}");
         }
@@ -1753,7 +1774,7 @@ fn fail_structured_launch<T>(
 ) -> Result<T> {
     // An unconfirmed shutdown still owns recovery state; never announce completion.
     if error
-        .downcast_ref::<super::repository::TeardownUnconfirmed>()
+        .downcast_ref::<crate::execution::TeardownUnconfirmed>()
         .is_some()
     {
         return Err(error);
@@ -1975,7 +1996,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let (status, vmm_diagnostic) = match execution {
         Ok(outcome) => outcome,
         Err(error) => {
-            if !error.is::<super::repository::TeardownUnconfirmed>() {
+            if !error.is::<crate::execution::TeardownUnconfirmed>() {
                 rootfs
                     .remove_stopped()
                     .with_context(|| format!("structured launch failed: {error:#}"))?;
@@ -2381,22 +2402,22 @@ pub(crate) fn workspace_path(session: &crate::session::Session) -> Result<PathBu
 /// been mode-locked on the host, and root could `chmod` that lock off.
 /// The start marker is printed only once this setup succeeded.
 pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
-    let started = crate::commands::session::GRADER_STARTED_PRINTF;
+    let started = crate::commands::session::grader::GRADER_STARTED_PRINTF;
     if drop_privileges {
         // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
         // a `;` would let the marker (and the grader) run when the mount failed.
         format!(
             "{} && [ -x {runuser} ] && {started} && {runuser} -u nobody --preserve-environment -- sh -c {}",
-            crate::commands::session::dropped_grader_setup(),
+            crate::commands::session::grader::dropped_grader_setup(),
             super::shell_quote(cmd),
-            runuser = crate::commands::session::RUNUSER,
+            runuser = crate::commands::session::grader::RUNUSER,
         )
     } else {
         format!("{started} && {{ {cmd} ; }}")
     }
 }
 
-pub(crate) fn score_in_sandbox(
+fn score_in_sandbox(
     resolved: &Pillbox,
     workspace: &Path,
     cmd: &str,
@@ -2445,15 +2466,15 @@ pub(crate) fn score_in_sandbox(
             // like the grader started.
             format!(
                 "{setup} && [ -x {runuser} ] && {started}; set +e; {runuser} -u nobody --preserve-environment -- sh -c {quoted}",
-                setup = crate::commands::session::dropped_grader_setup(),
-                runuser = crate::commands::session::RUNUSER,
-                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                setup = crate::commands::session::grader::dropped_grader_setup(),
+                runuser = crate::commands::session::grader::RUNUSER,
+                started = crate::commands::session::grader::GRADER_STARTED_PRINTF,
                 quoted = shell_quote(cmd),
             )
         } else {
             format!(
                 "{started}; set +e; {cmd}",
-                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                started = crate::commands::session::grader::GRADER_STARTED_PRINTF,
             )
         };
         let script = format!(
@@ -2647,7 +2668,7 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 }
 
 /// How long to let a buffered `Input` frame traverse socket → guest pty-host →
-/// PTY before closing — mirrors the docker driver's settle. All in-VM once the
+/// PTY before closing. All in-VM once the
 /// frame is written (libkrun bridges the unix socket straight to the guest's
 /// listening pty-host, no exec cold-start), so it's short.
 const SEND_SETTLE: Duration = Duration::from_millis(300);
@@ -2831,7 +2852,7 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
         );
         if !killed.contains(&pgid) {
             super::repository::signal_group(pgid, libc::SIGKILL)
-                .context(super::repository::TeardownUnconfirmed)?;
+                .context(crate::execution::TeardownUnconfirmed)?;
             killed.push(pgid);
         }
     }
@@ -2840,13 +2861,13 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
         let mut alive = false;
         for group in &killed {
             alive |= super::repository::group_exists(*group)
-                .context(super::repository::TeardownUnconfirmed)?;
+                .context(crate::execution::TeardownUnconfirmed)?;
         }
         if !alive {
             return confirm_vmm_stopped(spec);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+            return Err(anyhow::Error::new(crate::execution::TeardownUnconfirmed)
                 .context("VMM process group survived session teardown"));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -2855,7 +2876,7 @@ fn reap_vmm_by_spec(spec: &str) -> Result<()> {
 
 pub(super) fn confirm_vmm_stopped(spec: &str) -> Result<()> {
     if !vmm_groups_for_spec(spec)?.is_empty() {
-        return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+        return Err(anyhow::Error::new(crate::execution::TeardownUnconfirmed)
             .context("VMM still serves its private filesystem"));
     }
     Ok(())
@@ -2869,11 +2890,11 @@ fn vmm_groups_for_spec(spec: &str) -> Result<Vec<(i32, i32)>> {
     let output = Command::new("ps")
         .args(["-axww", "-o", "pid=,pgid=,command="])
         .output()
-        .context(super::repository::TeardownUnconfirmed)
+        .context(crate::execution::TeardownUnconfirmed)
         .context("scan VMM ownership before filesystem cleanup")?;
     if !output.status.success() {
         return Err(
-            anyhow::Error::new(super::repository::TeardownUnconfirmed).context(format!(
+            anyhow::Error::new(crate::execution::TeardownUnconfirmed).context(format!(
                 "VMM ownership scan failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )),
@@ -3508,7 +3529,7 @@ mod tests {
             crate::session::write(&resolved, &session).unwrap();
             let mut log = crate::events::log::SessionLog::open(&resolved, &session.id).unwrap();
             let error = if unconfirmed {
-                anyhow::Error::new(super::super::repository::TeardownUnconfirmed)
+                anyhow::Error::new(crate::execution::TeardownUnconfirmed)
                     .context("injected shutdown failure")
             } else {
                 anyhow::anyhow!("injected startup failure")
@@ -3526,7 +3547,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 error
-                    .downcast_ref::<super::super::repository::TeardownUnconfirmed>()
+                    .downcast_ref::<crate::execution::TeardownUnconfirmed>()
                     .is_some(),
                 unconfirmed
             );

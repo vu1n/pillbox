@@ -8,8 +8,9 @@ then implement the smallest end-to-end slice.
 
 - Cloudflare Durable Objects are the managed session authority; Cloudflare
   Containers run the agent.
-- libkrun is the one local agent backend. The Docker agent backend is deprecated
-  and gets no new features or parity work.
+- libkrun is the one local agent backend. The Docker agent backend was deleted;
+  Docker remains only as runner-image export plumbing (`src/sandbox/oci.rs`). Do
+  not re-add an agent-run Docker backend.
 - Local and managed placements share the §0 event contract. A feature that is
   only observable through a private managed service is incomplete.
 - Ghost remains an in-repo experimental tenant until its conductor contract is
@@ -28,12 +29,15 @@ The map is descriptive; historical decision status stays in the archive.
 
 ## Development checks
 
-The platform-independent Rust path:
+The platform-independent Rust path. `--no-default-features` is the in-guest
+tools build (no substrate), which links everywhere; the full build is linted
+with a type-check-only clippy, which never links libkrun:
 
 ```sh
 cargo fmt --check
-cargo test --no-default-features --all-targets
-cargo clippy --no-default-features --all-targets -- -D warnings
+cargo test --workspace --no-default-features --all-targets
+cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The Cloudflare gateway path (Node.js 22.6+):

@@ -10,7 +10,6 @@
 //! Whatever the agent writes — `.credentials.json`, settings, refresh
 //! tokens — persists there naturally.
 
-#[cfg(feature = "libkrun")]
 use std::borrow::Cow;
 use std::{
     fs,
@@ -31,9 +30,9 @@ pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};
 pub(crate) const GUEST_HOME: &str = "/home/pillbox";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
-/// The guest `PATH` every backend hands the agent — docker (`-e PATH=`) and
-/// libkrun (the boot-script env + the grader) share this one definition so they
-/// can't drift into resolving different toolchains. Includes the agent user's
+/// The guest `PATH` the agent gets — the libkrun boot-script env and the grader
+/// share this one definition so they can't drift into resolving different
+/// toolchains. Includes the agent user's
 /// `~/.local/bin` where the runner installs per-user tools. The runner image
 /// must install agent binaries onto one of these dirs (see `runner/Dockerfile`).
 pub(crate) fn guest_path() -> String {
@@ -72,24 +71,21 @@ impl Integration {
 /// The per-agent data a [`Integration::Server`] agent needs, beyond the common
 /// [`AgentSpec`] fields — the §0 capture filename, its wire format, and the
 /// guest server's auth. `Some` iff `integration == Server`. Every server agent
-/// runs on the libkrun backend only (docker refuses `server.is_some()`).
+/// runs on the libkrun backend only.
 /// Carrying these here (rather than re-deriving `if agent_id == "…"` at each
 /// dispatch site) keeps the events-file name and drain-format selection as one
 /// source of truth.
 #[derive(Clone, Copy)]
 pub(crate) struct ServerProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
-    /// Consumed by the libkrun §0 read path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun §0 read path.
     pub(crate) events_file: &'static str,
     /// Wire format of that capture → selects the drain function. Consumed by the
-    /// libkrun §0 read path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// libkrun §0 read path.
     pub(crate) events_format: crate::events::EventsFormat,
     /// HTTP basic-auth `(user, password)` every host call to the guest server
     /// carries (OpenCode 2 refuses to serve without a password). Consumed by the
-    /// libkrun transport; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// libkrun transport.
     pub(crate) basic_auth: Option<(&'static str, &'static str)>,
 }
 
@@ -100,17 +96,14 @@ pub(crate) struct ServerProfile {
 #[derive(Clone, Copy)]
 pub(crate) struct StructuredProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
-    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun structured launch path.
     pub(crate) events_file: &'static str,
     /// How `--model` is parsed for this agent.
-    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun structured launch path.
     pub(crate) model: StructuredModelPolicy,
     /// Guest env var that authenticates without the login sentinel (e.g.
     /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
-    /// Consumed by the libkrun `authenticated_home` gate; dead on a non-libkrun build.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// Consumed by the libkrun `authenticated_home` gate.
     pub(crate) alt_auth_env: Option<&'static str>,
 }
 
@@ -124,10 +117,8 @@ pub(crate) enum StructuredModelPolicy {
     OptionalBare,
 }
 
-/// Libkrun-only policy for a PTY agent whose cloned home or terminal protocol
-/// needs agent-specific handling. Docker deliberately does not consume this:
-/// its PTY contract remains the existing raw byte stream.
-#[cfg(feature = "libkrun")]
+/// Libkrun policy for a PTY agent whose cloned home or terminal protocol needs
+/// agent-specific handling.
 #[derive(Clone, Copy)]
 pub(crate) struct LibkrunPtyProfile {
     cloned_home: Option<ClonedHomePreparation>,
@@ -135,7 +126,6 @@ pub(crate) struct LibkrunPtyProfile {
     input_framing: PtyInputFraming,
 }
 
-#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum ClonedHomePreparation {
     FreshCodex,
@@ -151,7 +141,6 @@ pub(crate) enum DetachedTranscriptSource {
 }
 
 impl DetachedTranscriptSource {
-    #[cfg(feature = "libkrun")]
     pub(crate) fn as_token(self) -> &'static str {
         match self {
             Self::ServerCapture(format) => format.as_str(),
@@ -174,13 +163,11 @@ impl DetachedTranscriptSource {
     }
 }
 
-#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum PtyInputFraming {
     BracketedPasteLfTurn,
 }
 
-#[cfg(feature = "libkrun")]
 impl LibkrunPtyProfile {
     /// Prepare only the throwaway home clone. Errors are launch failures: an
     /// unprepared detached agent can park before it accepts input or can expose
@@ -209,14 +196,12 @@ impl LibkrunPtyProfile {
 /// that gets the body and its Enter in one write can keep both as an unsent draft (Agent Relay
 /// reproduced this with Codex: the body showed on screen, no turn started), so the submit key
 /// always goes on its own, after a pause. Joined, the writes are the turn's bytes.
-#[cfg(feature = "libkrun")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PtyTurn<'a> {
     pub(crate) body: Cow<'a, [u8]>,
     pub(crate) submit: Option<&'a [u8]>,
 }
 
-#[cfg(feature = "libkrun")]
 impl<'a> PtyTurn<'a> {
     /// Raw input for an agent with no framing of its own: the bytes unchanged, with a trailing
     /// `\r\n`, `\r` or `\n` split off as the submit write.
@@ -253,18 +238,14 @@ pub struct AgentSpec {
     /// `AGENT_CREDENTIALS`, so the session packet always leaves it out.
     pub(crate) cred_sentinel: pillbox_credentials::AgentCredential,
     /// Read only by the libkrun login VM (`sandbox::libkrun::login`).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
     /// Read only by the libkrun login VM's OAuth callback relay.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
     /// Hosts this agent's `auth login` reaches beyond the vault providers' hosts,
     /// for every provider its login can pick. Exact names: the fence has no wildcards.
     // Read only by the login VM's fence: a run, session or sandbox launch never gets these hosts.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_hosts: &'static [&'static str],
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
     /// Build a per-run MCP config injection from `--mcp` flags.
@@ -291,13 +272,10 @@ pub struct AgentSpec {
     pub(crate) server: Option<ServerProfile>,
     /// Structured one-shot data ([`StructuredProfile`]). `Some` iff
     /// `integration == Structured`. Consumed by the libkrun structured launch
-    /// path; dead on a non-libkrun build (docker only checks `integration`).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    /// path.
     pub(crate) structured: Option<StructuredProfile>,
     /// Agent-specific PTY behavior consumed only by libkrun. `None` preserves
-    /// the generic raw-input/no-clone-prep behavior (including Docker, which
-    /// never reads this field).
-    #[cfg(feature = "libkrun")]
+    /// the generic raw-input/no-clone-prep behavior.
     pub(crate) libkrun_pty: Option<LibkrunPtyProfile>,
 }
 
@@ -322,7 +300,6 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     prepare_workspace: Some(pretrust_claude_workspace),
     server: None,
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -331,8 +308,8 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 /// [`CODEX_SERVE`] is a structured sibling of [`CODEX`]. Opt-in via `--agent
 /// claude-stream`; the interactive PTY `claude` stays the default and is
 /// untouched. A separate id (not a flag on `claude`) because the integration
-/// kind is per-spec: it routes the run, the backend capability check (docker
-/// rejects Structured), and the events-file/model policy, and a sibling keeps
+/// kind is per-spec: it routes the run, the backend capability check, and the
+/// events-file/model policy, and a sibling keeps
 /// each spec's contract fixed.
 ///
 /// Shares `claude`'s auth home ([`auth_id`](AgentSpec::auth_id) `= "claude"`),
@@ -356,7 +333,6 @@ pub const CLAUDE_STREAM: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
     // Everything else is claude's: the shared auth home (`auth_id`), login,
     // sentinel, vault posture and permission args (root refuses bypass).
@@ -380,7 +356,6 @@ pub const CODEX: AgentSpec = AgentSpec {
     prepare_workspace: None,
     server: None,
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: Some(LibkrunPtyProfile {
         cloned_home: Some(ClonedHomePreparation::FreshCodex),
         detached_transcript: Some(DetachedTranscriptSource::Discover(
@@ -406,7 +381,7 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// session, not forwarded to Codex.
 ///
 /// libkrun-only, like every server agent (the server bring-up lives in the
-/// microVM run path; docker refuses any agent with a [`ServerProfile`]). **Non-vault v1**: the
+/// microVM run path). **Non-vault v1**: the
 /// app-server's model egress is `wss://api.openai.com/v1/responses` (WebSocket,
 /// `api.openai.com`), which the [`codex` vault provider](crate::vault::providers)
 /// (chatgpt.com only) doesn't intercept — so `--vault` is rejected until that
@@ -439,7 +414,6 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         basic_auth: None,
     }),
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -472,7 +446,6 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         )),
     }),
     structured: None,
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -506,7 +479,6 @@ pub const CURSOR: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: Some("CURSOR_API_KEY"),
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -553,7 +525,6 @@ pub const PI: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -587,7 +558,6 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
-    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -640,7 +610,6 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 /// Make a throwaway Codex home unambiguously fresh before libkrun mounts it.
 /// The authoritative auth home is never touched: stale rollouts are removed
 /// only from the clone, and only this run's unique guest workspace is trusted.
-#[cfg(feature = "libkrun")]
 fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
     let sessions = home.join(".codex/sessions");
     match fs::remove_dir_all(&sessions) {
@@ -698,7 +667,6 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
 /// A trailing LF explicitly marks a complete turn, so paste the body as one
 /// input event and submit it with a CR in a later write. Non-terminated bytes
 /// remain exactly raw.
-#[cfg(feature = "libkrun")]
 fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> PtyTurn<'_> {
     let Some(body) = bytes.strip_suffix(b"\n") else {
         return PtyTurn {
@@ -726,8 +694,8 @@ fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> PtyTurn<'_> {
 /// `--dangerously-skip-permissions` can't bypass as root.
 ///
 /// `hasCompletedOnboarding` is the same flag [`finalize_claude_onboarding`]
-/// sets at login. Local docker inherits it via the bind-mounted global home;
-/// a libkrun guest with a fresh `$HOME` would otherwise hit the wizard.
+/// sets at login; a libkrun guest with a fresh `$HOME` would otherwise hit the
+/// wizard.
 /// Setting it here (every launch, every backend) is idempotent and
 /// backend-agnostic. Merges into any existing entry; creates the file +
 /// `projects` map as needed.
@@ -817,7 +785,6 @@ impl AgentSpec {
         }
     }
 
-    #[cfg(feature = "libkrun")]
     pub(crate) fn resolved_oauth_port(&self) -> Option<u16> {
         let default = self.oauth_port?;
         let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
@@ -829,44 +796,28 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        // auth login runs only in the libkrun microVM; there is no Docker fallback.
-        #[cfg(not(feature = "libkrun"))]
-        let _ = resolved;
-        #[cfg(not(feature = "libkrun"))]
-        return Err(PillboxError::usage(
-            "login",
-            format!(
-                "`pillbox auth login --agent {}` needs the libkrun microVM backend, and this pillbox was built without it",
-                self.id
-            ),
-        )
-        .with_next("rebuild pillbox with the default `libkrun` feature")
-        .into());
+        // auth login runs only in the libkrun microVM.
+        let backend = crate::sandbox::SubstrateKind::Libkrun.backend()?;
+        let home = self.home_dir(resolved)?;
 
-        #[cfg(feature = "libkrun")]
-        {
-            let home = self.home_dir(resolved)?;
+        println!("pillbox: starting {} login inside a sandbox.", self.id);
+        println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
+        println!();
 
-            println!("pillbox: starting {} login inside a sandbox.", self.id);
-            println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
-            println!();
-
-            let code = crate::sandbox::libkrun::login::login(self, resolved, &home)?;
-            if code != 0 {
-                return Err(PillboxError::runtime(
-                    "login",
-                    format!("{} exited with status {code}", self.id),
-                )
-                .with_next(format!("pillbox auth login --agent {}", self.id))
-                .into());
-            }
-            self.finish_login(&home)
+        let code = backend.login(self, resolved, &home)?;
+        if code != 0 {
+            return Err(PillboxError::runtime(
+                "login",
+                format!("{} exited with status {code}", self.id),
+            )
+            .with_next(format!("pillbox auth login --agent {}", self.id))
+            .into());
         }
+        self.finish_login(&home)
     }
 
     /// The post-login checks: the credential sentinel exists, then the agent's
     /// optional finalize hook runs (best-effort).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     fn finish_login(&self, home: &Path) -> Result<()> {
         if !home.join(self.cred_sentinel).exists() {
             return Err(PillboxError::runtime(
@@ -920,6 +871,7 @@ impl AgentSpec {
 pub(crate) struct RunOpts {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) name: Option<String>,
+    /// `--mount` / preset `mount`: read only by `commands::run::start`, which refuses a run that has any.
     pub(crate) mounts: Vec<String>,
     /// `--with NAME[=ENV_VAR]` entries (parsed from raw CLI strings)
     pub(crate) withs: Vec<String>,
@@ -949,8 +901,8 @@ pub(crate) struct RunOpts {
     pub(crate) args: Vec<String>,
     /// `--detach` — start the session and exit. The session is recorded
     /// in the per-pillbox registry and the user reattaches with `pillbox
-    /// session attach <id>`. Supported on local Docker + libkrun backends
-    /// (each persists the in-sandbox pty-host).
+    /// session attach <id>`. Supported on the libkrun backend (it persists
+    /// the in-guest pty-host).
     pub(crate) detach: bool,
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
@@ -1332,7 +1284,6 @@ mod tests {
         assert_eq!(v["hasCompletedOnboarding"], true);
     }
 
-    #[cfg(feature = "libkrun")]
     #[test]
     fn detached_transcript_source_tokens_round_trip_and_reject_unknown() {
         let sources = [

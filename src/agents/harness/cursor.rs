@@ -31,7 +31,6 @@ pub(crate) struct CursorAdapter {
 }
 
 impl CursorAdapter {
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn with_request(requested: RequestedRunProfile) -> Self {
         Self {
             state: CursorState::default(),

@@ -9,18 +9,22 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::claude_text;
-use super::evidence::ExecutionEvidence;
-use super::opencode::{self, Plan};
-use super::pi_text::{self, PiHarness, Selection};
-use super::protocol;
-use super::store::OwnedInvocation;
-use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
-use super::usage::TurnUsage;
-use super::{EvidenceRef, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
 use crate::contract::{Custom, Payload};
+use crate::execution::claude_text;
+use crate::execution::evidence::ExecutionEvidence;
+use crate::execution::microvm::text::{
+    self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime,
+};
+use crate::execution::opencode::{self, Plan};
+use crate::execution::pi_text::{self, PiHarness, Selection};
+use crate::execution::protocol;
+use crate::execution::store::OwnedInvocation;
+use crate::execution::usage::TurnUsage;
+use crate::execution::TeardownUnconfirmed;
+use crate::execution::{
+    EvidenceRef, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat,
+};
 use crate::pillbox::Pillbox;
-use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
 
 pub(crate) const CONTRACT_VERSION: &str = "pillbox.text/2";
 pub(crate) const ADAPTER_REVISION: &str = "pillbox/local-text-v2";
@@ -230,7 +234,13 @@ fn execute_opencode(
     plan: &Plan,
     runner_image_id: String,
 ) -> Result<Outcome> {
-    match super::text_opencode::execute(pb, request, plan, &runner_image_id, owner) {
+    match crate::execution::microvm::text_opencode::execute(
+        pb,
+        request,
+        plan,
+        &runner_image_id,
+        owner,
+    ) {
         Ok(turn) => {
             let mut detail = json!({
                 "invocation_id": request.invocation_id,
@@ -274,7 +284,7 @@ fn execute_claude(
     owner: &mut OwnedInvocation,
     resolved: claude_text::Resolved,
 ) -> Result<Outcome> {
-    match claude_text::execute(pb, request, resolved, owner) {
+    match claude_text::local::execute(pb, request, resolved, owner) {
         Ok(detail) => Ok(Outcome::Completed(detail)),
         Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
         Err(error) => {
@@ -441,7 +451,7 @@ fn runner_image_id(pb: &Pillbox) -> Result<String> {
     let (image, _) = crate::sandbox::oci::resolve_runner_image(pb);
     let id = crate::sandbox::oci::image_id(&image)?;
     ensure!(
-        super::valid_digest(&id),
+        crate::execution::valid_digest(&id),
         "invalid runner image id for {image}"
     );
     Ok(id)
@@ -525,8 +535,8 @@ fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{canonical_json, digest};
     use super::*;
+    use crate::execution::{canonical_json, digest};
 
     fn request(harness: &str, model: &str) -> TextRequestV2 {
         let rendered_input = "hello".to_owned();
@@ -690,7 +700,7 @@ mod tests {
 
     #[test]
     fn an_unrunnable_harness_seals_a_free_text_free_failure() {
-        use super::super::store::{Claim, InvocationStore};
+        use crate::execution::store::{Claim, InvocationStore};
         let temp = tempfile::tempdir().unwrap();
         let pb = Pillbox {
             scope: crate::pillbox::Scope::Global,
@@ -750,7 +760,7 @@ mod tests {
 
     #[test]
     fn unservable_claude_model_is_rejected_at_resolve_before_image_or_credentials() {
-        use super::super::store::{Claim, InvocationStore};
+        use crate::execution::store::{Claim, InvocationStore};
         let temp = tempfile::tempdir().unwrap();
         let pb = Pillbox {
             scope: crate::pillbox::Scope::Global,

@@ -20,8 +20,8 @@ SMOKE_CODEX=1 scripts/smoke/run.sh libkrun   # also smoke codex-serve (opt-in)
 ## What it checks
 
 - **`scripts/lk-build.sh`** — build `--features libkrun` **and** codesign in one
-  step (a bare `cargo build`/`test`/`clippy` strips the HVF signature → silent
-  docker fallback). Run it before any manual libkrun run too.
+  step (a bare `cargo build`/`test`/`clippy` strips the HVF signature → the VM
+  can't start). Run it before any manual libkrun run too.
 - **`libkrun.sh <agent> <image> [model]`** — boot a libkrun server session, drive
   a mechanical edit, then assert: a §0 `usage` event flowed (producer works),
   agent output flowed (drain works), `session pull` recovered the edit (the live-

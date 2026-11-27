@@ -25,9 +25,8 @@ fail() { echo "  ✗ dispatch-segments: $1"; exit 1; }
 
 # libkrun-only today: dispatch's grader resolves each worker's *live* workspace
 # via `session info --json` → `.session.workspace`, which only libkrun sessions
-# populate (`libkrun_workspace_path`). Docker dispatch needs a non-libkrun
-# workspace-resolution path — deferred, see docs/dispatch.md. Skip (don't fail
-# the suite) on docker.
+# populate (`libkrun_workspace_path`). Skip (don't fail the suite) on any other
+# backend.
 if [ "$BACKEND" != libkrun ]; then
   echo "  · dispatch-segments smoke skipped — backend=$BACKEND not wired yet (libkrun-only grade path)"
   exit 0

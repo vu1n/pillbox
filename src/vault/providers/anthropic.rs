@@ -7,12 +7,8 @@
 use serde::Deserialize;
 
 use super::{mint_stub, HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest, VaultProvider};
-#[cfg(feature = "libkrun")]
 use super::{LibkrunOAuthStub, OAuthRelease};
-#[cfg(not(feature = "libkrun"))]
-use crate::vault::refresh::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 use crate::vault::token_store::RefreshDecider;
-#[cfg(feature = "libkrun")]
 use crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 
 // Provider id matches the AgentSpec auth id (`claude`) so `provider_for`
@@ -177,7 +173,6 @@ impl OAuthCodec for AnthropicProvider {
         Ok(HostProxyOAuthStub { credentials })
     }
 
-    #[cfg(feature = "libkrun")]
     fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
         let Some(oauth) = real
             .get_mut("claudeAiOauth")
@@ -224,7 +219,6 @@ impl OAuthCodec for AnthropicProvider {
     }
 }
 
-#[cfg(feature = "libkrun")]
 fn mint_libkrun_stub(real: &str) -> String {
     let prefix = if real.split('-').count() >= 4 {
         real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")

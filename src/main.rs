@@ -169,7 +169,7 @@ enum Command {
         /// Override the workspace mount-point name (`/workspace/<name>`).
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Extra bind mount. Repeatable. Forwarded to `docker run -v`.
+        /// Extra host bind mount. Refused: the microVM takes no extra host mounts.
         #[arg(long = "mount", value_name = "HOST:GUEST")]
         mounts: Vec<String>,
         /// Inject a stored secret as an env var. `NAME` binds to `NAME`;
@@ -210,9 +210,8 @@ enum Command {
         mcp_tokens: Vec<agents::McpTokenSpec>,
         /// Start the agent and immediately return — keeps the session
         /// alive in the background. Reattach later with `pillbox session
-        /// attach <id>`. Local Docker / libkrun only today. (Local
-        /// --detach doesn't support --vault: the proxy can't outlive the
-        /// CLI; libkrun keeps the vault in the VMM child.)
+        /// attach <id>`. The libkrun microVM keeps the vault in its VMM
+        /// child, so `--detach` and `--vault` combine.
         #[arg(long)]
         detach: bool,
         /// Human label for the detached session (surfaced in `session
@@ -666,15 +665,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // Internal re-exec entrypoint: the libkrun VMM child *becomes* the microVM.
-    // `krun_start_enter` doesn't return — it `exit()`s with the guest's code when
-    // the VM shuts down — so the backend spawns this hidden subprocess and
-    // supervises it from the parent (which keeps a live process for attach +
-    // cleanup). Not a user-facing command; argv is set by the backend.
+    // Internal re-exec entrypoints of the libkrun backend (the VMM child, the
+    // image-preparation guardian); returns only when argv names neither.
     #[cfg(feature = "libkrun")]
-    if std::env::args().nth(1).as_deref() == Some("__krun-vmm") {
-        crate::sandbox::libkrun::vmm_child_main(); // never returns
-    }
+    crate::sandbox::libkrun::child_main();
     // Internal re-exec entrypoint: the detached §0 PRODUCER for a reparented
     // session. Tails the guest capture → durable log forever (until SIGTERM on
     // teardown) so the log stays live for every consumer. argv set by the backend:
@@ -711,17 +705,12 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(code as u8);
     }
-    #[cfg(feature = "libkrun")]
-    if std::env::args().nth(1).as_deref() == Some("__repository-image") {
-        crate::sandbox::libkrun::repository::image_child_main();
-    }
     init_vault_trace();
     let cli = Cli::parse();
     let result = run(cli);
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        #[cfg(feature = "libkrun")]
-        Err(error) if error.is::<execution::probe::ProbeExit>() => ExitCode::from(1),
+        Err(error) if error.is::<execution::ProbeExit>() => ExitCode::from(1),
         Err(e) => errors::report(&e),
     }
 }
@@ -765,11 +754,13 @@ fn run(cli: Cli) -> Result<()> {
     let pillbox_arg = cli.pillbox.as_deref();
     match cli.command {
         Command::Execution { action } => {
-            #[cfg(feature = "libkrun")]
+            // The project verifier is sealed: it reads no pillbox, so it runs before resolution.
             if let commands::execution::ExecutionAction::VerifyProject { probe, repository } =
                 action
             {
-                return execution::probe::run(&probe, &repository);
+                return sandbox::SubstrateKind::Libkrun
+                    .backend()?
+                    .verify_project(&probe, &repository);
             }
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::execution::dispatch(&resolved, action)

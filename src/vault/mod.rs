@@ -16,20 +16,13 @@ mod egress;
 mod forward;
 pub(crate) mod known_secrets;
 pub(crate) mod providers;
-mod refresh;
+pub(crate) mod refresh;
 mod server;
 mod token_store;
 
 pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
 pub(crate) use egress::{is_denied_egress_ip, EgressPolicy};
 pub(crate) use known_secrets::{HeaderScheme, VaultMeta};
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) use refresh::pre_refresh_until;
-// The broker entry points the libkrun backend reuses: the
-// coordinated host-side pre-refresh and the far-future stub-expiry sentinel. Gated to
-// libkrun, the only substrate that releases credentials.
-#[cfg(feature = "libkrun")]
-pub(crate) use refresh::{
-    broker_expiry, broker_jit_refresh, pre_refresh, STUB_FAR_FUTURE_EXPIRES_AT_MS,
-};
+pub(crate) use refresh::STUB_FAR_FUTURE_EXPIRES_AT_MS;
 pub(crate) use server::{Server, ServerConfig};

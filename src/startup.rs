@@ -64,7 +64,6 @@ impl StartupTimer {
     }
 
     /// Stages marked so far, for a launch that reports progress before it finishes.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> StartupMetrics {
         StartupMetrics {
             total_ms: duration_ms(self.last.duration_since(self.started)),

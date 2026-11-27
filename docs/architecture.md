@@ -16,7 +16,7 @@ metadata/evidence, and the caller keeps its §0 log local.
 
 | Subsystem | Canonical doc | One line | Status |
 |---|---|---|---|
-| Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; docker backend slated for deletion |
+| Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; Docker backend deleted `[verified 2026-11-27]` |
 | Vault (creds + egress) | docs/vault.md | host-side MITM that swaps stub→real creds + fences egress | live; OAuth re-aimed at the broker model |
 | Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | local live; managed evidence copied into the local log `[verified 2026-08-31]` |
 | Snapshots | docs/config.md, AGENTS.md | rustic repo, push/pull, bookmarks | local + R2 live `[verified 2026-07-16]` |
@@ -36,32 +36,42 @@ bounded `repository-images-v2` generations share private case-sensitive APFS
 backing with their runtime clones; see [the storage contract](libkrun-sandbox.md).
 Docker is required for fresh exports and image-tag resolution. Ordinary launches
 may reuse a complete current-generation seed when Docker is unavailable, after
-validating its backing. This is image plumbing, separate from the retired Docker
-execution backend.
+validating its backing. This is image plumbing: `src/sandbox/oci.rs` is the one
+file that runs `docker` (runner-image resolution, `docker create`/`export`/`rm`),
+and pillbox has no Docker execution backend `[verified 2026-11-27]`.
 
-### `crate::docker` is two fused things `[verified 2026-06-20]`
-- **The backend** — `DockerBackend` / `DockerLiveSession` (run the agent in a
-  container). This is what the docker deletion removes.
-- **Image/build plumbing** — `resolve_runner_image` / `default_runner_image`
-  (src/docker.rs), used by libkrun (above), `doctor.rs`, `main.rs:~847`. This is
-  kept and renamed `crate::oci`.
-- `auth login` no longer touches it: it runs in a foreground libkrun microVM
-  (src/sandbox/libkrun/login.rs), and a build without libkrun refuses it.
+### One substrate value per record, one constructor `[verified 2026-11-27]`
+`SubstrateKind::selected()` (src/sandbox/substrate.rs) reads `PILLBOX_BACKEND`
+once (unset/`libkrun`, `managed`; `docker` and anything else are usage errors),
+and `SubstrateKind::backend()` is the **only** place a kind becomes a
+`Box<dyn SandboxBackend>`. Session and sandbox records store a `Substrate`
+(`Libkrun(Option<LibkrunHandle>)` / `Managed(ManagedHandle)` / `Retired`) as a
+`[substrate]` TOML table; pre-substrate records (`backend` + `sandbox_id` /
+`backend_ref`) migrate on read, and docker/e2b/undecodable ones load as
+`Retired` — listable and removable, never driven. The JSON `backend` /
+`placement` / `sandbox_id` keys are derived from the stored value.
 
-### The backend seam `[verified 2026-06-20]`
+### The backend seam `[verified 2026-11-27]`
 One backend = one impl of two traits in `src/sandbox/mod.rs`:
-`SandboxBackend` (`run` + `capabilities` + `id`) and `LiveSession`
-(`send`/`attach`/`spawn_log_tailer`/`http`/`workspace_path`/`ingest`/`kill`,
-capability-gated via `Caps`). The **only** two places that branch on backend are
-`select_backend()` and `live_session()`. Behavior also forks at ~38
-`#[cfg(feature = "libkrun")]` gates — collapsing those (libkrun-only) is the
-structural win when the docker backend is deleted.
+`SandboxBackend` (`run` + `capabilities` + `kind` + `live` + `target`, plus
+substrate-only operations with unsupported defaults: `spawn_sandbox`, `login`,
+`score_in_sandbox`, `verify_project`, `execute_repository`, `host_checks`) and
+`LiveSession` (`send`/`attach`/`spawn_log_tailer`/`http`/`workspace_path`/
+`ingest`/`kill`, capability-gated via `Caps`). `live_session()` and
+`sandbox_target()` match only on `substrate.kind()` and go through
+`SubstrateKind::backend()`; nothing matches a backend-name string.
+The build boundary is one feature: only `mod libkrun`, the libkrun arm of
+`SubstrateKind::backend`, code that names `crate::sandbox::libkrun` (the
+`execution::microvm` drivers, the hidden `text` command, the VMM re-exec
+entrypoints) and libkrun-only tests are gated — 16 `cfg(... feature =
+"libkrun")` lines in `src/`. The build without the feature is the in-guest
+tools build: it has no substrate, so `SubstrateKind::Libkrun.backend()` is an
+exit-2 usage error there. Its dead code is allowed once at the crate root and
+linted on the full build (CI runs a type-check-only `cargo clippy` with default
+features on Linux).
 `run` returns a typed `Started` and prints nothing; `pillbox run`'s `--json`
 envelope and banners are rendered by `commands::run::render_started`
 (src/commands/run.rs) `[verified 2026-11-26]`.
-Docker runs PTY agents only: `run` refuses every server agent (`spec.server`,
-opencode/codex-serve) and structured agent, and `sandbox agent` drives only the
-stdout `HarnessAdapter` harnesses (src/agents/harness/).
 
 ### Session verbs are in-process calls; the CLI is one client `[verified 2026-11-26]`
 `commands::run::start` (resolve agent + descriptor defaults, validate, `--memory`,
@@ -90,9 +100,6 @@ the vault MITM live (src/sandbox/libkrun/egress.rs).
 
 - **Daemonless OCI image pull** — replace `docker create/export` so libkrun
   doesn't need the docker daemon.
-- **No-backend build** — `--no-default-features` currently compiles because the
-  docker backend is the fallback; deleting it means resolving what the
-  toolchain-free / in-sandbox-guest build does.
 - **Spec/code drift** — several big docs (vnext and parts of the optimization
   family) mix design history with current behavior. They need curation into
   current canonical docs vs `docs/archive/`.

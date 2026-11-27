@@ -27,7 +27,7 @@ fail() { echo "  ✗ session-guard: $1"; exit 1; }
 
 # libkrun-only today: `session guard` resolves + kills a live session via the
 # LiveSession plane; the smoke needs a real booted VM. Skip (don't fail the
-# suite) on docker.
+# suite) on any other backend.
 if [ "$BACKEND" != libkrun ]; then
   echo "  · session-guard smoke skipped — backend=$BACKEND not exercised (libkrun-only)"
   exit 0

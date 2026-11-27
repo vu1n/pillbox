@@ -1,10 +1,12 @@
 # Shared MCP attachments (`--mcp`)
 
-**Status:** v0 — supported for `claude`, `codex`, and `opencode`
-(each agent has its own injection adapter).
+**Status:** v0 — supported for `claude`, `codex`, and `opencode` on the local
+libkrun microVM (each agent has its own injection adapter). Every other agent,
+and the managed tier, refuses `--mcp`/`--mcp-token` with a usage error (exit 2)
+rather than ignoring it.
 
 Pillbox can point a sandboxed agent at one or more HTTP MCP
-servers running on the host. The "shared" property falls out for
+servers — on the host's loopback, or remote over HTTPS. The "shared" property falls out for
 free: nothing stops two sandboxes from being attached to the same
 URL — they hit the same warm process, see the same state, no
 extra plumbing needed.
@@ -16,8 +18,7 @@ URL — supervision, lifecycle, schema, authz are all the user's
 ## Quick start
 
 ```sh
-# Start an MCP server somewhere on the host
-docker run -d -p 7777:7777 mem0ai/openmemory:latest
+# Start any HTTP MCP server on the host's loopback, e.g. on port 7777
 
 # Attach it to a sandboxed run
 pillbox run --mcp openmemory=http://localhost:7777
@@ -28,9 +29,8 @@ pillbox run --mcp openmemory=http://localhost:7777 \
 ```
 
 The flag value is `NAME=URL`. `NAME` is what the agent sees in
-its MCP tool list; `URL` is the host-side endpoint (pillbox rewrites
-`localhost` / `127.0.0.1` to `host.docker.internal` before injection
-so the sandbox can reach it).
+its MCP tool list; `URL` is where the server is, as seen from the host. See
+"Reaching the server from the microVM" for which URLs a run accepts.
 
 A first-party example ships in the repo:
 [`scripts/mcp/code-explore`](../scripts/mcp/code-explore/) — a read-only
@@ -44,8 +44,10 @@ then `pillbox run --mcp code-explore=http://localhost:8123`.
 --mcp NAME=URL                  Repeatable. Adds a shared MCP server.
                                 NAME: identifier shown to the agent
                                       ([A-Za-z][A-Za-z0-9_-]*).
-                                URL: must be HTTP/HTTPS. host.docker.internal
-                                is substituted for localhost/127.0.0.1.
+                                URL: http(s):// on the host's loopback
+                                (localhost / 127.0.0.1 / [::1]:PORT), or
+                                https://<dns-name>[:443]/… for a remote
+                                server.
 
 --mcp-token NAME=SECRET_NAME    Repeatable. Attaches a bearer token to a
                                 --mcp NAME=URL. SECRET_NAME refers to a
@@ -58,59 +60,51 @@ Combinations:
 
 - `--mcp` is **additive** with the user's persistent MCP config
   (`~/.claude.json` etc) — per-run servers extend, they don't
-  replace. The persistent home is bind-mounted; pillbox doesn't
-  touch it.
-- `--mcp` URLs are resolved against the **caller's machine** (a
-  host-local MCP server reachable from the sandbox). The managed
-  tier, when it lands, will need its own URL-reachability design.
+  replace. Pillbox writes its own file next to the agent's config in
+  the guest home clone and doesn't touch the persistent one.
+- The managed tier refuses `--mcp` (URL reachability from a hosted
+  sandbox is its own design).
 
 ## How it's wired
 
-For each `--mcp NAME=URL`:
+Each agent adapter (`src/agents/mcp.rs`) renders the attachments as a
+substrate-neutral injection — guest files, extra agent argv, guest env — and the
+libkrun launch lands it: files are written 0600 into the run's guest-home clone
+(never the persistent auth home), argv is appended to the agent command, env
+joins the guest env.
 
-1. Pillbox generates a per-run MCP config file in a tempdir on
-   the host (cleaned up at run exit via `tempfile::NamedTempFile`,
-   same pattern as the vault's stub creds).
-2. The tempfile is bind-mounted read-only into the sandbox at a
-   fixed guest path (e.g. `/etc/pillbox/mcp.json`).
-3. The agent's argv is extended with the appropriate
-   per-invocation flag so the agent loads it without mutating its
-   persistent home.
+| Agent    | URL mechanism                                                        | Token mechanism (`--mcp-token`)                                                                |
+|----------|----------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| Claude   | `~/.pillbox/mcp.json` + `--mcp-config <that path>`                   | Folded into the same 0600 file as `headers.Authorization: "Bearer <value>"`.                   |
+| Codex    | `-c mcp_servers.NAME.url="URL"` per attachment                       | Env-var indirection: `PILLBOX_MCP_TOKEN_<NAME>=<value>` in the guest env, referenced via `-c mcp_servers.NAME.bearer_token_env_var=…`. Token value never lands in argv. |
+| OpenCode | `~/.pillbox/opencode-mcp.json` named by `OPENCODE_CONFIG`            | Folded into that 0600 file as `headers.Authorization: "Bearer <value>"`.                       |
 
-Per-agent details:
+A server-mode agent (opencode serve) takes file + env injections only; an
+adapter that needs argv is refused there.
 
-| Agent  | URL mechanism                                          | Token mechanism (`--mcp-token`)                                                                |
-|--------|--------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| Claude | tempfile + `--mcp-config /etc/pillbox/mcp.json`        | Folded into the same 0600 tempfile JSON as `headers.Authorization: "Bearer <value>"`.          |
-| Codex  | `-c mcp_servers.NAME.url="URL"` per attachment        | Env-var indirection: `PILLBOX_MCP_TOKEN_<NAME>=<value>` set via `-e`, referenced via `-c mcp_servers.NAME.bearer_token_env_var=…`. Token value never lands in argv. |
+## Reaching the server from the microVM
 
-The codex path uses env-var indirection (vs inline `http_headers.Authorization` in argv) so `ps` on the host can't see the token. Symmetric with Claude's "token-in-0600-tempfile, not-in-argv" stance.
+The guest's `localhost` is not the host's, and the microVM's only network path
+is the egress gateway (`10.0.2.2`). Each URL is routed one of two ways; anything
+else is a usage error:
 
-The injection contract lives in the agent adapter (`src/agents/`),
-not in shared run code — each agent has different per-run config
-mechanics.
-
-## URL rewriting
-
-The agent runs inside Docker. The host's `localhost` is not the
-sandbox's `localhost`. Pillbox rewrites:
-
-- `http://localhost:N/...`   → `http://host.docker.internal:N/...`
-- `http://127.0.0.1:N/...`   → `http://host.docker.internal:N/...`
-
-Anything else (a real hostname, an IP, a DNS-resolvable name) passes
-through unchanged. The sandbox already gets `--add-host=
-host.docker.internal:host-gateway` for the vault, so the alias
-resolves on Linux too.
+- **Host loopback** — `http(s)://localhost|127.0.0.1|[::1]:PORT/…`. The gateway
+  forwards `10.0.2.2:PORT` to the host's `127.0.0.1:PORT`, and the agent is
+  given the URL rewritten to `10.0.2.2:PORT`. Ports 53 and 443 are refused: the
+  gateway's own DNS and TLS listeners own them.
+- **Remote** — `https://<dns-name>[:443]/…`. The host name joins the run's
+  egress allowlist, so the fence resolves it and the gateway's TLS leg carries
+  it. Plain `http://`, a port other than 443, an IP address, or another
+  loopback name is refused: the fence resolves allowlisted names and
+  terminates only 443.
 
 ## Gotcha: DNS-rebinding protection on the server
 
 Most MCP server libraries (FastMCP, Starlette/uvicorn-based servers,
 many Express-based ones) ship with DNS-rebinding protection that
 allows the `Host` header to be `localhost` or `127.0.0.1` *only*.
-Pillbox rewrites the URL to `host.docker.internal` so the sandbox
-can reach the host, which means the request arrives with
-`Host: host.docker.internal:<port>` and the server rejects it.
+A host-loopback attachment reaches the server through the gateway with
+`Host: 10.0.2.2:<port>`, which such a server rejects.
 
 The symptom on the Claude side is `/mcp` showing the server as
 **failed** with a body like:
@@ -126,10 +120,10 @@ few common recipes:
 
 | Server stack                 | Fix                                                                                  |
 |------------------------------|--------------------------------------------------------------------------------------|
-| FastMCP (Python)             | `FastMCP(..., transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))` — or pass `allowed_hosts=["host.docker.internal", "localhost", "127.0.0.1"]` to scope it |
-| Starlette / uvicorn (direct) | Drop `TrustedHostMiddleware`, or add `host.docker.internal` to its `allowed_hosts`   |
+| FastMCP (Python)             | `FastMCP(..., transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))` — or pass `allowed_hosts=["10.0.2.2:7777", "localhost:7777", "127.0.0.1:7777"]` to scope it |
+| Starlette / uvicorn (direct) | Drop `TrustedHostMiddleware`, or add `10.0.2.2` to its `allowed_hosts`               |
 | Express + helmet             | Remove `helmet.hostCheck()` or extend its allowlist                                  |
-| Custom Node/Go/Rust          | Whatever your `Host`-header allowlist is, add `host.docker.internal` to it           |
+| Custom Node/Go/Rust          | Whatever your `Host`-header allowlist is, add `10.0.2.2` to it                       |
 
 If the server you're attaching is third-party and you can't change
 its config, the workaround is to run a thin reverse proxy (caddy,
@@ -163,12 +157,11 @@ attachment. Mitigations are operational, not technical:
 secret store as `--with`. Tokens are designed to stay off the host
 process listing:
 
-- **Claude**: token folded into the 0600 tempfile JSON
+- **Claude / OpenCode**: token folded into the 0600 guest config file
   (`headers.Authorization: "Bearer <value>"`). Argv is token-free.
-- **Codex**: token lands in the container env as
-  `PILLBOX_MCP_TOKEN_<NAME>=<value>` (set via docker `-e`). The
-  argv carries only the env var *name* via
-  `-c mcp_servers.NAME.bearer_token_env_var=…`.
+- **Codex**: token lands in the guest env as
+  `PILLBOX_MCP_TOKEN_<NAME>=<value>`. The argv carries only the env
+  var *name* via `-c mcp_servers.NAME.bearer_token_env_var=…`.
 
 Codex's NAME → env var transform is uppercase + `-`→`_`:
 `code-search` → `PILLBOX_MCP_TOKEN_CODE_SEARCH`. The resolver
@@ -182,10 +175,11 @@ boundary before launching the sandbox.
 ## v0 scope
 
 - HTTP-transport MCP only
-- Both agents wired: Claude (file-based) + Codex (`-c` flag)
+- Three agents wired: Claude and OpenCode (file-based) + Codex (`-c` flag)
 - `--mcp NAME=URL` flag, repeatable. NAME is `[A-Za-z][A-Za-z0-9_-]*`
 - `--mcp-token NAME=SECRET_NAME` for bearer auth, secret-store sourced
-- `localhost` / `127.0.0.0/8` / `::1` / `*.localhost` → `host.docker.internal`
+- Host-loopback servers forwarded at the gateway; remote servers over
+  `https://<dns-name>:443` only
 - Additive with persistent agent config (no `--strict-mcp-config`)
 - No supervision, no manifests, no scope registry, no lookup keys
 

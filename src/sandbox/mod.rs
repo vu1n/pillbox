@@ -18,12 +18,12 @@ pub(crate) mod appserver;
 pub(crate) mod appserver_client;
 pub(crate) mod exec_channel;
 pub(crate) mod http;
+// The build boundary: only code that names this module (or smoltcp) is gated on the libkrun feature.
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
 pub(crate) mod managed;
 pub(crate) mod oci;
 pub(crate) mod opencode;
-#[cfg(feature = "libkrun")]
 pub(crate) mod structured;
 pub(crate) mod substrate;
 
@@ -45,10 +45,8 @@ use crate::session::Session;
 /// child nobody waits on stays a zombie of that caller. Dropping it hands the
 /// child to a waiter thread; the explicit methods consume it instead.
 // A detached child is reaped when dropped, so a dead child never reads as alive to signal-0 probes.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct DetachedChild(Option<std::process::Child>);
 
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 impl DetachedChild {
     pub(crate) fn spawn(cmd: &mut std::process::Command) -> std::io::Result<Self> {
         Ok(Self(Some(cmd.spawn()?)))
@@ -113,7 +111,7 @@ impl Drop for DetachedChild {
 
 /// What a backend can do — **declared, not chased**. The plane queries this to
 /// decide whether a verb is available on the current substrate, instead of
-/// discovering a `bail!("docker only")` buried in a command. Default = all
+/// discovering a `bail!("libkrun only")` buried in a command. Default = all
 /// false: a backend opts into each capability it actually supports. The matrix
 /// is in docs/substrate-plane.md.
 //
@@ -176,6 +174,16 @@ pub(crate) trait SandboxBackend {
         Err(self.capabilities().unsupported("execution execute"))
     }
 
+    /// Run the sealed project verifier `probe` against the committed tree in
+    /// `repository` (`execution verify-project`), printing its JSON record.
+    fn verify_project(
+        &self,
+        _probe: &std::path::Path,
+        _repository: &std::path::Path,
+    ) -> Result<()> {
+        Err(self.capabilities().unsupported("execution verify-project"))
+    }
+
     /// Launch one run and hand back what started (or finished). Backends never
     /// print the outcome: the CLI renders it, and dispatch/eval read it typed.
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
@@ -218,12 +226,43 @@ pub(crate) trait SandboxBackend {
     ) -> Result<crate::sandboxes::Sandbox> {
         Err(self.capabilities().unsupported("sandbox spawn"))
     }
+
+    /// Run `spec`'s interactive login in a throwaway sandbox whose auth home is
+    /// `home`, returning the login command's exit code.
+    fn login(
+        &self,
+        _spec: &AgentSpec,
+        _resolved: &Pillbox,
+        _home: &std::path::Path,
+    ) -> Result<i32> {
+        Err(self.capabilities().unsupported("auth login"))
+    }
+
+    /// Run grader `cmd` over `workspace` in a one-shot sandbox (`session score
+    /// --in-sandbox`), returning its exit code and raw output. Only a backend
+    /// declaring `in_sandbox_grading` overrides this.
+    fn score_in_sandbox(
+        &self,
+        _resolved: &Pillbox,
+        _workspace: &std::path::Path,
+        _cmd: &str,
+        _egress_allow: &[String],
+        _drop_privileges: bool,
+    ) -> Result<(i32, String)> {
+        Err(self
+            .capabilities()
+            .unsupported("session score --in-sandbox"))
+    }
+
+    /// The host checks `pillbox doctor` adds when this substrate is selected.
+    fn host_checks(&self) -> Vec<crate::doctor::Check> {
+        Vec::new()
+    }
 }
 
 /// What `sandbox spawn` asks a backend for: an optional agent harness to
 /// provision (its credentials env-forked, the guest user non-root), the host
 /// workspace to clone into the sandbox, and an optional `sandbox list` label.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxSpawn {
     pub(crate) agent: Option<String>,
@@ -258,7 +297,6 @@ pub(crate) trait SandboxTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Destroyed {
     /// The sandbox was stopped and its files removed, then its record.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only libkrun sandboxes run
     TornDown,
     /// Only the record was dropped: nothing it ran was torn down.
     RecordDropped,
@@ -348,7 +386,6 @@ pub(crate) enum Started {
     /// auto-send for server agents, so `pending_prompt` is the prompt `run` was
     /// given (if any), for the caller to send.
     // Only the libkrun backend runs server and structured agents.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     ServerReady {
         session: Session,
         pending_prompt: Option<String>,
@@ -357,7 +394,6 @@ pub(crate) enum Started {
     /// events it wrote, including the terminal one; a non-zero `exit_code` is the
     /// agent's failure, which the caller decides how to surface.
     // Only the libkrun backend runs server and structured agents.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     StructuredFinished {
         session: Session,
         events: usize,
@@ -437,7 +473,6 @@ pub(crate) trait LiveSession {
     fn spawn_log_tailer(&self, resolved: &Pillbox) -> Result<Option<TailerHandle>>;
 
     /// HTTP handle to a server-mode agent's in-sandbox server. `caps().server_mode`.
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     fn http(&self) -> Result<Box<dyn SandboxHttp>>;
 
     /// Host path of this session's (result) workspace.
@@ -544,7 +579,6 @@ impl LiveSession for RetiredSession {
 /// PTY agent — never re-branching on integration or backend. (The managed backend
 /// overrides `send` entirely: its turn goes to the DO's `/input`, not an HTTP
 /// server the host can reach.)
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn drive_server_prompt(
     session: &Session,
     http: &dyn SandboxHttp,
@@ -673,11 +707,6 @@ mod tests {
             .backend()
             .expect("managed builds everywhere");
         assert_eq!(managed.kind(), SubstrateKind::Managed);
-        #[cfg(feature = "libkrun")]
-        assert_eq!(
-            SubstrateKind::Libkrun.backend().unwrap().kind(),
-            SubstrateKind::Libkrun
-        );
     }
 
     #[test]
@@ -798,6 +827,10 @@ mod tests {
     #[cfg(feature = "libkrun")]
     #[test]
     fn live_session_dispatches_libkrun_to_microvm_family() {
+        assert_eq!(
+            SubstrateKind::Libkrun.backend().unwrap().kind(),
+            SubstrateKind::Libkrun
+        );
         let s = Session::test_fixture();
         let live = live_session(&s).expect("libkrun session resolves to a LiveSession");
         assert!(

@@ -1,6 +1,6 @@
 //! The OpenCode 2 driver behind `pillbox.text/2`: one tool-free turn in an
 //! invocation-owned microVM, with the same stages, stage evidence and session events
-//! as the Codex path (`text.rs`). What the frames mean is [`super::opencode`].
+//! as the Codex path (`text.rs`). What the frames mean is [`crate::execution::opencode`].
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 
-use super::evidence::ExecutionEvidence;
-use super::opencode::{self, Plan, TurnFold};
-use super::store::OwnedInvocation;
-use super::text::{check_live, FailedStage, Stages};
-use super::text_v2::{TextRequestV2, Turn, ADAPTER_REVISION};
-use super::usage::TurnUsage;
 use crate::contract::{Custom, Payload};
+use crate::execution::evidence::ExecutionEvidence;
+use crate::execution::microvm::text::{check_live, FailedStage, Stages};
+use crate::execution::microvm::text_v2::{TextRequestV2, Turn, ADAPTER_REVISION};
+use crate::execution::opencode::{self, Plan, TurnFold};
+use crate::execution::store::OwnedInvocation;
+use crate::execution::usage::TurnUsage;
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::opencode::{launch_staged, OpencodeInput};
 use crate::sandbox::libkrun::repository::VmLimits;

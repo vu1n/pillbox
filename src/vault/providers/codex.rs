@@ -31,7 +31,6 @@
 //! path, deferred until the ApiKey vault track lands.
 
 use super::{mint_stub, HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest, VaultProvider};
-#[cfg(feature = "libkrun")]
 use super::{LibkrunOAuthStub, OAuthRelease};
 use crate::vault::token_store::RefreshDecider;
 
@@ -232,7 +231,6 @@ impl OAuthCodec for CodexProvider {
         Ok(HostProxyOAuthStub { credentials })
     }
 
-    #[cfg(feature = "libkrun")]
     fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
         let Some(tokens) = real.get_mut("tokens").and_then(|v| v.as_object_mut()) else {
             return LibkrunOAuthStub {
@@ -276,7 +274,6 @@ impl OAuthCodec for CodexProvider {
     }
 }
 
-#[cfg(feature = "libkrun")]
 fn mint_libkrun_access_stub() -> String {
     use base64::Engine as _;
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);

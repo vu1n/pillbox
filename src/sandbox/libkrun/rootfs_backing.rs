@@ -6,7 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 
 const PREPARATION_LIMIT: Duration = Duration::from_secs(120);
 
@@ -445,7 +445,7 @@ mod macos {
                     mounted_at(&mountpoint)?.context("attached rootfs image is not mounted")?;
                 verify_mount(&source, &mountpoint, &mount)?;
             }
-            _ => bail!("rootfs backing mount and sparse bundle identity disagree"),
+            _ => anyhow::bail!("rootfs backing mount and sparse bundle identity disagree"),
         }
         check_live(deadline, cancelled)?;
         let volume_meta = fs::symlink_metadata(&mountpoint)?;
@@ -624,7 +624,7 @@ mod macos {
                         );
                         match_source = Some(source.to_owned());
                     } else if ours && mounted.is_some() {
-                        bail!("rootfs sparse bundle is mounted at a different path");
+                        anyhow::bail!("rootfs sparse bundle is mounted at a different path");
                     }
                 }
             }
@@ -707,7 +707,7 @@ mod tests {
                 |path| {
                     assert_eq!(path, namespace);
                     probed = true;
-                    bail!("case folding observed inside namespace")
+                    anyhow::bail!("case folding observed inside namespace")
                 },
             )
             .unwrap_err();

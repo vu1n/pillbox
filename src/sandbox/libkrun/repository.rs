@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use super::{EgressSpec, RefreshSpec, SwapPair, VmSpec, VsockAttach};
 use crate::execution::files::FileTree;
 use crate::execution::verifier::{self, VerifierConfiguration};
-use crate::execution::Verifier;
+use crate::execution::{TeardownUnconfirmed, Verifier};
 use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
@@ -110,19 +110,6 @@ impl OwnershipSpec {
         self.remaining_ms.is_some()
     }
 }
-
-/// A caller must not seal a terminal result when this marker is in the error
-/// chain: process ownership still needs recovery and sampling must not restart.
-#[derive(Debug)]
-pub(crate) struct TeardownUnconfirmed;
-
-impl std::fmt::Display for TeardownUnconfirmed {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("owned execution teardown was not confirmed")
-    }
-}
-
-impl std::error::Error for TeardownUnconfirmed {}
 
 fn cleanup_failure(error: anyhow::Error, cleanup: Result<ExitStatus>) -> anyhow::Error {
     match cleanup {

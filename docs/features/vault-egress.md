@@ -46,5 +46,5 @@ Inspect `pillbox vault status`; run a configured vault-capable agent with `pillb
 ## Gotchas
 
 - An ambiguous refresh leaves a pending marker so another caller cannot reuse a possibly consumed token. A provably non-consuming failure can clear it.
-- The maintained libkrun MITM has JIT refresh; the deprecated host proxy has different lifetime constraints. Do not extrapolate one path to the other.
+- Credentials are released only by the libkrun MITM in the VMM child (with JIT refresh). `pillbox sidecar` (`src/vault/server.rs`) is an egress-policy proxy that holds no credentials and leases no stubs: there is no host lease plane. Do not extrapolate one path to the other.
 - Vault substitution alone is not a blanket egress restriction; read the selected path’s policy and explicit deny setting.

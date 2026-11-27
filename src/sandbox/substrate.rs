@@ -500,4 +500,17 @@ mod tests {
         let docker = SubstrateKind::parse_selection(Some("docker")).unwrap_err();
         assert!(docker.to_string().contains("removed"), "{docker}");
     }
+
+    #[cfg(not(feature = "libkrun"))]
+    #[test]
+    fn the_guest_build_refuses_the_libkrun_substrate_as_usage_without_docker() {
+        let Err(err) = SubstrateKind::Libkrun.backend() else {
+            panic!("the guest build has no libkrun backend");
+        };
+        let pillbox = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+        assert_eq!(pillbox.category as i32, 2, "{err}");
+        let text = err.to_string();
+        assert!(text.contains("libkrun"), "{text}");
+        assert!(!text.to_lowercase().contains("docker"), "{text}");
+    }
 }

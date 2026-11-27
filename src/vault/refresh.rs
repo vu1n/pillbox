@@ -78,7 +78,6 @@ pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Va
 
 /// Sealed text uses the caller's remaining budget for both lock wait and the
 /// single refresh POST. Existing interactive callers keep their fixed bounds.
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) fn pre_refresh_until(
     creds_path: &Path,
     agent_id: &str,
@@ -169,7 +168,6 @@ fn pre_refresh_with_deadline(
 /// ever refreshing. Reuses `pre_refresh` verbatim, so the single-writer / at-most-once /
 /// fail-closed invariants are identical to the start-of-run broker refresh; this only
 /// adds the read-back of what `pre_refresh` already established.
-#[cfg(feature = "libkrun")]
 pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(String, u64)> {
     let creds = pre_refresh(creds_path, agent_id)?.ok_or_else(|| {
         // Reached only if a non-broker agent_id were scheduled — but the caller gates on
@@ -204,7 +202,6 @@ pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(S
 /// schedules against, or `None` for a non-broker agent (disables JIT) or creds without
 /// a usable expiry. Reads the LIVE creds file — the guest sees a post-dated stub copy,
 /// but the host file keeps the true expiry the rotation must track.
-#[cfg(feature = "libkrun")]
 pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
     let provider = providers::provider_for(agent_id)?;
     let codec = provider.oauth_codec()?;

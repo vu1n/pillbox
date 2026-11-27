@@ -26,6 +26,11 @@ git-tag archive for reference — not code kept resident in the tree.
 > is **no `crate::oci` module** yet — the build-tool boundary rename hasn't
 > happened. The decision (delete once at parity) still holds; the code is at the
 > "demoted, present" stage, not the end state.
+>
+> **Executed (2026-11-27):** `src/sandbox/docker.rs` and `src/docker.rs` are
+> deleted; the image plumbing lives in `src/sandbox/oci.rs`, the only file that
+> runs `docker`. `PILLBOX_BACKEND=docker` is refused and old docker records are
+> retired (listable, removable, never driven). The drift note above is history.
 
 **Why.** The second agent-run backend is the divergence/parity source that
 stranded features and produced the vault clobber (see

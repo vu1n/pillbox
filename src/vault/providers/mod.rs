@@ -11,7 +11,6 @@ use hudsucker::{
 
 pub(crate) mod anthropic;
 pub(crate) mod codex;
-#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod codex_execution;
 pub(crate) mod github;
 pub(crate) mod openai;
@@ -50,7 +49,6 @@ pub(crate) trait OAuthCodec: RefreshDecider {
 
     /// Build the libkrun env-fork in place. Its release pairs are intentionally a
     /// separate operation: providers may refuse to release a guest refresh stub.
-    #[cfg(feature = "libkrun")]
     fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub;
 }
 
@@ -63,13 +61,11 @@ pub(crate) struct HostProxyOAuthStub {
     pub credentials: serde_json::Value,
 }
 
-#[cfg(feature = "libkrun")]
 pub(crate) struct LibkrunOAuthStub {
     pub access_stub: Option<String>,
     pub releases: Vec<OAuthRelease>,
 }
 
-#[cfg(feature = "libkrun")]
 pub(crate) struct OAuthRelease {
     pub stub: String,
     pub real: String,
@@ -93,7 +89,6 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
     /// endpoints). Used as the egress DNS-fence allowlist so the agent can reach
     /// its provider's API *and* refresh a token; default empty. Consumed only by
     /// the libkrun egress fence (`intercepted_hosts`).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     fn hosts(&self) -> &'static [&'static str] {
         &[]
     }
@@ -127,7 +122,6 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
 /// Every host the registered providers intercept — the egress DNS-fence allowlist
 /// for a sandbox (each provider's API + OAuth/platform endpoints; token endpoints
 /// stay intercepted so the local broker can reject guest rotation).
-#[cfg(feature = "libkrun")]
 pub(crate) fn intercepted_hosts() -> Vec<&'static str> {
     registry()
         .iter()

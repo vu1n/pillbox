@@ -4,14 +4,15 @@ paths:
   - "src/sandbox/mod.rs"
   - "src/commands/run.rs"
   - "src/sandbox/libkrun/**"
-  - "src/docker.rs"
+  - "src/sandbox/oci.rs"
+  - "src/sandbox/substrate.rs"
   - "src/startup.rs"
   - "src/commands/sandbox.rs"
   - "src/sandboxes.rs"
   - "runner/**"
   - "build.rs"
 entry:
-  - "src/sandbox/mod.rs:select_backend"
+  - "src/sandbox/substrate.rs:backend"
   - "src/commands/run.rs:start"
   - "src/sandbox/libkrun/session.rs:prepare_launch"
   - "src/sandbox/libkrun/rootfs.rs"
@@ -50,7 +51,8 @@ With the macOS libkrun toolchain, runner image and agent auth prepared, build/si
 ## Gotchas
 
 - GitHub macOS CI compiles/links and runs non-VM tests; it cannot prove HVF boot.
-- Fresh OCI exports still need Docker as image plumbing. That does not make the deprecated Docker execution backend a maintained alternative.
+- Fresh OCI exports still need Docker as image plumbing (`src/sandbox/oci.rs`, the only file that runs `docker`). The Docker execution backend is deleted: `PILLBOX_BACKEND=docker` is a usage error, and an old docker record is `Substrate::Retired` — listed and removable, never driven.
+- `SubstrateKind::backend` is the one place a substrate kind becomes a backend; on the build without the `libkrun` feature (the in-guest tools build) its libkrun arm is an exit-2 usage error. Only code that names `crate::sandbox::libkrun` is feature-gated.
 - A rebuild can replace the signed binary; use the build/sign script before a manual VM run.
 - `run::start` also runs inside long-lived callers (dispatch, eval): a detached `__krun-vmm` or `__session-tailer` child is spawned as a `sandbox::DetachedChild` (never a bare `Child`): dropping it hands it to a waiter thread, and the failure paths consume it (`kill_and_wait`, or `into_child` for `stop_spawned_vmm`), so an exit never leaves a zombie that signal-0 probes read as alive.
 - The egress fence logs its DNS and TLS decisions to `PILLBOX_KRUN_EGRESS_LOG`, else to a per-run file under `~/.pillbox/krun/egress/` (pruned after 14 days, capped at 4 MiB). A foreground run prints the hosts it refused when it ends; a shared `PILLBOX_KRUN_EGRESS_LOG` gets no summary, since it mixes runs.

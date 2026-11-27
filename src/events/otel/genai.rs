@@ -13,7 +13,7 @@
 //! per pillbox run, parented to the sandbox-side session span via
 //! shared trace_id + the session's deterministic span_id). When the
 //! caller didn't plumb a session_id through (e.g. test fixtures,
-//! local-docker foreground without the wrapper), gen_ai spans fall
+//! a local foreground run without the wrapper), gen_ai spans fall
 //! back to a sandbox_id-rooted trace per lease.
 
 use std::time::SystemTime;

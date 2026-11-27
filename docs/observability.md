@@ -1,10 +1,10 @@
 # Observability
 
-> **Note:** the OTLP + §0 event-log model stands. Pillbox is local-only;
-> the emitters are the local sandboxes — the **Docker** container (default)
-> and the **libkrun** microVM. Under the [libkrun pivot](./libkrun-sandbox.md)
-> the guest's events ride the `pillbox-init` vsock channel to the host, which
-> exports to the §0 log / OTLP. Telemetry is a headline differentiator — see
+> **Note:** the OTLP + §0 event-log model stands. The local emitter is the
+> **libkrun** microVM (the Docker backend is deleted; sections below that
+> describe its host bind-mount path are history). Under the
+> [libkrun pivot](./libkrun-sandbox.md) the guest's events ride the vsock
+> channel to the host, which exports to the §0 log / OTLP. Telemetry is a headline differentiator — see
 > the spec.
 
 Pillbox emits lifecycle telemetry as OTLP without taking a dependency on

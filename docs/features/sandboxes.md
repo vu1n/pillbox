@@ -43,10 +43,11 @@ tests:
 and drives with `sandbox exec` (one command per call, PTY-free) and `sandbox agent`
 (one headless agent turn, normalized to contract events), then removes with
 `sandbox destroy`. The commands are backend-blind: spawn goes through
-`select_backend().spawn_sandbox`, and every other verb through the record's
-`sandbox_target`. Only libkrun declares `long_lived_exec`; the deprecated Docker
-backend refuses spawn; an old docker record (or one with an unknown backend or an
-undecodable libkrun handle) resolves to a record-only target that refuses exec and whose
+`SubstrateKind::selected()?.backend()?.spawn_sandbox`, and every other verb through
+the record's `sandbox_target`, built from the `Substrate` the record stores. Only
+libkrun declares `long_lived_exec`; managed refuses spawn; a record left by the
+removed Docker backend (or one with an unknown backend or an undecodable libkrun
+handle) is `Substrate::Retired` and resolves to a record-only target that refuses exec and whose
 destroy drops the record, names what was left (`docker rm -f <container>`), and exits 0.
 
 ## Sub-features

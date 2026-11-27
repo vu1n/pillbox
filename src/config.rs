@@ -123,8 +123,8 @@ impl WorkspaceConfig {
     }
 }
 
-/// `[runner]` table — selects the docker image pillbox launches
-/// sandboxes from. Pinned per-pillbox so a project that needs a
+/// `[runner]` table — selects the runner image the microVM rootfs is
+/// exported from. Pinned per-pillbox so a project that needs a
 /// newer harness can bump independently of `pillbox` releases.
 ///
 /// Deliberately **not** mirrored into `meta.json` the way
@@ -132,12 +132,12 @@ impl WorkspaceConfig {
 /// choice that should take effect the moment the user edits
 /// `pillbox.toml` — no `pillbox upgrade-meta` step, no "edited
 /// toml but old meta wins" footgun. We pay one TOML re-parse per
-/// `pillbox run`, which is invisible against the docker spawn
-/// that follows. `Deserialize`-only for the same reason: the
+/// `pillbox run`, which is invisible against the VM boot that
+/// follows. `Deserialize`-only for the same reason: the
 /// value flows in from the descriptor and never back out.
 #[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
 pub(crate) struct RunnerConfig {
-    /// Docker image reference (e.g. `ghcr.io/vu1n/pillbox-runner:vX.Y.Z`
+    /// OCI image reference (e.g. `ghcr.io/vu1n/pillbox-runner:vX.Y.Z`
     /// or a locally-built `pillbox:latest`). `None` falls back to the
     /// CLI default — see [`crate::sandbox::oci::default_runner_image`].
     /// Overridden by the `PILLBOX_RUNNER_IMAGE` env var.

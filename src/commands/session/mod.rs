@@ -18,11 +18,8 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, sandbox, session};
 
-mod grader;
+pub(crate) mod grader;
 pub(crate) mod stream;
-
-#[cfg(feature = "libkrun")]
-pub(crate) use grader::{dropped_grader_setup, GRADER_STARTED_PRINTF, RUNUSER};
 
 /// Pid file a detached §0 producer ([`serve_detached_tailer`]) writes in the session
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
@@ -73,8 +70,7 @@ impl DetachedProducerLock {
     }
 }
 
-/// The detached §0 PRODUCER for a reparented session (the libkrun analog of
-/// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
+/// The detached §0 PRODUCER for a reparented session. Re-exec'd as a bare subprocess at
 /// bring-up (`pillbox __session-tailer <dir> <capture> <source> <sid>`), it tails
 /// the guest's persistent capture file → maps → appends to the durable log
 /// until SIGTERM on teardown or the nested producer terminates. This keeps the log
@@ -144,7 +140,6 @@ fn wait_for_discover_tailer(tailer: events::transcripts::TailerHandle) -> Result
 // The detached §0 producer is a libkrun-server affordance, so the consumers
 // (`LibkrunLiveSession::{event_source,ingest}` + `kill_session`) are all under
 // the `libkrun` feature; dead on a build without it.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
     let pid = std::fs::read_to_string(session_dir.join(TAILER_PID_FILE))
         .ok()?
@@ -157,43 +152,9 @@ pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
 /// Is a detached §0 producer currently alive for this session? Pid file + a signal-0 liveness probe.
 /// Readers (`subscribe`/`ingest`) use it to DEFER their own drain — only one writer may append to the
 /// log or events double.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
     tailer_pid(&session::session_dir_path(resolved, &s.id))
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
-}
-
-/// Run a grader in a one-shot microVM (`session score --in-sandbox`); feature-gated.
-#[cfg(feature = "libkrun")]
-fn libkrun_score_in_sandbox(
-    resolved: &Pillbox,
-    workspace: &std::path::Path,
-    cmd: &str,
-    egress_allow: &[String],
-    drop_privileges: bool,
-) -> Result<(i32, String)> {
-    let (code, raw) = sandbox::libkrun::score_in_sandbox(
-        resolved,
-        workspace,
-        cmd,
-        egress_allow,
-        drop_privileges,
-    )?;
-    Ok((code, grader::grader_output_after_start(code, &raw)?))
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_score_in_sandbox(
-    _resolved: &Pillbox,
-    _workspace: &std::path::Path,
-    _cmd: &str,
-    _egress_allow: &[String],
-    _drop_privileges: bool,
-) -> Result<(i32, String)> {
-    Err(PillboxError::usage(
-        "session score",
-        "--in-sandbox requires the libkrun feature (host grading: drop --in-sandbox)",
-    )
-    .into())
 }
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
@@ -1525,13 +1486,16 @@ pub(crate) fn score(resolved: &Pillbox, id: &str, request: &ScoreRequest) -> Res
     // rubric's frame markers are interspersed, so capping here (tail-only) could
     // drop early criteria. `--in-sandbox` runs it in a one-shot microVM.
     let (code, raw) = if in_sandbox {
-        libkrun_score_in_sandbox(
-            resolved,
-            &grade_dir,
-            &exec_cmd,
-            grader_egress,
-            drop_privileges,
-        )?
+        let (code, raw) = sandbox::SubstrateKind::Libkrun
+            .backend()?
+            .score_in_sandbox(
+                resolved,
+                &grade_dir,
+                &exec_cmd,
+                grader_egress,
+                drop_privileges,
+            )?;
+        (code, grader::grader_output_after_start(code, &raw)?)
     } else {
         run_host_grader(&grade_dir, &exec_cmd)?
     };

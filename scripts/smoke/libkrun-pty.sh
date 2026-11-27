@@ -23,8 +23,8 @@ export PILLBOX_BACKEND=libkrun PILLBOX_RUNNER_IMAGE="$IMAGE"
 
 fail() { echo "  ✗ pty-smoke($AGENT): $1"; exit 1; }
 
-# Must be the codesigned libkrun build, or this tests nothing (it'd silently fall
-# back to docker). grep -c (not -q) so `pipefail` doesn't trip on SIGPIPE.
+# Must be the codesigned libkrun build, or this tests nothing (the VM can't
+# start). grep -c (not -q) so `pipefail` doesn't trip on SIGPIPE.
 [ "$(nm "$PB" 2>/dev/null | grep -c LibkrunBackend)" -ge 1 ] \
   || fail "binary lacks the libkrun feature — run scripts/lk-build.sh"
 [ "$(codesign -d --entitlements :- "$PB" 2>/dev/null | grep -c hypervisor)" -ge 1 ] \

@@ -12,9 +12,8 @@
 //!     etc.), and SIGTERM keeps its default disposition (terminate), so the
 //!     run stays killable and a stray Ctrl-A D can't silently destroy it.
 //!
-//! The read/write halves are separate types, so the same pump serves a
-//! cloned `UnixStream` pair (local) and a child process's `stdout`/`stdin`
-//! (docker exec / ssh transports).
+//! The read/write halves are separate types, so the same pump serves any
+//! reader/writer pair (a cloned `UnixStream` pair, a child's `stdout`/`stdin`).
 
 use std::io::{stdin, stdout, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

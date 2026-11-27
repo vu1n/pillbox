@@ -1,6 +1,6 @@
-//! Host-capability probes for the libkrun backend — pure, side-effect-free
-//! checks shared by `doctor` and the launch preflight so "can this host run a
-//! microVM" has a single home.
+//! Host-capability probes for the libkrun backend, shared by `doctor` (through
+//! [`doctor_checks`]) and the launch preflight so "can this host run a microVM"
+//! has a single home.
 //!
 //! Each probe guards a specific, recurring host-side failure that is NOT a
 //! pillbox bug:
@@ -12,7 +12,9 @@
 //! - disk pressure → a half-allocated rootfs/CoW clone stalls the boot, so we
 //!   refuse to start below a floor rather than wedge.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::doctor::Check;
 
 /// Minimum free bytes on the filesystem holding the krun cache before a launch is
 /// safe. 2 GiB: a materialized runner rootfs plus a CoW workspace clone plus the
@@ -167,6 +169,89 @@ fn lib_present(stem: &str) -> bool {
     LIB_DIRS
         .iter()
         .any(|dir| Path::new(dir).join(&file).exists())
+}
+
+/// The checks `pillbox doctor` runs when the libkrun substrate is selected.
+pub(crate) fn doctor_checks() -> Vec<Check> {
+    let virtualization = match virtualization_available() {
+        Ok(()) => Check::ok("virtualization", "CPU virtualization available"),
+        Err(reason) => Check::fail("virtualization", reason),
+    };
+    let deps = match runtime_deps_present() {
+        Ok(()) => Check::ok("libkrun_deps", "runtime dylibs present"),
+        Err(reason) => Check::fail("libkrun_deps", reason),
+    };
+    // Headroom on the filesystem that holds the krun cache (~/.pillbox/krun);
+    // stat the data root, which shares that filesystem and exists earlier. A
+    // warning, not a hard fail — the launch preflight is what refuses to boot.
+    let headroom = {
+        let path = pillbox_data_dir();
+        let free = disk_headroom(&path);
+        let detail = format!(
+            "{} GiB free on {}",
+            free / (1024 * 1024 * 1024),
+            path.display()
+        );
+        if free >= MIN_HEADROOM_BYTES {
+            Check::ok("disk_headroom", detail).optional()
+        } else {
+            Check::fail(
+                "disk_headroom",
+                format!(
+                    "{detail} — below the {} GiB floor; free space before launching",
+                    MIN_HEADROOM_BYTES / (1024 * 1024 * 1024)
+                ),
+            )
+            .optional()
+        }
+    };
+    vec![virtualization, deps, headroom, check_orphan_vmms()]
+}
+
+/// Count of running `__krun-vmm` processes — informational only. The count is
+/// host-wide and carries no per-pillbox attribution, so it may include *another*
+/// pillbox's live session, not just dead orphans; we deliberately do NOT suggest
+/// a host-wide `pkill` (it would kill those live foreign VMs). Never fails the
+/// diagnosis.
+fn check_orphan_vmms() -> Check {
+    let name = "orphan_vmms";
+    // `pgrep -f` matches the full argv, which carries the `__krun-vmm`
+    // subcommand. Exit 0 = matches, 1 = none, >1 = pgrep error/unavailable.
+    match std::process::Command::new("pgrep")
+        .args(["-f", "__krun-vmm"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let count = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            if count == 0 {
+                Check::ok(name, "none").optional()
+            } else {
+                Check::fail(
+                    name,
+                    format!(
+                        "{count} `__krun-vmm` process(es) running — may include other pillboxes' \
+                         live sessions, not just orphans. Manage owned sessions with `pillbox \
+                         session list` / `session rm`; for a confirmed stray, `kill` its specific \
+                         pid"
+                    ),
+                )
+                .optional()
+            }
+        }
+        // Exit 1 is pgrep's "no matches" — the clean case.
+        Ok(out) if out.status.code() == Some(1) => Check::ok(name, "none").optional(),
+        Ok(_) | Err(_) => Check::ok(name, "could not scan (pgrep unavailable)").optional(),
+    }
+}
+
+/// The filesystem location whose free space governs a libkrun launch — the data
+/// root (`~/.pillbox`), same filesystem as the `krun` cache and present earlier.
+fn pillbox_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".pillbox")
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ use crate::sandbox::{RecordOnly, Substrate};
 /// forward (1025) ports.
 pub(super) const EXEC_PORT: u32 = 1026;
 
-/// The uid:gid an agent sandbox's commands run as (the docker `--user 1000:1000`).
+/// The uid:gid an agent sandbox's commands run as (the runner image's agent user).
 const AGENT_UID: u32 = 1000;
 
 /// How long spawn waits for the guest's exec channel to answer: VM boot plus the

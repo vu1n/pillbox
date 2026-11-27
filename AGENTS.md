@@ -7,29 +7,26 @@ screen and documents every command an agent might need to run.
 If you're a human, the README is friendlier. If you're an agent, this is
 what you want.
 
-> **⚠️ Direction note — ONE backend, a local microVM. Docker is DEPRECATED.**
+> **⚠️ Direction note — ONE backend, a local microVM. The Docker backend is DELETED.**
 > The backend is **a single local microVM**. **libkrun** is the current impl (the
 > default build; macOS/HVF only today). **QEMU is under evaluation as the
 > cross-platform single backend** (Mac+Linux+CI via HVF/KVM/TCG) and may replace
 > libkrun — the microVM model and the vault/egress/§0 plumbing are shared, only the
-> VMM launcher differs. **Docker is deprecated and on the path to deletion** — NOT
-> a co-equal backend, NOT held to parity, and it gets **no new features and no
-> bug-fix engineering**. Do not propose, build, or "also do" a docker version of
-> anything. Do not defend docker with "it's cheap" / "cross-platform" / "the
-> CF-container twin" — that framing repeatedly wasted the maintainer's time and is
-> banned. A docker-only bug's resolution is "docker is deprecated," not a fix.
+> VMM launcher differs. The agent-run **Docker backend was removed**:
+> `PILLBOX_BACKEND=docker` is refused, and old docker session/sandbox records only
+> list and drop their record. Docker remains only as **runner-image export
+> plumbing** in `src/sandbox/oci.rs` (the microVM rootfs is exported from the
+> runner image). Do not re-add an agent-run Docker backend, or a docker version of
+> anything.
 >
 > **Core swarm primitives belong on the microVM backend.** pillbox exists for an
 > independent orchestrator to spawn **swarms** — so `sandbox spawn/exec/agent` and
-> `session send` are CORE, not optional. Anything that currently lives only on
-> docker is a **bug to fix by porting to the microVM backend** (top of the
-> backlog), never a reason to keep docker alive.
+> `session send` are CORE, not optional.
 >
 > The **remote** backend plane was removed (`remote add/list/info/rm`,
 > `pillbox run --remote`, the `ssh://`/`e2b://`/`docker://` URL backends are gone).
 > "Remote" returns as the managed tier (Cloudflare by default, optional DigitalOcean compute) — a different shape, built
-> fresh against provider APIs, **not** a port of local docker (so docker earns no
-> "twin" credit). Managed Pillbox is a **single-controller execution runtime**:
+> fresh against provider APIs. Managed Pillbox is a **single-controller execution runtime**:
 > Cloudflare's Sandbox Durable Object may own the container lifecycle, while
 > bounded invocation claims live in D1, immutable evidence lives in R2, and
 > collaboration belongs to Huddles. Pillbox must not introduce a custom Durable
@@ -109,8 +106,9 @@ from a partial memory of a large project.
 - **Rules live in the code.** A rule the code must keep is a one-line comment where the
   code applies it, stating the rule itself, with no pointer to a doc. Change the rule by
   changing the code and its comment together, and say so in the PR.
-- **Backend = libkrun** (the direction note above). Docker's *backend* is
-  deprecated/slated for deletion — don't add features to it.
+- **Backend = libkrun** (the direction note above). The build without the
+  `libkrun` feature is the in-guest tools build with no substrate; only code that
+  names `crate::sandbox::libkrun` (or smoltcp) is gated on the feature.
 - **Durable Objects are default-deny.** Cloudflare Sandbox may use its own DO as
   substrate; new Pillbox-authored DO classes require the maintainer's approval,
   a per-operation read/write budget, retention bound, kill switch, and cost

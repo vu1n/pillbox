@@ -95,6 +95,17 @@ pub(crate) fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
 /// [`Started::StructuredFinished`] with that `exit_code`: the session and its
 /// log are real, and the caller decides whether that is an error.
 pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) -> Result<Started> {
+    // A run flag the substrate can't honor is refused, never ignored.
+    if !opts.mounts.is_empty() {
+        return Err(PillboxError::usage(
+            "run",
+            "--mount (or a preset `mount`) isn't supported: the microVM takes no extra host mounts",
+        )
+        .with_next(
+            "drop --mount; put what the agent needs in the workspace or pass it with --with/--env",
+        )
+        .into());
+    }
     let spec = resolve_agent_spec(resolved, agent)?;
     if let Some(meta) = &resolved.meta {
         if opts.name.is_none() {
@@ -259,6 +270,23 @@ mod tests {
         // In-process callers (json=false) still get the profile check.
         let err = usage_reason(validate_run_request(claude, &opts, false).unwrap_err());
         assert!(err.contains(NO_PROFILE_TRANSPORT), "{err}");
+    }
+
+    #[test]
+    fn a_run_with_an_extra_mount_is_refused_before_launch() {
+        crate::test_util::with_isolated_home("run-mount-refused", || {
+            let opts = RunOpts {
+                mounts: vec!["/a:/b".into()],
+                ..RunOpts::default()
+            };
+            let err = start(&crate::pillbox::global(), Some("claude"), opts).unwrap_err();
+            let pillbox = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+            assert!(
+                matches!(pillbox.category, crate::errors::ExitCategory::Usage),
+                "{err}"
+            );
+            assert!(err.to_string().contains("--mount"), "{err}");
+        });
     }
 
     #[test]

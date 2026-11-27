@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 use super::{Credentials, Resolved};
 use crate::contract::{Custom, Payload};
 use crate::execution::evidence::ExecutionEvidence;
+use crate::execution::microvm::text::{self, FailedStage, Stages};
+use crate::execution::microvm::text_v2::TextRequestV2;
 use crate::execution::store::OwnedInvocation;
-use crate::execution::text::{self, FailedStage, Stages};
-use crate::execution::text_v2::TextRequestV2;
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::{claude_text as launcher, VmLimits};
 

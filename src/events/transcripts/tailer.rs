@@ -613,7 +613,7 @@ impl Tailer {
 
     /// Like [`Tailer::follow`], but also returns once `stop` is set —
     /// after a final [`Tailer::pump`] so the agent's last appended
-    /// lines aren't stranded. The in-process local-docker tailer flips
+    /// lines aren't stranded. The in-process local tailer flips
     /// `stop` when the agent exits.
     ///
     /// Falls back to a polling tick so a missed notification —

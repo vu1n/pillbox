@@ -131,7 +131,6 @@ fn invalid(msg: &str) -> io::Error {
 /// exchange (closing the stream; the guest then kills the command's process
 /// group). A guest that could not start the command, or a stream that closes
 /// before `Exit`, is an error.
-#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn run_exec<S: Read + Write>(
     mut stream: S,
     argv: &[String],

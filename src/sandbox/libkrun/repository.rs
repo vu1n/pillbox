@@ -1004,8 +1004,8 @@ impl SupervisedOwner {
 }
 
 /// Abort a spawned persistent VMM before handing ownership to its session record.
-pub(super) fn stop_spawned_vmm(child: Child) -> Result<ExitStatus> {
-    OwnedProcess::from_child(child, u64::MAX, true)?.stop_and_reap()
+pub(super) fn stop_spawned_vmm(child: crate::sandbox::DetachedChild) -> Result<ExitStatus> {
+    OwnedProcess::from_child(child.into_child(), u64::MAX, true)?.stop_and_reap()
 }
 
 /// Structured one-shot runs are owned until exit, including when the CLI is SIGKILLed.

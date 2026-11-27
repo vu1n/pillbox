@@ -53,7 +53,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use super::{Caps, LiveSession, SandboxBackend};
+use super::{Caps, LiveSession, SandboxBackend, Started};
 use crate::agents::{AgentSpec, RunOpts};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
@@ -124,7 +124,7 @@ impl SandboxBackend for ManagedBackend {
     /// the result back to R2; the host records the result handle on the session.
     /// This builds ONLY the host side — the DO/worker restore+snapshot is a
     /// separate build to the same frozen contract (see docs/managed-tier.md).
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         let supported = require_supported_agent(spec)?;
         self.run_supported(supported, opts, resolved)
     }
@@ -139,7 +139,7 @@ impl ManagedBackend {
         supported: SupportedManagedAgent<'_>,
         opts: RunOpts,
         resolved: &Pillbox,
-    ) -> Result<()> {
+    ) -> Result<Started> {
         let prompt = opts.args.join(" ").trim().to_string();
         if prompt.is_empty() {
             return Err(PillboxError::usage(
@@ -290,19 +290,7 @@ impl ManagedBackend {
         finished.result_snapshot = Some(result_snapshot);
         session::write(resolved, &finished)?;
 
-        if opts.json {
-            crate::session::print_started_json(&finished);
-        } else {
-            println!(
-                "pillbox: ✓ managed session `{}` finished; result snapshot recorded.",
-                finished.id
-            );
-            println!(
-                "         pillbox session pull {}   # rehydrate the result",
-                finished.id
-            );
-        }
-        Ok(())
+        Ok(Started::ManagedFinished(finished))
     }
 }
 
@@ -459,10 +447,6 @@ impl LiveSession for ManagedLiveSession {
             Some(&self.session),
         );
         session::delete(resolved, &self.session.id)?;
-        println!(
-            "pillbox: ✓ managed session `{}` record removed.",
-            self.session.id
-        );
         Ok(())
     }
 }
@@ -1439,29 +1423,8 @@ mod tests {
 
     fn run_opts() -> RunOpts {
         RunOpts {
-            workspace: None,
-            name: None,
-            mounts: Vec::new(),
-            withs: Vec::new(),
-            env_bundles: Vec::new(),
-            env_files: Vec::new(),
-            vault: false,
-            memory: false,
-            memory_briefed: Vec::new(),
-            mcps: Vec::new(),
-            mcp_tokens: Vec::new(),
             args: vec!["must-not-run".into()],
-            detach: false,
-            label: None,
-            json: false,
-            ttl_seconds: None,
-            from_bookmark: None,
-            model: None,
-            profile: None,
-            reasoning_effort: None,
-            temperature: None,
-            egress_allow: Vec::new(),
-            egress_deny: false,
+            ..RunOpts::default()
         }
     }
 

@@ -52,6 +52,9 @@ use crate::contract::{
     Actor, AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart,
     Payload, Role, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
 };
+use crate::events::capture::{
+    open_guest_file, read_line_capped, CappedLine, MAX_CAPTURE_LINE_BYTES,
+};
 use crate::events::log::SessionLog;
 
 /// Stateful opencode-event → §0-payload mapper. One per session stream.
@@ -333,40 +336,63 @@ fn structured_error_message(error: Option<&Value>) -> String {
 ///
 /// Blocks reading the stream until it closes or `stop` is set (observed between
 /// frames — a live caller closes the connection to unblock). Non-JSON `data:`
-/// payloads and unmapped event types are skipped, not errored, so a stray frame
-/// can't wedge the stream. Returns the number of §0 events appended.
+/// payloads, unmapped event types and frames or lines past
+/// [`MAX_CAPTURE_LINE_BYTES`] are skipped, not errored, so a stray or hostile frame
+/// can't wedge the stream or exhaust memory. Returns the number of §0 events appended.
 pub(crate) fn drain_sse<R: std::io::Read>(
     reader: R,
     session_id: &str,
     log: &mut SessionLog,
     stop: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<usize> {
-    use std::io::BufRead as _;
     use std::sync::atomic::Ordering;
 
     let mut mapper = EventMapper::new();
     let mut data = String::new();
+    // Set when the current frame grew past the cap; its `data` is already dropped.
+    let mut oversized_frame = false;
     let mut total = 0;
-    let mut lines = std::io::BufReader::new(reader).lines();
+    let mut reader = std::io::BufReader::new(reader);
+    let mut raw = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let Some(line) = lines.next() else { break };
-        let line = line?;
-        // `lines()` strips `\n` but keeps a `\r` — tolerate CRLF SSE so a blank
-        // `\r` line still terminates a frame and a `data:…\r` doesn't carry the
-        // `\r` into the JSON. (opencode emits bare `\n` today; this is a guard.)
+        // The guest writes this stream: a line or frame past the cap is skipped, never buffered.
+        let line = match read_line_capped(&mut reader, &mut raw, MAX_CAPTURE_LINE_BYTES)? {
+            CappedLine::Eof => break,
+            CappedLine::Oversized(n) => {
+                eprintln!("pillbox: warning: skipped a {n}-byte opencode event line (cap {MAX_CAPTURE_LINE_BYTES})");
+                // A frame that lost a line is incomplete; drop the whole frame.
+                data.clear();
+                oversized_frame = true;
+                continue;
+            }
+            CappedLine::Line => String::from_utf8_lossy(&raw),
+        };
+        // Tolerate CRLF SSE so a blank `\r` line still terminates a frame and a
+        // `data:…\r` doesn't carry the `\r` into the JSON. (opencode emits bare
+        // `\n` today; this is a guard.)
         let line = line.trim_end_matches('\r');
         if let Some(rest) = line.strip_prefix("data:") {
             // SSE allows one optional space after the colon; multiple `data:`
             // lines in a frame join with newlines.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            if oversized_frame || data.len() + 1 + rest.len() > MAX_CAPTURE_LINE_BYTES {
+                if !oversized_frame {
+                    eprintln!("pillbox: warning: skipped an opencode event frame past {MAX_CAPTURE_LINE_BYTES} bytes");
+                }
+                data.clear();
+                oversized_frame = true;
+                continue;
+            }
             if !data.is_empty() {
                 data.push('\n');
             }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            data.push_str(rest);
         } else if line.is_empty() {
             // Blank line ends the frame.
+            oversized_frame = false;
             total += flush_frame(&mut mapper, &mut data, session_id, log)?;
         }
         // `event:` / `id:` / `retry:` / `:comment` lines carry no payload here.
@@ -417,16 +443,26 @@ fn flush_frame(
 ///   emits its first SSE line, so a `watch` right after `run` can beat it; we
 ///   poll for the file to appear rather than giving up (which would silently
 ///   capture nothing for the run-then-watch ordering).
-/// - **Reads before checking `stop`.** On stop we do a final read first, so any
-///   frames the guest flushed during the last poll sleep are still drained
-///   (mirrors the file tailer's final-pump); only a genuine EOF *and* `stop`
-///   ends the drain.
+/// - **Opens only a regular file.** The guest owns the path, so the open goes
+///   through [`open_guest_file`]: a symlink, FIFO or device there ends the read
+///   with an error instead of being followed or blocking.
+/// - **Reads a bounded tail after `stop`.** Once `stop` is seen, reads go on so a
+///   drain can finish the line it is in (the drains themselves stop at the next
+///   line boundary), but at most [`FOLLOW_FINAL_DRAIN_BYTES`] more: a guest can
+///   grow its capture without end (a huge sparse file, one endless line), and the
+///   thread that set `stop` is joining this one.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes still allowed after `stop` was first seen; `None` until then.
+    final_budget: Option<usize>,
 }
+
+/// Most bytes a [`FollowReader`] reads once `stop` is set: two whole capture lines,
+/// more than any line a drain could still log, and never an unbounded guest backlog.
+pub(crate) const FOLLOW_FINAL_DRAIN_BYTES: usize = 2 * MAX_CAPTURE_LINE_BYTES;
 
 impl FollowReader {
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
@@ -438,6 +474,7 @@ impl FollowReader {
             path,
             file: None,
             stop,
+            final_budget: None,
         }
     }
 }
@@ -452,17 +489,34 @@ impl std::io::Read for FollowReader {
                 if self.stop.load(Ordering::Relaxed) {
                     return Ok(0);
                 }
-                match std::fs::File::open(&self.path) {
+                match open_guest_file(&self.path) {
                     Ok(f) => self.file = Some(f),
-                    Err(_) => {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         std::thread::sleep(nap);
                         continue;
                     }
+                    // A symlink, FIFO or device the guest planted is refused, not followed.
+                    Err(e) => return Err(e),
                 }
             }
-            // Read FIRST, then decide on `stop` — so a final read after stop is
-            // observed still drains frames flushed during the previous nap.
-            let n = self.file.as_mut().expect("opened above").read(buf)?;
+            // After stop, only a bounded tail is read, so a guest-grown capture cannot hold off the join.
+            if self.final_budget.is_none() && self.stop.load(Ordering::Relaxed) {
+                self.final_budget = Some(FOLLOW_FINAL_DRAIN_BYTES);
+            }
+            let want = match self.final_budget {
+                Some(0) => return Ok(0),
+                Some(left) => buf.len().min(left),
+                None => buf.len(),
+            };
+            // Read before deciding on `stop`, so frames flushed during the previous nap still drain.
+            let n = self
+                .file
+                .as_mut()
+                .expect("opened above")
+                .read(&mut buf[..want])?;
+            if let Some(left) = self.final_budget.as_mut() {
+                *left -= n;
+            }
             if n > 0 {
                 return Ok(n);
             }
@@ -748,5 +802,130 @@ mod tests {
                 .iter()
                 .all(|e| e.actor == Some(crate::contract::Actor::agent("opencode"))));
         });
+    }
+
+    /// A guest can write a `data:` line, or a frame of many lines, past the cap: it is
+    /// skipped with a warning (even when it is valid JSON that would map) and every
+    /// later frame still drains.
+    #[test]
+    fn an_oversized_sse_line_or_frame_is_skipped_and_later_frames_drain() {
+        let mapped = TOOL_TURN
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|d| {
+                serde_json::from_str::<Value>(d)
+                    .is_ok_and(|v| !EventMapper::new().on_event(&v).is_empty())
+            })
+            .expect("a frame that maps on its own");
+        let pad = "x".repeat(MAX_CAPTURE_LINE_BYTES);
+        let padded = mapped.replacen('{', &format!("{{\"pad\":\"{pad}\","), 1);
+        let half = "y".repeat(MAX_CAPTURE_LINE_BYTES / 2 + 1);
+        let sse = format!("data: {padded}\n\ndata: {half}\ndata: {half}\n\n{TOOL_TURN}");
+        crate::test_util::with_isolated_home("opencode-drain-oversized", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "ses-oc").expect("open log");
+            let stop = AtomicBool::new(false);
+            let n = drain_sse(Cursor::new(sse), "ses-oc", &mut log, &stop).expect("drain");
+            assert_eq!(n, map_capture(TOOL_TURN).len());
+        });
+    }
+
+    /// A guest can grow its capture into a huge sparse file holding one endless line.
+    /// Once the tailer is stopped (a `wait_idle` timeout, a kill), both server drains
+    /// end within the bounded final tail instead of reading the line to its end, so
+    /// the thread joining the tailer is never held off by the guest.
+    #[test]
+    fn a_stopped_follow_drain_ends_inside_an_endless_line() {
+        use crate::events::EventsFormat;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        crate::test_util::with_isolated_home("opencode-follow-stop-endless", || {
+            for format in [EventsFormat::Sse, EventsFormat::Ndjson] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("events.capture");
+                // 1 TiB of zeros, no newline, costing no disk.
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(1 << 40)
+                    .unwrap();
+                let pb = crate::pillbox::global();
+                let mut log = SessionLog::open(&pb, "ses-endless").expect("open log");
+                let stop = Arc::new(AtomicBool::new(false));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let thread_stop = Arc::clone(&stop);
+                let join = std::thread::spawn(move || {
+                    let reader = FollowReader::new(path, Arc::clone(&thread_stop));
+                    let result = crate::events::drain_server_capture(
+                        format,
+                        reader,
+                        "ses-endless",
+                        &mut log,
+                        &thread_stop,
+                    );
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stop.store(true, Ordering::Relaxed);
+                let result = rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("a stopped drain must end inside an endless guest line");
+                assert_eq!(result, Ok(0));
+                join.join().unwrap();
+            }
+        });
+    }
+
+    /// After stop the follower still returns what is left in the file, so a drain can
+    /// finish its current line, then ends at EOF.
+    #[test]
+    fn a_stopped_follow_reader_drains_its_final_tail() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sse");
+        std::fs::write(&path, "data: {}\n\n").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = FollowReader::new(path.clone(), Arc::clone(&stop));
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"data: {\"late\":1}\n\n")
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, ": {}\n\ndata: {\"late\":1}\n\n");
+    }
+
+    /// The follower opens the guest-owned capture path itself: a symlink (to a host
+    /// file) or a FIFO there is an error, never followed and never a hang.
+    #[test]
+    fn follow_reader_refuses_a_symlink_or_fifo_capture() {
+        use std::io::Read as _;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("host-secret");
+        std::fs::write(&secret, "data: {}\n\n").unwrap();
+        let link = dir.path().join("link.sse");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let fifo = dir.path().join("fifo.sse");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        for path in [link, fifo] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let stop = Arc::new(AtomicBool::new(false));
+                let mut buf = [0u8; 64];
+                let _ = tx.send(FollowReader::new(path, stop).read(&mut buf).map(|_| ()));
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the follower must not block on a planted capture");
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }

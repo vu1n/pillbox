@@ -25,7 +25,7 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::{Caps, SandboxBackend};
+use crate::sandbox::{Caps, SandboxBackend, Started};
 use crate::startup::StartupTimer;
 use crate::workspace::{SnapshotHandle, WorkspaceBackend};
 
@@ -81,7 +81,7 @@ impl SandboxBackend for LibkrunBackend {
         super::sandbox_vm::spawn(resolved, req)
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return run_structured(spec, opts, resolved);
         }
@@ -156,7 +156,7 @@ impl SandboxBackend for LibkrunBackend {
         )?;
         match outcome {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
-            _ => Ok(()),
+            _ => Ok(Started::Foreground),
         }
     }
 }
@@ -478,23 +478,24 @@ impl PendingVm {
 
 /// A reparented VMM this CLI spawned but whose record is not committed yet.
 pub(super) struct SpawnedVm {
-    pub(super) child: std::process::Child,
+    pub(super) child: crate::sandbox::DetachedChild,
     pub(super) handle: LibkrunHandle,
 }
 
 impl SpawnedVm {
     /// Run the launch's commit step `f`; on its error, kill the VMM and tear its
     /// files down ([`abandon_launch`]) before returning the error. On success the
-    /// VMM keeps running, owned by the record `f` wrote; its `Child` comes back
-    /// with `f`'s value for a caller that must still be able to stop it.
+    /// VMM keeps running, owned by the record `f` wrote; its child comes back
+    /// with `f`'s value for a caller that must still be able to stop it, and
+    /// dropping it hands the child to a waiter thread.
     pub(super) fn commit<T>(
         mut self,
         verb: &'static str,
-        f: impl FnOnce(&mut std::process::Child, &LibkrunHandle) -> Result<T>,
-    ) -> Result<(T, std::process::Child)> {
+        f: impl FnOnce(&mut crate::sandbox::DetachedChild, &LibkrunHandle) -> Result<T>,
+    ) -> Result<(T, crate::sandbox::DetachedChild)> {
         match f(&mut self.child, &self.handle) {
             Ok(value) => Ok((value, self.child)),
-            Err(e) => Err(abandon_launch(verb, &mut self.child, &self.handle, e)),
+            Err(e) => Err(abandon_launch(verb, self.child, &self.handle, e)),
         }
     }
 }
@@ -507,7 +508,12 @@ pub(super) fn spawn_reparented(
     record: &Path,
     swap_pairs: &[SwapPair],
 ) -> Result<SpawnedVm> {
-    let child = spawn_vmm(&vm.spec, VmmTether::Reparented { record }, swap_pairs)?;
+    // A reparented VMM may outlive a long-lived caller (dispatch, eval): reap it if it exits first.
+    let child = crate::sandbox::DetachedChild::adopt(spawn_vmm(
+        &vm.spec,
+        VmmTether::Reparented { record },
+        swap_pairs,
+    )?);
     vm.preserve();
     let handle = vm.handle(child.id() as i32);
     Ok(SpawnedVm { child, handle })
@@ -1188,8 +1194,9 @@ pub(super) fn agent_launch_creds(
     })
 }
 
-/// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
-/// reparented to init), hand it the reals on stdin, record the session, return.
+/// Start the microVM detached: spawn the VMM child so it outlives the caller (a
+/// waiter thread reaps it while the caller lives; init after), hand it the reals
+/// on stdin, record the session, return.
 /// No pump and no teardown (the clones + spec persist for the running VM;
 /// `kill_session` scrubs them). Codex starts one reparented transcript tailer
 /// after the record commits so repeated read commands never replay its rollout
@@ -1202,7 +1209,7 @@ fn run_detached(
     opts: &RunOpts,
     launch: Launch,
     mut startup: StartupTimer,
-) -> Result<()> {
+) -> Result<Started> {
     let record = crate::session::record_path(resolved, session_id);
     let spawned = spawn_reparented(launch.vm, &record, &launch.swap_pairs)?;
     startup.mark("vmm_spawn");
@@ -1250,18 +1257,11 @@ fn run_detached(
             .with_context(|| format!("detached transcript tailer failed: {e:#}"))?;
         return Err(e).context("start detached session transcript tailer");
     }
-    // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
-    // init and keeps running.
-    if opts.json {
-        crate::session::print_started_json(&session);
-    } else {
-        println!(
-            "pillbox: ✓ session `{}` started in background (libkrun)",
-            session.id
-        );
-        println!("  Next: pillbox session attach {}", session.id);
-    }
-    Ok(())
+    // Don't wait: the child (VM + egress + MITM, with the vault) keeps running;
+    // dropping it hands it to a waiter thread that reaps it if it exits while this
+    // process lives.
+    drop(child);
+    Ok(Started::Detached(session))
 }
 
 /// Builds the guest entrypoint script from `(preamble, quoted_events_path)`.
@@ -1302,7 +1302,7 @@ struct ServerLaunch {
 /// per-agent differences (guest script, events file, egress, bring-up calls)
 /// arrive as a [`ServerLaunch`]; everything else (CoW creds, the `VmSpec`, the
 /// detached `__krun-vmm` spawn, the empty-swap stdin, the session record + event,
-/// the error-path teardown, `print_started`) is identical and lives here so a
+/// the error-path teardown, the returned [`Started::ServerReady`]) is identical and lives here so a
 /// launch invariant can't drift between the two agents. The VM outlives the CLI
 /// (reaped by `session rm`); the call returns once the agent session exists and
 /// does NOT auto-send (the first prompt goes through `session send`). Differs
@@ -1313,7 +1313,7 @@ fn launch_server_vm(
     opts: RunOpts,
     resolved: &Pillbox,
     launch: ServerLaunch,
-) -> Result<()> {
+) -> Result<Started> {
     let mut startup = StartupTimer::start();
     // Non-vault: refuse --vault / vaulted --with before anything else (the shared
     // base would otherwise compose them into the guest env).
@@ -1431,7 +1431,7 @@ fn launch_server_vm(
     // Bring-up over the forward; a failure tears the VM down rather than leaking
     // it + the clones. The success path leaves the child running, reparented;
     // `kill_session` reaps that one by spec path.
-    let (session, _child) = spawned.commit("run", |_child, handle| {
+    let (session, child) = spawned.commit("run", |_child, handle| {
         let agent_session_id = (launch.bringup)(&http)?;
         startup.mark("server_ready");
         let session = crate::session::Session {
@@ -1490,14 +1490,14 @@ fn launch_server_vm(
         Ok(session)
     })?;
 
+    // The VMM keeps running; dropping `child` hands it to a waiter thread.
+    drop(child);
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
-    crate::sandbox::opencode::print_started(
-        &session,
-        opts.json,
-        (!prompt.is_empty()).then_some(prompt.as_str()),
-    );
-    Ok(())
+    Ok(Started::ServerReady {
+        session,
+        pending_prompt: (!prompt.is_empty()).then_some(prompt),
+    })
 }
 
 fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
@@ -1507,14 +1507,14 @@ fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
         .find_map(|line| line.strip_prefix("krun-vmm: ").map(str::to_string))
 }
 
-fn fail_structured_launch(
+fn fail_structured_launch<T>(
     resolved: &Pillbox,
     agent_id: &str,
     session: &mut crate::session::Session,
     requested: Option<crate::contract::RequestedRunProfile>,
     log: &mut crate::events::log::SessionLog,
     error: anyhow::Error,
-) -> Result<()> {
+) -> Result<T> {
     // An unconfirmed shutdown still owns recovery state; never announce completion.
     if error
         .downcast_ref::<super::repository::TeardownUnconfirmed>()
@@ -1549,7 +1549,7 @@ fn fail_structured_launch(
 /// The VM has no PTY and no prompt API: the agent writes native JSONL to the
 /// host-readable cloned home, then the supervising host normalizes that capture
 /// into the session log before returning.
-fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::structured as structured_io;
 
     let profile = spec.structured.as_ref().ok_or_else(|| {
@@ -1761,7 +1761,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let process_exit = status.code().unwrap_or(1);
     let capture = creds_share.join(events_file);
     let drained = (|| -> Result<(usize, i32)> {
-        let file = std::fs::File::open(&capture).with_context(|| match vmm_diagnostic.as_deref() {
+        let file = crate::events::capture::open_guest_file(&capture).with_context(|| match vmm_diagnostic.as_deref() {
             Some(diagnostic) => format!(
                 "{} VMM exited with code {process_exit} before creating structured capture: {diagnostic}",
                 spec.id
@@ -1818,20 +1818,12 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         }
     };
     crate::events::emit_session_event(resolved, terminal, &session.id, Some(&session));
-    if opts.json {
-        crate::session::print_started_json(&session);
-    } else {
-        println!(
-            "pillbox: ✓ {} session `{}` finished ({} durable events)",
-            spec.id,
-            session.id,
-            outcome_events + 1
-        );
-    }
-    if outcome_exit_code != 0 {
-        bail!("{} structured run exited {}", spec.id, outcome_exit_code);
-    }
-    Ok(())
+    // The terminal event above is durable too, so it counts.
+    Ok(Started::StructuredFinished {
+        session,
+        events: outcome_events + 1,
+        exit_code: outcome_exit_code,
+    })
 }
 
 /// Resolve the structured agent's `--model` request from its [`StructuredProfile`]
@@ -1904,7 +1896,7 @@ fn resolve_structured_request(
 }
 
 /// opencode via `opencode serve` — fills a [`ServerLaunch`] for [`launch_server_vm`].
-fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::opencode;
 
     let model = opts
@@ -1968,7 +1960,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
 /// login), which the [`codex` vault provider](crate::vault::providers) doesn't yet
 /// intercept — so `--vault` is rejected until that interception lands; the egress
 /// fence still confines the VM to the OpenAI/ChatGPT hosts.
-fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::appserver_client as appserver;
 
     // The bridge does not pass a model to codex (it uses its configured default),
@@ -2114,22 +2106,23 @@ fn spawn_session_tailer(
     };
     let dir = crate::session::session_dir(resolved, &session.id)?;
     let exe = std::env::current_exe().context("locate pillbox transcript tailer executable")?;
-    let mut child = Command::new(exe)
-        .arg("__session-tailer")
-        .arg(&dir)
-        .arg(&capture)
-        .arg(source.as_token())
-        .arg(&session.id)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn detached session transcript tailer")?;
+    let mut child = crate::sandbox::DetachedChild::spawn(
+        Command::new(exe)
+            .arg("__session-tailer")
+            .arg(&dir)
+            .arg(&capture)
+            .arg(source.as_token())
+            .arg(&session.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .context("spawn detached session transcript tailer")?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if crate::commands::session::detached_tailer_alive(resolved, session) {
-            return Ok(());
+            return Ok(()); // `child` drops into a waiter thread
         }
         if let Some(status) = child
             .try_wait()
@@ -2138,8 +2131,7 @@ fn spawn_session_tailer(
             bail!("detached transcript tailer exited before readiness ({status})");
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill_and_wait();
             bail!("timed out waiting for the detached transcript tailer to become ready");
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -2581,7 +2573,6 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
     // host-wide `__krun-vmm` sweep (`~/.pillbox/krun/` is shared across pillboxes,
     // so a scan can't tell a dead local orphan from another pillbox's *live* VM;
     // the spec path is the attribution that makes the reap safe).
-    println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
 
@@ -2943,7 +2934,7 @@ pub(super) fn vmm_command_for(exe: &Path, spec_path: &Path, tether: VmmTether<'_
 /// boot, else `cause`. `verb` is the command that launched it.
 pub(super) fn abandon_launch(
     verb: &'static str,
-    child: &mut std::process::Child,
+    mut child: crate::sandbox::DetachedChild,
     handle: &LibkrunHandle,
     cause: anyhow::Error,
 ) -> anyhow::Error {
@@ -2952,8 +2943,7 @@ pub(super) fn abandon_launch(
     // clobber that status with SIGKILL and mask the actionable cause. Reap before
     // removing the clones so we don't race the dying child's virtio-fs mounts.
     let self_status = child.try_wait().ok().flatten();
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.kill_and_wait();
     if let Err(teardown) = teardown_handle(handle) {
         return teardown.context(format!("{verb} failed: {cause:#}"));
     }
@@ -3115,7 +3105,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         // than tailing, and the never-set stop flag is meaningless on this path.
         let path = server_events_file(&self.session)?;
         let format = self.events_format()?;
-        let file = std::fs::File::open(&path).map_err(|e| {
+        let file = crate::events::capture::open_guest_file(&path).map_err(|e| {
             PillboxError::runtime(
                 "session ingest",
                 format!("open events file {}: {e}", path.display()),
@@ -3315,7 +3305,7 @@ mod tests {
             } else {
                 anyhow::anyhow!("injected startup failure")
             };
-            let error = fail_structured_launch(
+            let error = fail_structured_launch::<()>(
                 &resolved,
                 "pi",
                 &mut session,
@@ -3450,7 +3440,7 @@ mod tests {
             let mut command = Command::new("/bin/sleep");
             command.arg("30");
             vmm_own_process_group(&mut command);
-            let child = command.spawn().unwrap();
+            let child = crate::sandbox::DetachedChild::spawn(&mut command).unwrap();
             let group = child.id() as i32;
             let spawned = SpawnedVm {
                 child,

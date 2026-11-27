@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live e2e smoke for `pillbox dispatch` (GHOST-004): fork k workers from a
 # bookmark → drive each (send the segment prompt) → score → select → pull. The
-# first real exercise of the dispatch CliDriver on booted VMs — unit tests cover
+# first real exercise of the dispatch SessionDriver (in-process) on booted VMs — unit tests cover
 # the selection/retry POLICY, this covers the fork/drive/score/pull WIRING and
 # the agent turn-semantics they can't reach.
 #
@@ -21,8 +21,8 @@ export PILLBOX_BACKEND="$BACKEND" PILLBOX_RUNNER_IMAGE="$IMAGE"
 fail() { echo "  ✗ dispatch: $1"; exit 1; }
 
 # libkrun-only today: dispatch's grader resolves each worker's *live* workspace
-# via `session info --json` → `.session.workspace`, which only libkrun sessions
-# populate (`libkrun_workspace_path`). Docker dispatch needs a non-libkrun
+# in-process via `commands::session::workspace_of` (the session's
+# `LiveSession::workspace_path`), which only libkrun sessions provide. Docker dispatch needs a non-libkrun
 # workspace-resolution path (pull-then-score, or score-by-result-snapshot) —
 # deferred, see docs/dispatch.md. Skip (don't fail the suite) on docker.
 if [ "$BACKEND" != libkrun ]; then

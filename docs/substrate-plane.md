@@ -62,7 +62,10 @@ same pattern to the one surface still doing string-match dispatch: the **PTY + l
 ```rust
 // src/sandbox/mod.rs — backend = launch + capability profile; the session is the PLANE.
 trait SandboxBackend {
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
+    // Returns what started (Foreground / Detached / ServerReady /
+    // StructuredFinished / ManagedFinished) and never prints it; the CLI
+    // renders it (commands::run::render_started), dispatch/eval read it typed.
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
     fn capabilities(&self) -> Caps;
 }
 // The single backend-dispatch point: build the plane handle for an EXISTING

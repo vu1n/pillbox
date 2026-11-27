@@ -16,28 +16,31 @@
 //!   fork-per-segment, is what cuts variance + lifts the mean. The two compose:
 //!   `--segments -k N` = best-of-k over segmented chains.
 //!
-//! **Orchestration is subprocess, not in-process.** The loop drives workers by
-//! self-exec'ing the pillbox binary (`run`/`session …`) and parsing the
-//! documented `--json` contracts — the same way the repo's existing eval /
-//! router / smoke stack drives sessions (`scripts/eval/lib.sh`,
-//! `scripts/router/cost-router.py`). The session handlers are private and return
-//! `Result<()>`, not values, so an in-process path would mean re-shaping them +
-//! the run path (a cross-cutting refactor); the CLI `--json` surface exists
-//! precisely for this. The loop sits behind [`WorkerDriver`] so the selection /
-//! retry **policy** is unit-tested over a mock, while the live [`CliDriver`] is
-//! exercised by the GHOST-004 smoke.
-// ghost is an in-repo tenant that uses only pillbox's public contract (CLIs, §0 events), never its internals.
+//! **Orchestration is in-process over the typed session calls.** The loop forks
+//! workers with `run::start` and drives, grades, pulls and reads them through the
+//! session API (`send`, `wait_idle`, `workspace_of`, `score`, `rehydrate_result`)
+//! and the §0 log reader (`events::log::read_log`) — the same calls the `pillbox run` / `session …` CLI renders, so
+//! a change to a CLI `--json` shape cannot break dispatch. The loop sits behind
+//! [`WorkerDriver`] so the selection / retry **policy** is unit-tested over a
+//! mock; the live [`SessionDriver`] takes its grade-side calls through
+//! [`SessionOps`] so the grading security properties are unit-tested over a
+//! recorder, and is exercised end to end by the GHOST-004 smoke.
+// ghost is an in-repo tenant: it drives sessions only through the typed session calls the CLI also renders (run::start, commands::session), never backend internals.
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::json;
 
 use crate::commands::critic::{
-    edits_from_log, render_state, Critic, CriticPolicy, CriticVerdict, EditRecord, TypesafeCritic,
+    edits_from_events, render_state, Critic, CriticPolicy, CriticVerdict, EditRecord,
+    TypesafeCritic,
+};
+use crate::commands::grading::{
+    dispatch_clone_source, grade_protect_set, grade_worker, grader_vm_available, restore_bookmark,
+    GradeKnobs, GradePolicy, KnobNames, LiveSessions, SessionOps,
 };
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::cost::ObservedUsage;
@@ -45,10 +48,7 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{
-    force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
-};
-use crate::workspace::WorkspaceBackend;
+use crate::workspace::protect::ProtectSet;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
 /// (→ an `Errored` worker, not a whole-dispatch hang). Generous — agent turns run
@@ -94,11 +94,11 @@ impl Grader {
         }
     }
 
-    /// The `session score` flags for this grader.
-    fn flags(&self) -> Vec<String> {
+    /// This grader as the `(cmd, rubric)` pair the session grader takes.
+    fn parts(&self) -> (Option<&str>, Option<&std::path::Path>) {
         match self {
-            Grader::Cmd(c) => vec!["--cmd".into(), c.clone()],
-            Grader::Rubric(p) => vec!["--rubric".into(), p.to_string_lossy().into_owned()],
+            Grader::Cmd(c) => (Some(c.as_str()), None),
+            Grader::Rubric(p) => (None, Some(p.as_path())),
         }
     }
 }
@@ -441,11 +441,10 @@ impl DispatchVerdict {
     }
 }
 
-/// The I/O seam the loop drives workers through. The live [`CliDriver`] shells
-/// out to the pillbox binary; tests substitute a mock so the selection / retry
-/// **policy** is verified without booting a VM. A worker's grade is the
-/// `contract::Scored` the `session score --json` surface emits — deserialized
-/// directly so a wire-contract change is a compile error, not a silent default.
+/// The I/O seam the loop drives workers through. The live [`SessionDriver`]
+/// calls the session API in-process; tests substitute a mock so the selection /
+/// retry **policy** is verified without booting a VM. A worker's grade is the
+/// typed `contract::Scored` the session grader returns.
 trait WorkerDriver {
     /// Fork a new detached worker (the `i`-th, 0-based) from the bookmark → its
     /// session id. The index picks this worker's roster row (`--workers-spec`);
@@ -1136,9 +1135,9 @@ fn run_dispatch_with(
     // BOOTS (each `--detach` worker boots in the background). Server-mode worker
     // turns are driven SERIALLY below; one-shot CLI workers receive their only
     // prompt at launch and are merely awaited/graded below. True turn-level
-    // concurrency would need driving workers on separate threads; the subprocess
-    // `WorkerDriver` calls are independent, so that's a safe future change — not
-    // done here. A fork that fails becomes an `Errored` worker rather than aborting
+    // concurrency would need driving workers on separate threads, and a `Sync`
+    // driver (the live one caches the bookmark tree in a `OnceCell`) — not done
+    // here. A fork that fails becomes an `Errored` worker rather than aborting
     // the batch — the successes are still driven, and no forked worker is left
     // unrecorded (the orphan a `collect::<Result>()?` would leak).
     //
@@ -1600,17 +1599,19 @@ fn drive_segments_inner(
     })
 }
 
-// ── the live CLI driver (subprocess self-exec) ──────────────────────────────
+// ── the live driver (typed in-process session calls) ────────────────────────
 
-/// Drives workers by self-exec'ing the pillbox binary and parsing the documented
-/// `--json` contracts. All subprocesses inherit cwd, so they resolve the same
-/// pillbox as the parent (the session a `fork` creates is found by a later
-/// `grade`/`pull`).
-struct CliDriver<'a> {
-    exe: PathBuf,
+/// Drives workers through the typed session calls in-process: `run::start`
+/// forks, `stream::wait_idle` / `session::send` drive turns, grades and the
+/// winner pull go through [`SessionOps`], and critic edits are read from the
+/// worker's typed §0 events. Everything resolves against `resolved`, so the
+/// session a `fork` creates is the one a later `grade`/`pull` finds.
+struct SessionDriver<'a> {
     resolved: &'a Pillbox,
     opts: &'a DispatchOpts,
     default_agent: String,
+    /// Workspace lookup, grading and pull — the session API outside tests.
+    ops: &'a dyn SessionOps,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
     /// Paths restored from the bookmark in every grade tree.
@@ -1622,19 +1623,18 @@ struct CliDriver<'a> {
     graded: OnceCell<tempfile::TempDir>,
 }
 
-impl<'a> CliDriver<'a> {
+impl<'a> SessionDriver<'a> {
     fn new(
         resolved: &'a Pillbox,
         opts: &'a DispatchOpts,
         default_agent: String,
         protect: ProtectSet,
-    ) -> Result<Self> {
-        let exe = std::env::current_exe().context("locate the pillbox binary")?;
-        Ok(Self::with_exe(exe, resolved, opts, default_agent, protect))
+    ) -> Self {
+        Self::with_ops(&LiveSessions, resolved, opts, default_agent, protect)
     }
 
-    fn with_exe(
-        exe: PathBuf,
+    fn with_ops(
+        ops: &'a dyn SessionOps,
         resolved: &'a Pillbox,
         opts: &'a DispatchOpts,
         default_agent: String,
@@ -1645,10 +1645,10 @@ impl<'a> CliDriver<'a> {
             uuid::Uuid::now_v7().simple()
         ));
         Self {
-            exe,
             resolved,
             opts,
             default_agent,
+            ops,
             rundir,
             protect,
             base: OnceCell::new(),
@@ -1656,17 +1656,9 @@ impl<'a> CliDriver<'a> {
         }
     }
 
-    /// Restore `--from-bookmark` into a fresh temp dir and scrub it like a
-    /// worker's clone — never the warm base cache the workers clone from.
+    /// Restore `--from-bookmark` into a fresh scrubbed temp dir.
     fn restore_bookmark(&self, purpose: &str) -> Result<tempfile::TempDir> {
-        let dir = tempfile::Builder::new()
-            .prefix("pillbox-dispatch-base-")
-            .tempdir()
-            .with_context(|| format!("temp dir for {purpose}"))?;
-        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
-        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
-        crate::workspace::ingest::scrub_secrets(dir.path())?;
-        Ok(dir)
+        restore_bookmark(self.resolved, &self.opts.from_bookmark, purpose)
     }
 
     fn base_tree(&self) -> Result<&std::path::Path> {
@@ -1675,18 +1667,6 @@ impl<'a> CliDriver<'a> {
             let _ = self.base.set(dir);
         }
         Ok(self.base.get().expect("base just set").path())
-    }
-
-    fn live_workspace(&self, id: &str) -> Result<PathBuf> {
-        // `.session.workspace` resolves via the session's `LiveSession`
-        // `workspace_path()` — libkrun sessions only.
-        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
-        let iv: serde_json::Value = serde_json::from_str(&info)
-            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
-        iv["session"]["workspace"]
-            .as_str()
-            .map(PathBuf::from)
-            .context("`session info --json` had no session.workspace (libkrun-only today)")
     }
 
     /// Where worker `id`'s last graded snapshot lives. The directory is a temp
@@ -1707,124 +1687,49 @@ impl<'a> CliDriver<'a> {
     }
 }
 
-/// The project directory `dir` sits in, if any: the resolved pillbox's own
-/// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
-/// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
-/// `.git` (else the cwd itself).
-fn grader_files_inside_project(
-    dir: &std::path::Path,
-    resolved: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    let dir = dir.canonicalize().ok()?;
-    // A selected project pillbox is the only bookmark source; the cwd stands in
-    // for the project only on the global pillbox.
-    let project = match resolved {
-        Some(p) => p.canonicalize().ok()?,
-        None => {
-            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
-            cwd.ancestors()
-                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
-                .unwrap_or(&cwd)
-                .to_path_buf()
-        }
+/// The `RunOpts` (and agent override) that fork worker `i` — what `pillbox run
+/// --from-bookmark B --detach [--agent A] [--model M] [--temperature T]
+/// [--memory] [--ttl D] [-- FIRST_TURN]` parses to, every other flag at its clap
+/// default. `first_turn` is `Some` only when the worker's agent takes its first
+/// turn on the launch argv.
+fn fork_run_opts(
+    opts: &DispatchOpts,
+    i: usize,
+    first_turn: Option<&str>,
+) -> Result<(Option<String>, crate::agents::RunOpts)> {
+    // Per-worker agent/model/temperature from the roster (`--workers-spec`)
+    // falling back to the run-level scalars; without a roster this is the
+    // scalar opts for every worker.
+    let (agent, model, temperature) = resolve_worker(opts, i);
+    // `--ttl` writes `expires_at` so `session prune` can later reap this worker.
+    let ttl_seconds = match &opts.ttl {
+        Some(t) => Some(crate::session::parse_ttl_seconds(t)?),
+        None => None,
     };
-    dir.starts_with(&project).then_some(project)
-}
-
-/// The `session score` argv that grades `tree` for worker `id` inside the
-/// one-shot grader microVM.
-// The reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
-fn score_args(
-    id: &str,
-    tree: &std::path::Path,
-    grader: &Grader,
-    egress: &[String],
-    drop_privileges: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "session".into(),
-        "score".into(),
-        id.into(),
-        "--workspace".into(),
-        tree.to_string_lossy().into_owned(),
-        "--in-sandbox".into(),
-    ];
-    if drop_privileges {
-        args.push("--drop-privileges".into());
-    }
-    for host in egress {
-        args.extend(["--grader-egress".into(), host.clone()]);
-    }
-    args.push("--json".into());
-    args.extend(grader.flags());
-    args
-}
-
-/// Stderr note for a worker whose grade tree had protected paths put back.
-fn reverted_note(id: &str, reverted: &[PathBuf]) -> Option<String> {
-    const SHOWN: usize = 5;
-    if reverted.is_empty() {
-        return None;
-    }
-    let mut list: Vec<String> = reverted
-        .iter()
-        .take(SHOWN)
-        .map(|p| p.display().to_string())
-        .collect();
-    if reverted.len() > SHOWN {
-        list.push(format!("+{} more", reverted.len() - SHOWN));
-    }
-    Some(format!(
-        "pillbox: dispatch: worker {id} changed protected paths; graded with the bookmark's copy: {}",
-        list.join(", ")
-    ))
-}
-
-impl WorkerDriver for CliDriver<'_> {
-    fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
-        // Per-worker agent/model/temperature from the roster (`--workers-spec`)
-        // falling back to the run-level scalars; without a roster this is the
-        // scalar opts for every worker. The argv assembly below is otherwise
-        // unchanged — only these values become per-worker.
-        let (agent, model, temperature) = resolve_worker(self.opts, i);
-        let mut args = vec![
-            "run".into(),
-            "--from-bookmark".into(),
-            self.opts.from_bookmark.clone(),
-            "--detach".into(),
-            "--json".into(),
-        ];
-        if let Some(a) = &agent {
-            args.extend(["--agent".into(), a.clone()]);
-        }
-        if let Some(m) = &model {
-            args.extend(["--model".into(), m.clone()]);
-        }
-        if let Some(t) = &temperature {
-            args.extend(["--temperature".into(), t.to_string()]);
-        }
-        if self.opts.memory {
-            args.push("--memory".into());
-        }
-        if let Some(t) = &self.opts.ttl {
-            // `run --ttl` requires `--detach` (already passed above) and writes
-            // `expires_at` so `session prune` can later reap this worker.
-            args.extend(["--ttl".into(), t.clone()]);
-        }
-        if self.first_turn_driven_on_fork(i) {
-            args.extend(["--".into(), first_turn.into()]);
-        }
+    let run = crate::agents::RunOpts {
+        memory: opts.memory,
         // Server-mode workers get no positional prompt: a `--detach` server comes
-        // up idle; the segment prompt is driven as turn 1 via `session send` (see
-        // `drive_one_inner`). A server treats a baked positional as a pre-fill
+        // up idle and the first turn is driven via `session::send` (see
+        // `drive_one_inner`); a server treats a baked positional as a pre-fill
         // hint, not a turn.
-        let out = self.capture(&args)?;
-        let v: serde_json::Value = serde_json::from_str(&out)
-            .with_context(|| format!("parse `run --json` output: {out:?}"))?;
-        v["session"]["id"]
-            .as_str()
-            .map(str::to_string)
-            .context("`run --json` had no session.id")
+        args: first_turn.map(|t| vec![t.to_string()]).unwrap_or_default(),
+        detach: true,
+        ttl_seconds,
+        from_bookmark: Some(opts.from_bookmark.clone()),
+        model,
+        temperature,
+        // memory_briefed: run::start fills it from the kypp briefing.
+        ..crate::agents::RunOpts::default()
+    };
+    Ok((agent, run))
+}
+
+impl WorkerDriver for SessionDriver<'_> {
+    fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
+        let launch_turn = self.first_turn_driven_on_fork(i).then_some(first_turn);
+        let (agent, run) = fork_run_opts(self.opts, i, launch_turn)?;
+        let started = crate::commands::run::start(self.resolved, agent.as_deref(), run)?;
+        Ok(started.into_live_session().context("worker fork")?.id)
     }
 
     fn first_turn_driven_on_fork(&self, i: usize) -> bool {
@@ -1833,52 +1738,38 @@ impl WorkerDriver for CliDriver<'_> {
 
     fn wait_idle(&self, id: &str) -> Result<()> {
         // Bounded so one stuck worker becomes an Errored worker (the caller maps
-        // this Err → Errored), not a whole-dispatch hang. `wait-idle` exits 0 on
-        // idle/terminated, 1 on timeout — so any non-zero here is a stuck turn.
-        self.status(&[
-            "session".into(),
-            "wait-idle".into(),
-            id.into(),
-            "--timeout".into(),
-            turn_timeout_secs().to_string(),
-        ])
+        // this Err → Errored), not a whole-dispatch hang.
+        crate::commands::session::stream::wait_idle(
+            self.resolved,
+            id,
+            Some(std::time::Duration::from_secs(turn_timeout_secs())),
+            None,
+        )
     }
 
     fn grade(&self, id: &str, grader: &Grader) -> Result<Scored> {
         // Never the live workspace: grade a scrubbed copy with the protected
         // paths restored from the bookmark, inside the grader microVM. A VM that
-        // can't run fails `session score`, which errors this worker — there is
-        // no host fallback.
+        // can't run fails the score, which errors this worker — there is no
+        // host fallback.
         // Grade a frozen snapshot, and keep it: `pull_winner` delivers exactly
         // the tree that was graded, not whatever a background process the
         // worker left running has made of the live workspace since.
-        let ws = self.live_workspace(id)?;
+        let (cmd, rubric) = grader.parts();
+        let policy = GradePolicy {
+            base: self.base_tree()?,
+            protect: &self.protect,
+            grader_files: self.opts.grader_files.as_deref(),
+            egress: &self.opts.grader_egress,
+            command: "dispatch",
+        };
         let snap = self.graded_snapshot(id)?;
-        if snap.exists() {
-            force_remove(&snap)?;
-        }
-        snapshot_workspace(&ws, &snap)?;
-        let tree = GradeTree::prepare(
-            &snap,
-            self.base_tree()?,
-            &self.protect,
-            self.opts.grader_files.as_deref(),
-        )?;
-        if let Some(note) = reverted_note(id, &tree.report.reverted) {
-            eprintln!("{note}");
-        }
-        let out = self.capture(&score_args(
-            id,
-            tree.path(),
-            grader,
-            &self.opts.grader_egress,
-            tree.locked,
-        ))?;
-        parse_grade(&out)
+        grade_worker(self.ops, self.resolved, id, &snap, cmd, rubric, &policy)
     }
 
     fn send(&self, id: &str, prompt: &str) -> Result<()> {
-        self.status(&["session".into(), "send".into(), id.into(), prompt.into()])
+        crate::commands::session::send(self.resolved, id, prompt)?;
+        Ok(())
     }
 
     fn pull_winner(&self, id: &str) -> Result<PathBuf> {
@@ -1896,27 +1787,15 @@ impl WorkerDriver for CliDriver<'_> {
             })?;
             return Ok(to);
         }
-        self.status(&[
-            "session".into(),
-            "pull".into(),
-            id.into(),
-            "--to".into(),
-            to.to_string_lossy().into_owned(),
-        ])?;
+        self.ops.pull(self.resolved, id, &to)?;
         Ok(to)
     }
 
     fn edits(&self, id: &str) -> Result<Vec<EditRecord>> {
         // The worker's own §0 log is the source — the same events the offline
         // harness extracts, so the live critic sees exactly what was measured.
-        let out = self.capture(&[
-            "session".into(),
-            "log".into(),
-            id.into(),
-            "--type".into(),
-            "tool_call".into(),
-        ])?;
-        Ok(edits_from_log(&out))
+        let events = crate::events::log::read_log(self.resolved, id)?;
+        Ok(edits_from_events(&events))
     }
 
     fn usage(&self, id: &str) -> Result<Option<ObservedUsage>> {
@@ -1935,63 +1814,9 @@ impl WorkerDriver for CliDriver<'_> {
         if let Some(src) = &self.opts.grader_files {
             crate::workspace::protect::inject_grader_files(dir.path(), src)?;
         }
-        let (cmd, rubric) = match grader {
-            Grader::Cmd(c) => (Some(c.as_str()), None),
-            Grader::Rubric(p) => (None, Some(p.as_path())),
-        };
+        let (cmd, rubric) = grader.parts();
         crate::commands::session::grade_dir(dir.path(), cmd, rubric)
     }
-}
-
-impl CliDriver<'_> {
-    /// Run a pillbox subcommand, require success, return stdout.
-    fn capture(&self, args: &[String]) -> Result<String> {
-        let out = Command::new(&self.exe)
-            .args(args)
-            .output()
-            .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
-        if !out.status.success() {
-            bail!(
-                "`pillbox {}` failed ({}): {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    /// Run a pillbox subcommand for its exit status only (success = Ok). Its
-    /// stdout — a per-command human banner (`sent prompt…`, `…idle`, `✓
-    /// restored…`) — is captured and **discarded**, never inherited: dispatch's
-    /// own stdout must stay pure JSON for `--json`. stderr surfaces on failure.
-    fn status(&self, args: &[String]) -> Result<()> {
-        let out = Command::new(&self.exe)
-            .args(args)
-            .output()
-            .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
-        if !out.status.success() {
-            bail!(
-                "`pillbox {}` failed ({}): {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Whether this build can run the grader microVM. Without it dispatch refuses
-/// to start rather than grade worker code on the host.
-fn grader_vm_available() -> bool {
-    cfg!(feature = "libkrun")
-}
-
-/// Parse a `session score --json` envelope into the `contract::Scored` it
-/// serializes (the extra `version`/`session`/`seq` envelope keys are ignored).
-fn parse_grade(out: &str) -> Result<Scored> {
-    serde_json::from_str(out).with_context(|| format!("parse `score --json`: {out:?}"))
 }
 
 // ── segment spec (`--segments`, TOML) ───────────────────────────────────────
@@ -2259,45 +2084,22 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .into());
     }
 
-    // `--grader-files`: a real directory, and its landing spot is protected so
-    // a worker can't plant its own `.pillbox-grader/` (and the copy is locked).
-    let mut protect_patterns = opts.protect.clone();
-    if let Some(dir) = &opts.grader_files {
-        if !dir.is_dir() {
-            return Err(PillboxError::usage(
-                "dispatch",
-                format!("--grader-files {} is not a directory", dir.display()),
-            )
-            .into());
-        }
-        // Hidden only if the bookmark can't carry it: a directory inside the
-        // project ships to every worker's fork with the rest of the tree.
-        let source_dir = match &resolved.scope {
-            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
-            crate::pillbox::Scope::Global => None,
-        };
-        if let Some(project) = grader_files_inside_project(dir, source_dir) {
-            return Err(PillboxError::usage(
-                "dispatch",
-                format!(
-                    "--grader-files {} is inside the project {}, so workers can read it",
-                    dir.display(),
-                    project.display()
-                ),
-            )
-            .with_next(
-                "keep hidden checks outside the project directory, e.g. ../myapp-hidden-tests/",
-            )
-            .into());
-        }
-        protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
-    }
-    let protect = ProtectSet::new(!opts.no_default_protect, &protect_patterns).map_err(|e| {
-        PillboxError::usage("dispatch", format!("--protect: {e:#}"))
-            .with_next("patterns are paths relative to the workspace, e.g. --protect 'ci/**'")
-    })?;
+    let protect = grade_protect_set(
+        &dispatch_clone_source(resolved),
+        &GradeKnobs {
+            protect: &opts.protect,
+            no_default_protect: opts.no_default_protect,
+            grader_files: opts.grader_files.as_deref(),
+        },
+        &KnobNames {
+            command: "dispatch",
+            protect: "--protect",
+            grader_files: "--grader-files",
+            protect_example: "--protect 'ci/**'",
+        },
+    )?;
 
-    let driver = CliDriver::new(resolved, &opts, default_agent_id, protect)?;
+    let driver = SessionDriver::new(resolved, &opts, default_agent_id, protect);
     // `--baseline-check`: grade the untouched base first — a reward that already
     // passes there stops the run (exit 2) before any worker boots. The base is
     // the trusted bookmark, graded on the host, so this needs no microVM.
@@ -2356,23 +2158,6 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn grader_files_inside_the_project_are_refused() {
-        // Tests run from the package root, which holds Cargo.toml and .git.
-        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
-        let outside = tempfile::TempDir::new().unwrap();
-        assert!(grader_files_inside_project(outside.path(), None).is_none());
-        // The selected pillbox's directory counts wherever the cwd is.
-        let project = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(project.path().join("hidden")).unwrap();
-        let hidden = project.path().join("hidden");
-        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
-        // With a project selected, a directory in the unrelated cwd repo is fine.
-        assert!(
-            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
-                .is_none()
-        );
-    }
     use std::cell::RefCell;
 
     fn outcome(
@@ -3871,8 +3656,7 @@ mod tests {
             ])
             .unwrap();
             let opts = opts_for_resolve(None, None, None, None);
-            let driver = CliDriver::with_exe(
-                PathBuf::from("unused"),
+            let driver = SessionDriver::new(
                 &pb,
                 &opts,
                 "opencode".into(),
@@ -3939,14 +3723,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_usage_read_failure_and_absent_log_are_distinct() {
+    fn driver_usage_read_failure_and_absent_log_are_distinct() {
         crate::test_util::with_isolated_home("dispatch-usage-read", || {
             let pb = crate::pillbox::global();
             let s = crate::session::Session::test_fixture();
             crate::session::write(&pb, &s).unwrap();
             let opts = opts_for_resolve(None, None, None, None);
-            let driver = CliDriver::with_exe(
-                PathBuf::from("unused"),
+            let driver = SessionDriver::new(
                 &pb,
                 &opts,
                 "opencode".into(),
@@ -3979,118 +3762,18 @@ mod tests {
         assert!(!WorkerStatus::Errored.passed());
     }
 
-    // ── CliDriver grading: a scrubbed copy, protected paths restored, VM only ──
+    // ── SessionDriver grading: a scrubbed copy, protected paths restored, VM only ──
 
+    use crate::commands::grading::testing::{project, put, read, FakeSessions, Project, Vm};
+    use crate::commands::grading::{grade_request, reverted_note};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    /// The grader-VM stand-in runs the grader against the tree it was handed,
-    /// with an empty env, and reports the verdict.
-    const VM_RUNS_GRADER: &str = r#"if (cd "$tree" && env -i PATH=/usr/bin:/bin sh -c "$cmd") >/dev/null 2>&1; then p=true; s=1.0; else p=false; s=0.0; fi
-printf '{"grader":"cmd","passed":%s,"score":%s,"feedback":""}' "$p" "$s""#;
-    /// The grader-VM stand-in executes nothing and reports a failing grade.
-    const VM_RECORDS_ONLY: &str =
-        r#"printf '{"grader":"cmd","passed":false,"score":0.0,"feedback":""}'"#;
-    /// The grader VM can't run.
-    const VM_DOWN: &str =
-        r#"echo "the grader microVM exited (1) before the grader started" >&2; exit 1"#;
-
-    /// A `pillbox` executable standing in for the real one under [`CliDriver`]:
-    /// `session info` reports `ws` as the worker's live workspace; `session
-    /// score` refuses to grade without `--in-sandbox`, copies the tree it was
-    /// handed to `seen` (the grade tree is gone once `grade` returns), then
-    /// runs `vm` with `$tree` and `$cmd` set. Every argv is appended to `log`.
-    struct FakePillbox {
-        _dir: tempfile::TempDir,
-        exe: PathBuf,
-        log: PathBuf,
-        seen: PathBuf,
-    }
-
-    impl FakePillbox {
-        fn new(ws: &Path, vm: &str) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("argv.log");
-            let seen = dir.path().join("seen");
-            let exe = dir.path().join("pillbox");
-            let script = format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{log}'
-if [ "$1 $2" = "session info" ]; then
-  printf '{{"session":{{"workspace":"%s"}}}}' '{ws}'
-  exit 0
-fi
-[ "$1 $2" = "session score" ] || exit 64
-shift 3
-tree=""; cmd=""; sandboxed=0
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --workspace) tree="$2"; shift 2 ;;
-    --cmd) cmd="$2"; shift 2 ;;
-    --in-sandbox) sandboxed=1; shift ;;
-    *) shift ;;
-  esac
-done
-[ "$sandboxed" = 1 ] || {{ echo "host grading refused" >&2; exit 3; }}
-rm -rf '{seen}'; cp -R "$tree" '{seen}'
-{vm}
-"#,
-                log = log.display(),
-                ws = ws.display(),
-                seen = seen.display(),
-            );
-            std::fs::write(&exe, script).unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-            Self {
-                _dir: dir,
-                exe,
-                log,
-                seen,
-            }
-        }
-
-        fn argv(&self) -> Vec<String> {
-            std::fs::read_to_string(&self.log)
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_string)
-                .collect()
-        }
-    }
-
-    fn put(root: &Path, rel: &str, body: &str) {
-        let p = root.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, body).unwrap();
-    }
-
-    /// The bookmark (`base`) and a worker workspace forked from it (`ws`).
-    /// The base test passes only once `src/lib.rs` contains `fixed`.
-    struct Project {
-        base: tempfile::TempDir,
-        _root: tempfile::TempDir,
-        ws: PathBuf,
-    }
-
-    fn project() -> Project {
-        let base = tempfile::tempdir().unwrap();
-        put(base.path(), "src/lib.rs", "pub fn f() {}\n");
-        put(base.path(), "tests/check.sh", "grep -q fixed src/lib.rs\n");
-        let root = tempfile::tempdir().unwrap();
-        let ws = root.path().join("ws");
-        crate::workspace::cow::cow_clone_dir(base.path(), &ws).unwrap();
-        Project {
-            base,
-            _root: root,
-            ws,
-        }
-    }
-
-    fn grade_with(p: Project, fake: &FakePillbox, grader: &Grader) -> (Result<Scored>, Project) {
+    fn grade_with(p: Project, fake: &FakeSessions, grader: &Grader) -> (Result<Scored>, Project) {
         let resolved = crate::pillbox::global();
         let opts = opts_for_resolve(None, None, None, None);
-        let driver = CliDriver::with_exe(
-            fake.exe.clone(),
+        let driver = SessionDriver::with_ops(
+            fake,
             &resolved,
             &opts,
             "opencode".into(),
@@ -4103,20 +3786,16 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         (r, Project { base, _root, ws })
     }
 
-    fn read(p: &Path) -> String {
-        std::fs::read_to_string(p).unwrap()
-    }
-
     #[test]
     fn the_winner_delivered_is_the_tree_that_was_graded() {
         let grader = Grader::Cmd("sh tests/check.sh".into());
         let p = project();
         put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let resolved = crate::pillbox::global();
         let opts = opts_for_resolve(None, None, None, None);
-        let driver = CliDriver::with_exe(
-            fake.exe.clone(),
+        let driver = SessionDriver::with_ops(
+            &fake,
             &resolved,
             &opts,
             "opencode".into(),
@@ -4130,9 +3809,29 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         let won = driver.pull_winner("w1").unwrap();
         assert_eq!(read(&won.join("src/lib.rs")), "pub fn f() {} // fixed\n");
         assert!(
-            !fake.argv().iter().any(|a| a.contains("session pull")),
+            fake.pulls.borrow().is_empty(),
             "the graded snapshot is delivered, not a fresh pull of the live tree"
         );
+        let _ = std::fs::remove_dir_all(&driver.rundir);
+    }
+
+    #[test]
+    fn a_winner_never_graded_here_is_pulled_through_the_session_api() {
+        let p = project();
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        let resolved = crate::pillbox::global();
+        let opts = opts_for_resolve(None, None, None, None);
+        let driver = SessionDriver::with_ops(
+            &fake,
+            &resolved,
+            &opts,
+            "opencode".into(),
+            ProtectSet::new(true, &[]).unwrap(),
+        );
+        let to = driver.pull_winner("w9").unwrap();
+        assert_eq!(to, driver.rundir.join("winner-w9"));
+        assert_eq!(*fake.pulls.borrow(), ["w9"]);
+        assert!(fake.scores().is_empty());
         let _ = std::fs::remove_dir_all(&driver.rundir);
     }
 
@@ -4142,7 +3841,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
 
         // Untouched worker: fails, as on the base.
         let p = project();
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let (untouched, _) = grade_with(p, &fake, &grader);
         assert!(!untouched.unwrap().passed);
 
@@ -4150,14 +3849,14 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         // the test is graded as the bookmark has it.
         let p = project();
         put(&p.ws, "tests/check.sh", "exit 0\n");
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let (tampered, p) = grade_with(p, &fake, &grader);
         assert!(!tampered.unwrap().passed);
         assert_eq!(
             read(&fake.seen.join("tests/check.sh")),
             "grep -q fixed src/lib.rs\n"
         );
-        // The tree handed to `session score` is locked: the owner (who the
+        // The tree handed to the grader is locked: the owner (who the
         // virtiofs server writes as) cannot rewrite the restored test, and can
         // still write the worker's own code.
         let test_mode = std::fs::symlink_metadata(fake.seen.join("tests/check.sh"))
@@ -4183,7 +3882,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         // Deleting it, or swapping in a symlink to a passing script, changes nothing either.
         let p = project();
         std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let (deleted, _) = grade_with(p, &fake, &grader);
         assert!(!deleted.unwrap().passed);
 
@@ -4191,7 +3890,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         put(&p.ws, "src/pass.sh", "exit 0\n");
         std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
         std::os::unix::fs::symlink("../src/pass.sh", p.ws.join("tests/check.sh")).unwrap();
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let (linked, _) = grade_with(p, &fake, &grader);
         assert!(!linked.unwrap().passed);
 
@@ -4199,7 +3898,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         // is unchanged, only what the worker may edit is.
         let p = project();
         put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
-        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
         let (fixed, _) = grade_with(p, &fake, &grader);
         assert!(fixed.unwrap().passed);
     }
@@ -4222,25 +3921,32 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
         put(&p.ws, "build.sh", &touch);
         put(&p.ws, "tests/check.sh", &touch);
         let live_ws = p.ws.clone();
-        let fake = FakePillbox::new(&p.ws, VM_RECORDS_ONLY);
+        let fake = FakeSessions::new(&p.ws, Vm::RecordsOnly);
         let grader = Grader::Cmd("sh build.sh && cargo test".into());
         let (r, _p) = grade_with(p, &fake, &grader);
         assert!(!r.unwrap().passed);
 
         assert!(!marker.exists(), "worker code executed on the host");
-        let score = fake
-            .argv()
-            .into_iter()
-            .find(|a| a.starts_with("session score"))
-            .expect("graded via `session score`");
-        assert!(score.contains("--in-sandbox"), "{score}");
+        let scores = fake.scores();
+        assert_eq!(scores.len(), 1, "graded exactly once: {scores:?}");
+        let score = &scores[0];
+        assert_eq!(score.id, "w1");
+        assert!(score.in_sandbox, "{score:?}");
         assert!(
-            score.contains("--drop-privileges"),
-            "grader must not run as root: {score}"
+            score.drop_privileges,
+            "grader must not run as root: {score:?}"
         );
+        assert_eq!(score.cmd.as_deref(), Some("sh build.sh && cargo test"));
+        assert_eq!(score.snapshot, None, "{score:?}");
         assert!(
-            !score.contains(&format!("--workspace {} ", live_ws.display())),
-            "graded the live workspace: {score}"
+            score.egress.is_empty(),
+            "the grader VM is offline by default: {score:?}"
+        );
+        let tree = score.workspace.as_deref().expect("graded an explicit tree");
+        assert_ne!(tree, live_ws, "graded the live workspace: {score:?}");
+        assert!(
+            !tree.starts_with(&live_ws),
+            "graded the live workspace: {score:?}"
         );
         // The VM got the worker's own code, and the bookmark's test.
         assert!(fake.seen.join("build.rs").exists());
@@ -4260,64 +3966,135 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
             "tests/check.sh",
             &format!("touch '{}'\n", marker.display()),
         );
-        let fake = FakePillbox::new(&p.ws, VM_DOWN);
+        let fake = FakeSessions::new(&p.ws, Vm::Down);
         let (r, _p) = grade_with(p, &fake, &Grader::Cmd("sh tests/check.sh".into()));
         let err = format!("{:#}", r.unwrap_err());
         assert!(err.contains("before the grader started"), "{err}");
         assert!(!marker.exists());
-        let scores: Vec<String> = fake
-            .argv()
-            .into_iter()
-            .filter(|a| a.starts_with("session score"))
-            .collect();
+        let scores = fake.scores();
         assert_eq!(scores.len(), 1, "no second attempt: {scores:?}");
-        assert!(scores[0].contains("--in-sandbox"));
+        assert!(scores[0].in_sandbox);
     }
 
     #[test]
-    fn score_args_grade_in_the_vm_with_the_requested_egress() {
-        let args = score_args(
-            "w1",
-            Path::new("/tmp/tree"),
-            &Grader::Rubric("r.txt".into()),
-            &["pypi.org".into()],
-            true,
-        );
-        assert_eq!(
-            args,
-            [
-                "session",
-                "score",
-                "w1",
-                "--workspace",
-                "/tmp/tree",
-                "--in-sandbox",
-                "--drop-privileges",
-                "--grader-egress",
-                "pypi.org",
-                "--json",
-                "--rubric",
-                "r.txt"
-            ]
-        );
-        assert!(!score_args(
-            "w1",
-            Path::new("/tmp/tree"),
-            &Grader::Cmd("true".into()),
-            &[],
-            false,
-        )
-        .iter()
-        .any(|a| a == "--drop-privileges"));
+    fn grade_request_grades_in_the_vm_with_the_requested_egress() {
+        let egress = vec!["pypi.org".to_string()];
+        let rubric = Grader::Rubric("r.txt".into());
+        let (c, r) = rubric.parts();
+        let req = grade_request(Path::new("/tmp/tree"), c, r, &egress, true);
+        assert_eq!(req.workspace, Some(Path::new("/tmp/tree")));
+        assert_eq!(req.snapshot, None);
+        assert!(req.in_sandbox);
+        assert!(req.drop_privileges);
+        assert_eq!(req.grader_egress, ["pypi.org"]);
+        assert_eq!(req.cmd, None);
+        assert_eq!(req.rubric, Some(Path::new("r.txt")));
+
+        let cmd = Grader::Cmd("true".into());
+        let (c, r) = cmd.parts();
+        let req = grade_request(Path::new("/tmp/tree"), c, r, &[], false);
+        assert!(req.in_sandbox);
+        assert!(!req.drop_privileges);
+        assert_eq!(req.cmd, Some("true"));
+        assert_eq!(req.rubric, None);
+    }
+
+    #[test]
+    fn a_fork_is_the_detached_bookmark_run_the_cli_would_start() {
+        let mut opts = opts_for_resolve(Some("codex"), Some("m/x"), Some(0.5), None);
+        opts.memory = true;
+        opts.ttl = Some("30m".into());
+        let (agent, run) = fork_run_opts(&opts, 0, Some("do it")).unwrap();
+        assert_eq!(agent.as_deref(), Some("codex"));
+        assert_eq!(run.from_bookmark.as_deref(), Some("base"));
+        assert!(run.detach && run.memory);
+        assert_eq!(run.ttl_seconds, Some(1800));
+        assert_eq!(run.model.as_deref(), Some("m/x"));
+        assert_eq!(run.temperature, Some(0.5));
+        assert_eq!(run.args, ["do it"]);
+        // Every other flag at its `pillbox run` default.
+        assert!(run.workspace.is_none() && run.name.is_none() && run.label.is_none());
+        assert!(run.profile.is_none() && run.reasoning_effort.is_none());
+        assert!(!run.vault && !run.egress_deny);
+        assert!(run.mounts.is_empty() && run.withs.is_empty() && run.env_bundles.is_empty());
+        assert!(run.env_files.is_empty() && run.mcps.is_empty() && run.mcp_tokens.is_empty());
+        assert!(run.egress_allow.is_empty() && run.memory_briefed.is_empty());
+
+        // A server-mode worker's first turn is sent, not baked into the launch.
+        let opts = opts_for_resolve(None, None, None, None);
+        let (agent, run) = fork_run_opts(&opts, 0, None).unwrap();
+        assert_eq!(agent, None);
+        assert!(run.args.is_empty() && !run.memory && run.ttl_seconds.is_none());
+    }
+
+    /// The `pillbox run …` argv dispatch built for a fork before it called
+    /// `run::start` in-process (base 0d2e275 `CliDriver::fork`), verbatim.
+    fn old_fork_argv(opts: &DispatchOpts, i: usize, first_turn: Option<&str>) -> Vec<String> {
+        let (agent, model, temperature) = resolve_worker(opts, i);
+        let mut args: Vec<String> = vec![
+            "pillbox".into(),
+            "run".into(),
+            "--from-bookmark".into(),
+            opts.from_bookmark.clone(),
+            "--detach".into(),
+            "--json".into(),
+        ];
+        if let Some(a) = &agent {
+            args.extend(["--agent".into(), a.clone()]);
+        }
+        if let Some(m) = &model {
+            args.extend(["--model".into(), m.clone()]);
+        }
+        if let Some(t) = &temperature {
+            args.extend(["--temperature".into(), t.to_string()]);
+        }
+        if opts.memory {
+            args.push("--memory".into());
+        }
+        if let Some(t) = &opts.ttl {
+            args.extend(["--ttl".into(), t.clone()]);
+        }
+        if let Some(turn) = first_turn {
+            args.extend(["--".into(), turn.into()]);
+        }
+        args
+    }
+
+    #[test]
+    fn a_fork_starts_exactly_what_the_old_cli_argv_asked_for() {
+        let mut full = opts_for_resolve(Some("codex"), Some("m/x"), Some(0.25), None);
+        full.memory = true;
+        full.ttl = Some("30m".into());
+        let mut roster = opts_for_resolve(Some("claude"), Some("run/level"), None, None);
+        roster.workers_spec = Some(vec![
+            worker_spec(Some("opencode"), Some("zai/glm"), Some(0.0)),
+            worker_spec(None, None, None),
+        ]);
+        let bare = opts_for_resolve(None, None, None, None);
+        for (opts, i, turn) in [
+            (&full, 0, Some("do it")),
+            (&full, 0, None),
+            (&roster, 0, None),
+            (&roster, 1, Some("turn one")),
+            (&bare, 0, None),
+        ] {
+            let argv = old_fork_argv(opts, i, turn);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert_eq!(
+                fork_run_opts(opts, i, turn).unwrap(),
+                crate::parse_run_argv(&argv),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]
     fn reverted_note_lists_a_capped_set() {
-        assert_eq!(reverted_note("w1", &[]), None);
+        assert_eq!(reverted_note("dispatch", "w1", &[]), None);
         let many: Vec<PathBuf> = (0..7)
             .map(|i| PathBuf::from(format!("tests/{i}")))
             .collect();
-        let note = reverted_note("w1", &many).unwrap();
+        let note = reverted_note("dispatch", "w1", &many).unwrap();
         assert!(
             note.contains("tests/0, tests/1, tests/2, tests/3, tests/4, +2 more"),
             "{note}"

@@ -24,6 +24,7 @@ tests:
   - "src/sandbox/libkrun/http.rs:an_endless_body_errors_at_the_cap"
   - "src/sandbox/libkrun/http.rs:a_silent_guest_errors_at_the_timeout"
   - "src/sandbox/libkrun/http.rs:a_guest_that_reads_a_trickle_errors_at_the_deadline"
+  - "src/sandbox/libkrun/rootfs_backing.rs:identity_survives_a_reboot_renumbering_the_volume"
   - "scripts/smoke/libkrun.sh"
 ---
 
@@ -53,3 +54,4 @@ With the macOS libkrun toolchain, runner image and agent auth prepared, build/si
 - `run::start` also runs inside long-lived callers (dispatch, eval): a detached `__krun-vmm` or `__session-tailer` child is spawned as a `sandbox::DetachedChild` (never a bare `Child`): dropping it hands it to a waiter thread, and the failure paths consume it (`kill_and_wait`, or `into_child` for `stop_spawned_vmm`), so an exit never leaves a zombie that signal-0 probes read as alive.
 - The egress fence logs its DNS and TLS decisions to `PILLBOX_KRUN_EGRESS_LOG`, else to a per-run file under `~/.pillbox/krun/egress/` (pruned after 14 days, capped at 4 MiB). A foreground run prints the hosts it refused when it ends; a shared `PILLBOX_KRUN_EGRESS_LOG` gets no summary, since it mixes runs.
 - The host's HTTP client to the guest server (`sandbox/libkrun/http.rs`; opencode or the codex app-server bridge) treats the guest as untrusted: a reply is capped at `MAX_RESPONSE_BYTES` (16 MiB) and a whole exchange, request write included, at `RESPONSE_TIMEOUT` (60 s), because dispatch/eval call it in-process and an unbounded read would take down the orchestrator. Its tests need the libkrun feature (a stub `libkrun.so` is enough on Linux); the `--no-default-features` gate does not run them.
+- The macOS rootfs sparse bundle (`~/.pillbox/krun/case-sensitive-rootfs.sparsebundle`) is admitted by its inode, by sitting on the krun dir's live filesystem, and by the random token in the mounted volume's marker. It is never admitted by a stored `st_dev`, because macOS renumbers volume device numbers across reboots. Older `rootfs-backing.identity.json` files still carry `image_device`; it is read and ignored.

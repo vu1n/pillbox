@@ -278,9 +278,28 @@ mod macos {
     struct Identity {
         magic: String,
         token: String,
-        image_device: u64,
+        /// The bundle's `st_dev` when it was created. Older versions wrote it and new ones
+        /// don't; it is never checked, because macOS renumbers `st_dev` across reboots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_device: Option<u64>,
         image_inode: u64,
         logical_bytes: u64,
+    }
+
+    /// Whether a recorded identity still names this bundle. The inode pins the bundle
+    /// directory itself, and the bundle must sit on the same live filesystem as the krun
+    /// dir that holds it. A stored device number is never compared: a reboot renumbers it.
+    fn identity_matches(
+        identity: &Identity,
+        image_device: u64,
+        image_inode: u64,
+        krun_device: u64,
+    ) -> bool {
+        identity.magic == MARKER_MAGIC
+            && identity.logical_bytes == LOGICAL_BYTES
+            && identity.image_inode == image_inode
+            && image_device == krun_device
+            && !identity.token.is_empty()
     }
 
     pub(super) struct Mount {
@@ -372,6 +391,9 @@ mod macos {
                 && image_meta.uid() == unsafe { libc::geteuid() },
             "rootfs sparse bundle is not an owned plain directory"
         );
+        let krun_device = fs::symlink_metadata(krun)
+            .context("inspect rootfs backing parent")?
+            .dev();
         if fresh {
             fs::set_permissions(&image, fs::Permissions::from_mode(0o700))?;
         } else {
@@ -385,11 +407,7 @@ mod macos {
         } else {
             let identity: Identity = read_marker(&identity_path)?;
             ensure!(
-                identity.magic == MARKER_MAGIC
-                    && identity.logical_bytes == LOGICAL_BYTES
-                    && identity.image_device == image_meta.dev()
-                    && identity.image_inode == image_meta.ino()
-                    && !identity.token.is_empty(),
+                identity_matches(&identity, image_meta.dev(), image_meta.ino(), krun_device),
                 "rootfs sparse bundle identity or logical capacity changed"
             );
             Some(identity)
@@ -455,7 +473,7 @@ mod macos {
             let identity = Identity {
                 magic: MARKER_MAGIC.into(),
                 token: uuid::Uuid::now_v7().to_string(),
-                image_device: image_meta.dev(),
+                image_device: None,
                 image_inode: image_meta.ino(),
                 logical_bytes: LOGICAL_BYTES,
             };
@@ -493,6 +511,16 @@ mod macos {
         file.take(513).read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 512, "rootfs backing identity exceeds limit");
         serde_json::from_slice(&bytes).context("parse rootfs backing identity")
+    }
+
+    #[cfg(test)]
+    pub(super) fn identity_matches_for_test(
+        json: &str,
+        device: u64,
+        inode: u64,
+        krun: u64,
+    ) -> bool {
+        identity_matches(&serde_json::from_str(json).unwrap(), device, inode, krun)
     }
 
     #[cfg(test)]
@@ -816,6 +844,44 @@ mod tests {
             "FIFO marker fixture did not run: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// macOS renumbers a volume's `st_dev` across reboots; an identity written before
+    /// one (with the old `image_device`) must still admit the same bundle afterwards.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn identity_survives_a_reboot_renumbering_the_volume() {
+        let magic = "pillbox-case-sensitive-rootfs/v1";
+        let logical = 64u64 * 1024 * 1024 * 1024;
+        let before_reboot = format!(
+            r#"{{"magic":"{magic}","token":"t","image_device":16777231,"image_inode":204880328,"logical_bytes":{logical}}}"#
+        );
+        let current = format!(
+            r#"{{"magic":"{magic}","token":"t","image_inode":204880328,"logical_bytes":{logical}}}"#
+        );
+        for json in [&before_reboot, &current] {
+            // Same bundle inode, on the krun dir's filesystem, after st_dev changed.
+            assert!(macos::identity_matches_for_test(
+                json, 16777229, 204880328, 16777229
+            ));
+            // A different bundle directory is refused.
+            assert!(!macos::identity_matches_for_test(
+                json, 16777229, 1, 16777229
+            ));
+            // A bundle on another filesystem than the krun dir is refused.
+            assert!(!macos::identity_matches_for_test(
+                json, 16777230, 204880328, 16777229
+            ));
+        }
+        let wrong_capacity = format!(
+            r#"{{"magic":"{magic}","token":"t","image_inode":204880328,"logical_bytes":1}}"#
+        );
+        assert!(!macos::identity_matches_for_test(
+            &wrong_capacity,
+            1,
+            204880328,
+            1
+        ));
     }
 
     #[cfg(target_os = "macos")]

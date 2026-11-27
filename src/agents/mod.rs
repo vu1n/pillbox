@@ -20,8 +20,8 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::errors::PillboxError;
 use crate::pillbox::{self, Pillbox};
-use crate::{docker, errors::PillboxError};
 
 pub(crate) mod harness;
 pub(crate) mod mcp;
@@ -109,7 +109,7 @@ pub(crate) struct StructuredProfile {
     pub(crate) model: StructuredModelPolicy,
     /// Guest env var that authenticates without the login sentinel (e.g.
     /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
-    /// Consumed by the libkrun launch_base gate; dead on a non-libkrun build.
+    /// Consumed by the libkrun `authenticated_home` gate; dead on a non-libkrun build.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) alt_auth_env: Option<&'static str>,
 }
@@ -252,9 +252,19 @@ pub struct AgentSpec {
     /// come from `pillbox_credentials`' table, which also lists it in
     /// `AGENT_CREDENTIALS`, so the session packet always leaves it out.
     pub(crate) cred_sentinel: pillbox_credentials::AgentCredential,
+    /// Read only by the libkrun login VM (`sandbox::libkrun::login`).
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
+    /// Read only by the libkrun login VM's OAuth callback relay.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
+    /// Hosts this agent's `auth login` reaches beyond the vault providers' hosts,
+    /// for every provider its login can pick. Exact names: the fence has no wildcards.
+    // Read only by the login VM's fence: a run, session or sandbox launch never gets these hosts.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) login_hosts: &'static [&'static str],
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
     /// Build a per-run MCP config injection from `--mcp` flags.
@@ -299,6 +309,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
     oauth_port: Some(54545),
+    login_hosts: &["claude.ai"],
     post_login_finalize: Some(finalize_claude_onboarding),
     vault_capable: true,
     mcp_inject: Some(mcp::claude_inject),
@@ -360,6 +371,8 @@ pub const CODEX: AgentSpec = AgentSpec {
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
+    // Its device flow and token exchange are all on auth.openai.com, a vault provider host.
+    login_hosts: &[],
     post_login_finalize: None,
     vault_capable: true,
     mcp_inject: Some(mcp::codex_inject),
@@ -412,6 +425,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     // via the appserver-host bridge, not this argv) — kept honest, not launched.
     run_argv: &["codex", "app-server"],
     oauth_port: None,
+    login_hosts: CODEX.login_hosts,
     post_login_finalize: None,
     vault_capable: true,
     mcp_inject: Some(mcp::codex_inject),
@@ -441,6 +455,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     // OpenCode owns its isolated provider store. Structured runs consume an
     // existing OAuth/API credential and do not open a callback during serve.
     oauth_port: None,
+    login_hosts: &["models.dev", "github.com"],
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: Some(mcp::opencode_inject),
@@ -472,6 +487,12 @@ pub const CURSOR: AgentSpec = AgentSpec {
     run_argv: &["agent"],
     // Remote URL + poll login — no localhost OAuth callback to forward.
     oauth_port: None,
+    login_hosts: &[
+        "cursor.com",
+        "www.cursor.com",
+        "api2.cursor.sh",
+        "authenticator.cursor.sh",
+    ],
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: None,
@@ -486,6 +507,16 @@ pub const CURSOR: AgentSpec = AgentSpec {
     #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
+
+/// The non-vault hosts pi-ai's `/login` OAuth flows reach (pi and its fork Prime Agent):
+/// Anthropic, GitHub Copilot's device flow, and Google's Gemini CLI / Antigravity.
+const PI_AI_LOGIN_HOSTS: &[&str] = &[
+    "claude.ai",
+    "github.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+];
 
 pub const PI: AgentSpec = AgentSpec {
     id: "pi",
@@ -503,6 +534,7 @@ pub const PI: AgentSpec = AgentSpec {
     login_argv: &["pi"],
     run_argv: &["pi"],
     oauth_port: Some(53692),
+    login_hosts: PI_AI_LOGIN_HOSTS,
     post_login_finalize: None,
     // Not wired into the vault stub-swap proxy (no custom-CA / proxy routing
     // integration yet) — mirrors opencode. `--vault` and vaulted secrets are
@@ -539,6 +571,7 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
     login_argv: &["prime-agent"],
     run_argv: &["prime-agent"],
     oauth_port: Some(53692),
+    login_hosts: PI_AI_LOGIN_HOSTS,
     post_login_finalize: None,
     // Same posture as pi for `pillbox run`: mounts its own auth home, no vault.
     // The text/2 driver vaults its API key separately (`execution::pi_text`).
@@ -782,7 +815,8 @@ impl AgentSpec {
         }
     }
 
-    fn resolved_oauth_port(&self) -> Option<u16> {
+    #[cfg(feature = "libkrun")]
+    pub(crate) fn resolved_oauth_port(&self) -> Option<u16> {
         let default = self.oauth_port?;
         let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
         let port = std::env::var(&var)
@@ -793,34 +827,45 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        let image = docker::check_ready_for(resolved)?;
+        // auth login runs only in the libkrun microVM; there is no Docker fallback.
+        #[cfg(not(feature = "libkrun"))]
+        let _ = resolved;
+        #[cfg(not(feature = "libkrun"))]
+        return Err(PillboxError::usage(
+            "login",
+            format!(
+                "`pillbox auth login --agent {}` needs the libkrun microVM backend, and this pillbox was built without it",
+                self.id
+            ),
+        )
+        .with_next("rebuild pillbox with the default `libkrun` feature")
+        .into());
 
-        let home = self.home_dir(resolved)?;
+        #[cfg(feature = "libkrun")]
+        {
+            let home = self.home_dir(resolved)?;
 
-        let mut args = base_docker_args();
-        if let Some(port) = self.resolved_oauth_port() {
-            args.push("-p".into());
-            args.push(format!("{port}:{port}"));
+            println!("pillbox: starting {} login inside a sandbox.", self.id);
+            println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
+            println!();
+
+            let code = crate::sandbox::libkrun::login::login(self, resolved, &home)?;
+            if code != 0 {
+                return Err(PillboxError::runtime(
+                    "login",
+                    format!("{} exited with status {code}", self.id),
+                )
+                .with_next(format!("pillbox auth login --agent {}", self.id))
+                .into());
+            }
+            self.finish_login(&home)
         }
-        args.push("-v".into());
-        args.push(format!("{}:{GUEST_HOME}", home.display()));
-        args.push(image);
-        args.extend(self.login_argv.iter().map(|s| s.to_string()));
+    }
 
-        println!("pillbox: starting {} login inside a sandbox.", self.id);
-        println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
-        println!();
-
-        let status = docker::run_interactive(&args)?;
-        if !status.success() {
-            return Err(PillboxError::runtime(
-                "login",
-                format!("{} exited with status {status}", self.id),
-            )
-            .with_next(format!("pillbox auth login --agent {}", self.id))
-            .into());
-        }
-
+    /// The post-login checks: the credential sentinel exists, then the agent's
+    /// optional finalize hook runs (best-effort).
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    fn finish_login(&self, home: &Path) -> Result<()> {
         if !home.join(self.cred_sentinel).exists() {
             return Err(PillboxError::runtime(
                 "login",
@@ -838,7 +883,7 @@ impl AgentSpec {
         }
 
         if let Some(finalize) = self.post_login_finalize {
-            if let Err(e) = finalize(&home) {
+            if let Err(e) = finalize(home) {
                 eprintln!(
                     "pillbox: warning: could not finalize {} setup: {e}",
                     self.id
@@ -1006,9 +1051,12 @@ pub(crate) fn resolve_with_entries(
     Ok(out)
 }
 
+/// Compose a run's env: `env_bundles` (stored), then `env_files` (.env), then
+/// the resolved `--with` entries, each layer shadowing the one before.
 pub(crate) fn resolve_run_env(
     resolved: &Pillbox,
-    opts: &RunOpts,
+    env_bundles: &[String],
+    env_files: &[PathBuf],
     withs: &[ResolvedWith],
     mut vault: Option<&mut crate::vault::VaultSession>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
@@ -1016,7 +1064,7 @@ pub(crate) fn resolve_run_env(
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     // Layer 1: stored env bundles (inheritance applies).
-    for bundle_name in &opts.env_bundles {
+    for bundle_name in env_bundles {
         let vars = crate::envs::read(resolved, bundle_name)?.ok_or_else(|| {
             PillboxError::runtime("run", format!("env bundle `{bundle_name}` not found"))
                 .with_next("pillbox env list  # see what's stored".to_string())
@@ -1032,7 +1080,7 @@ pub(crate) fn resolve_run_env(
     }
 
     // Layer 2: ad-hoc .env files.
-    for path in &opts.env_files {
+    for path in env_files {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             PillboxError::runtime(
                 "run",
@@ -1086,9 +1134,8 @@ pub(crate) fn resolve_run_env(
 }
 
 /// `docker run` args common to every local launch: host-gateway alias +
-/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head:
-/// `["-it", "--rm"]` for a foreground run, `["-d"]` for the detached
-/// attach-transport flow.
+/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head
+/// (`["-d"]` for the detached attach-transport flow).
 fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
     let mut v: Vec<String> = stdio_prefix.iter().map(|s| (*s).into()).collect();
     v.extend([
@@ -1106,10 +1153,6 @@ fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
         format!("PATH={}", guest_path()),
     ]);
     v
-}
-
-pub(crate) fn base_docker_args() -> Vec<String> {
-    base_docker_args_with(&["-it", "--rm"])
 }
 
 /// Detached base args for the attach-transport flow: `-d`, no `--rm`, so the
@@ -1173,7 +1216,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, None).unwrap();
+            let env =
+                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap();
             assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
         });
     }
@@ -1207,7 +1251,14 @@ mod tests {
             .unwrap();
             let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
+            let env = resolve_run_env(
+                &g,
+                &opts.env_bundles,
+                &opts.env_files,
+                &withs,
+                Some(&mut session),
+            )
+            .unwrap();
 
             let injected = env.get("VAULTED_KEY").cloned().unwrap();
             assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
@@ -1255,7 +1306,14 @@ mod tests {
             .unwrap();
             let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
+            let env = resolve_run_env(
+                &g,
+                &opts.env_bundles,
+                &opts.env_files,
+                &withs,
+                Some(&mut session),
+            )
+            .unwrap();
 
             assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
             let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
@@ -1326,7 +1384,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let err = resolve_run_env(&g, &opts, &withs, None).unwrap_err();
+            let err =
+                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
         });

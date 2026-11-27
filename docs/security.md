@@ -18,9 +18,9 @@ There are two security boundaries:
   owns collaboration and driver policy.
 
 The local Docker **agent backend** is deprecated. Docker is still in the build
-and auth trust path today: it materializes the OCI rootfs that libkrun boots and
-runs the current OAuth login flow. A compromised Docker daemon can therefore
-tamper with those inputs even though it does not host the normal agent run.
+trust path today: it materializes the OCI rootfs that libkrun boots. A
+compromised Docker daemon can therefore tamper with that input even though it
+hosts neither the agent run nor the OAuth login (both run in libkrun microVMs).
 
 ## What pillbox defends against
 
@@ -28,7 +28,8 @@ tamper with those inputs even though it does not host the normal agent run.
 |---|---|
 | Agent reads `~/.claude` or `~/.codex` on the host | Sandbox only mounts the resolved auth pillbox's `auth/<agent>/` dir; the agent never sees the host's real config directories. |
 | Agent reads host environment variables | Guest env is built from explicit pillbox inputs only. The host's `$ANTHROPIC_API_KEY` etc. do not leak in. |
-| Login flow contaminated by host state | The login container is one-shot and fresh — no prior state mounted. |
+| Login flow contaminated by host state | The login runs in a fresh libkrun microVM on a private rootfs clone of the global pillbox's runner image (a project's `pillbox.toml` can't pick it); only the agent's own pillbox auth dir is mounted (read-write, for the credential the login writes). Its egress is fenced like a run's: only the vault providers' hosts plus the exact hosts that agent's login flows declare (`AgentSpec::login_hosts`, e.g. `github.com` for a Copilot device flow) resolve; those login hosts never reach a run, session or sandbox fence. |
+| Sandbox agent forges `sandbox exec` results | In an agent sandbox `exec-host` runs as guest root and drops each command to uid 1000 with no supplementary groups; its vsock sockets are close-on-exec, so the agent can neither kill it, inherit a channel, nor take its port. |
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
 | Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |
@@ -41,7 +42,7 @@ tamper with those inputs even though it does not host the normal agent run.
 |---|---|
 | Prompt-injected agent abusing an authorized capability | Isolation does not distinguish a requested action from a prompt-injected one. Stub credentials prevent raw-key theft, but an agent may still make allowed requests through the broker. Use default-deny egress and least-privilege accounts. |
 | Stolen unencrypted disk / backup | Files are plaintext at 0600. If FileVault / LUKS / BitLocker isn't on, an attacker with the disk has the secrets. Same posture as `~/.aws/credentials`. |
-| Compromised Docker daemon | Docker still materializes libkrun's OCI rootfs and runs OAuth login, so a root-equivalent daemon compromise can tamper with either. Daemonless OCI pull and auth-in-libkrun remain open structural debts. |
+| Compromised Docker daemon | Docker still materializes libkrun's OCI rootfs, so a root-equivalent daemon compromise can tamper with the image every VM (agent and login) boots. Daemonless OCI pull remains an open structural debt. |
 | Kernel-level or hypervisor attacks | libkrun/HVF and Cloudflare's isolation reduce the shared-kernel attack surface; compromise of the host kernel, hypervisor, Cloudflare control plane, or VMM remains out of scope. |
 | Multi-user separation on a shared host | One secret store per OS user. 0600 blocks other non-root users from reading; a root user on the host bypasses it. |
 | Cloudflare/R2 compromise | Managed terminal evidence and encrypted workspace objects leave the local machine. Rustic protects workspace content at rest; the local §0 copy still trusts evidence returned by the managed account boundary. Do not emit provider tokens or unredacted auth responses into evidence. |
@@ -143,8 +144,8 @@ Each normal local `pillbox run` boots a fresh libkrun microVM with:
   `.env` secrets, and other sensitive paths from workspace snapshots.
 
 The OCI runner filesystem is still pulled/unpacked through Docker and cached as
-the libkrun rootfs. OAuth login also still runs in a one-shot container. Both are
-tracked migration debts, not supported alternative agent placements.
+the libkrun rootfs. That is a tracked migration debt, not a supported
+alternative agent placement.
 
 ## Managed data boundary
 

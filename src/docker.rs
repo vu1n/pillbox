@@ -4,9 +4,7 @@
 //! "Docker Desktop installed" — no extra crates, no extra failure modes.
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -172,19 +170,6 @@ pub fn check_ready(image: &str) -> Result<()> {
     Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())
 }
 
-/// Run `docker run <args...>` with stdio inherited from the parent.
-pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
-    let status = Command::new("docker")
-        .arg("run")
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("invoking `docker run`")?;
-    Ok(status)
-}
-
 /// `docker rm -f <container>` — force-remove (kills if running). Best-effort
 /// teardown for the attach-transport flow; errors are the caller's to ignore.
 /// Tolerates a missing container (see [`rm`] for the error-surfacing form).
@@ -248,81 +233,6 @@ pub fn run_detached(args: &[String], secret_env: &BTreeMap<String, String>) -> R
         .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// `docker exec <container> <argv...>`, streaming output in real time.
-/// `on_chunk(is_stderr, bytes)` fires per read; returns the command's exit
-/// code. stdout and stderr are pumped on separate threads into one ordered
-/// channel so output interleaves as it arrives (no PTY).
-pub fn exec_streamed(
-    container: &str,
-    argv: &[String],
-    mut on_chunk: impl FnMut(bool, &[u8]) -> Result<()>,
-) -> Result<i32> {
-    let mut child = Command::new("docker")
-        .arg("exec")
-        .arg(container)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("invoking `docker exec`")?;
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
-    let tx_err = tx.clone();
-    let err_thread = std::thread::spawn(move || pump(stderr, true, &tx_err));
-    // Move the original `tx` into the stdout pump so the channel closes
-    // once BOTH pumps finish (no lingering sender in this scope).
-    let out_thread = std::thread::spawn(move || pump(stdout, false, &tx));
-
-    let mut result = Ok(());
-    for (is_stderr, buf) in rx {
-        if let Err(e) = on_chunk(is_stderr, &buf) {
-            result = Err(e);
-            break;
-        }
-    }
-    out_thread.join().ok();
-    err_thread.join().ok();
-    result?;
-
-    let status = child.wait().context("waiting on `docker exec`")?;
-    Ok(status.code().unwrap_or(-1))
-}
-
-/// `docker rm -f <container>`. Idempotent — a missing container is `Ok`.
-pub fn rm(container: &str) -> Result<()> {
-    let out = Command::new("docker")
-        .arg("rm")
-        .arg("-f")
-        .arg(container)
-        .output()
-        .context("invoking `docker rm -f`")?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("No such container") {
-        return Ok(());
-    }
-    Err(PillboxError::runtime("sandbox destroy", stderr.trim().to_string()).into())
-}
-
-fn pump<R: Read>(mut reader: R, is_stderr: bool, tx: &mpsc::Sender<(bool, Vec<u8>)>) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tx.send((is_stderr, buf[..n].to_vec())).is_err() {
-                    break;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

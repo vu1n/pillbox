@@ -657,12 +657,8 @@ pub(super) fn launch_prepared(
     let spec = make_spec(&owner_path, &rpc_path, remaining_ms(deadline)?);
     let spec_path = runtime.path().join("vm.json");
     write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("__krun-vmm")
-        .arg(&spec_path)
-        .env_clear()
-        .envs(super::boot::static_child_env());
+    let mut command =
+        super::session::vmm_command(&spec_path, super::session::VmmTether::Supervised)?;
     let process = OwnedProcess::spawn(&mut command, limits.max_output_bytes, credential_channel)?;
     let mut vm = OwnedVm {
         process,
@@ -714,11 +710,11 @@ fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> 
             "-S".into(),
             verifier::SUPERVISOR_PATH.into(),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: verifier::REPORT_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
+        }],
         egress: None,
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
@@ -898,22 +894,22 @@ fn builder_spec(
             "-S".into(),
             format!("{GUEST_RUNTIME}/bridge.py"),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: RPC_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
-        egress: Some(EgressSpec {
-            allowlist: vec![PROVIDER_HOST.into()],
-            log_path: None,
-            ca_dir: Some(ca_dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: Some(RefreshSpec {
+        }],
+        egress: Some(EgressSpec::fence(
+            vec![PROVIDER_HOST.into()],
+            None,
+            Some(ca_dir.to_string_lossy().into_owned()),
+            None,
+            Some(RefreshSpec {
                 creds_path: input.refresh_credentials.to_string_lossy().into_owned(),
                 auth_id: "codex".into(),
                 access_stub: input.access_release.stub.clone(),
             }),
-        }),
+        )),
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
             remaining_ms: Some(remaining_ms),
@@ -978,6 +974,35 @@ pub(super) fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
     crate::paths::ensure_mode_0700(&path)
 }
 
+/// The owner socket of a supervised one-shot VMM ([`run_supervised_vmm`]): bound
+/// first, so the VmSpec written once afterwards can name it.
+pub(super) struct SupervisedOwner {
+    _sockets: TempDir,
+    listener: UnixListener,
+    socket: PathBuf,
+}
+
+impl SupervisedOwner {
+    pub(super) fn bind() -> Result<Self> {
+        let sockets = socket_directory()?;
+        let socket = sockets.path().join("owner.sock");
+        let listener = bind_listener(&socket)?;
+        Ok(Self {
+            _sockets: sockets,
+            listener,
+            socket,
+        })
+    }
+
+    /// The VmSpec `ownership` the VMM child arms before any guest or egress work.
+    pub(super) fn ownership(&self) -> OwnershipSpec {
+        OwnershipSpec {
+            socket: self.socket.to_string_lossy().into_owned(),
+            remaining_ms: None,
+        }
+    }
+}
+
 /// Abort a spawned persistent VMM before handing ownership to its session record.
 pub(super) fn stop_spawned_vmm(child: crate::sandbox::DetachedChild) -> Result<ExitStatus> {
     OwnedProcess::from_child(child.into_child(), u64::MAX, true)?.stop_and_reap()
@@ -986,22 +1011,18 @@ pub(super) fn stop_spawned_vmm(child: crate::sandbox::DetachedChild) -> Result<E
 /// Structured one-shot runs are owned until exit, including when the CLI is SIGKILLed.
 /// The child arms its watcher before starting guest or egress work; closing this socket
 /// stops its group even when no host-side Drop or signal handler can run.
-/// `swap_blob` is the JSON stub→real swap set for the child's MITM — written to
-/// its stdin only after ownership is established (`[]` for a non-vault run).
+/// `owner` is bound before the caller writes the VmSpec carrying
+/// [`SupervisedOwner::ownership`]. `swap_blob` is the JSON stub→real swap set for
+/// the child's MITM — written to its stdin only after ownership is established
+/// (`[]` for a non-vault run).
 pub(super) fn run_supervised_vmm(
     command: &mut Command,
-    mut spec: VmSpec,
-    spec_path: &Path,
+    owner: SupervisedOwner,
     swap_blob: &[u8],
 ) -> Result<std::process::Output> {
-    let sockets = socket_directory()?;
-    let socket = sockets.path().join("owner.sock");
-    let listener = bind_listener(&socket)?;
-    spec.ownership = Some(OwnershipSpec {
-        socket: socket.to_string_lossy().into_owned(),
-        remaining_ms: None,
-    });
-    write_private_file(spec_path, &serde_json::to_vec(&spec)?)?;
+    let SupervisedOwner {
+        _sockets, listener, ..
+    } = owner;
     // Ownership must not import bounded-execution limits into ordinary agent runs.
     command
         .stdin(Stdio::piped())
@@ -2385,7 +2406,7 @@ mod tests {
     fn legacy_vm_spec_defaults_to_no_invocation_owner() {
         let spec: VmSpec = serde_json::from_value(serde_json::json!({
             "rootfs":"/rootfs", "vcpus":1, "ram_mib":512,
-            "shares":[], "exec":["/bin/true"], "vsock":null, "egress":null
+            "shares":[], "exec":["/bin/true"], "vsock":[], "egress":null
         }))
         .unwrap();
         assert!(spec.ownership.is_none());
@@ -2822,12 +2843,17 @@ except RuntimeError:
         assert!(cache_complete(&generation.join("rootfs"), &input().image_id).unwrap());
     }
 
-    fn supervised_fixture_spec() -> VmSpec {
-        serde_json::from_value(serde_json::json!({
+    /// Bind the owner and write the fixture VmSpec naming it to `spec_path`.
+    fn supervised_fixture_owner(spec_path: &Path) -> SupervisedOwner {
+        let owner = SupervisedOwner::bind().unwrap();
+        let mut spec: VmSpec = serde_json::from_value(serde_json::json!({
             "rootfs":"/unused", "vcpus":1, "ram_mib":64,
-            "shares":[], "exec":["unused"], "vsock":null, "egress":null
+            "shares":[], "exec":["unused"], "vsock":[], "egress":null
         }))
-        .unwrap()
+        .unwrap();
+        spec.ownership = Some(owner.ownership());
+        fs::write(spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+        owner
     }
 
     fn supervised_fixture_command(role: &str, directory: &Path) -> Command {
@@ -2864,7 +2890,7 @@ except RuntimeError:
         let spec_path = directory.join("vm.json");
         if role == "owner" {
             let mut command = supervised_fixture_command("worker", &directory);
-            run_supervised_vmm(&mut command, supervised_fixture_spec(), &spec_path, b"[]").unwrap();
+            run_supervised_vmm(&mut command, supervised_fixture_owner(&spec_path), b"[]").unwrap();
             panic!("supervisor unexpectedly returned");
         }
         if role == "before-handshake" {
@@ -2909,12 +2935,8 @@ except RuntimeError:
         for role in ["complete", "before-handshake"] {
             let directory = tempfile::tempdir().unwrap();
             let mut command = supervised_fixture_command(role, directory.path());
-            let result = run_supervised_vmm(
-                &mut command,
-                supervised_fixture_spec(),
-                &directory.path().join("vm.json"),
-                b"[]",
-            );
+            let owner = supervised_fixture_owner(&directory.path().join("vm.json"));
+            let result = run_supervised_vmm(&mut command, owner, b"[]");
             if role == "complete" {
                 let output = result.unwrap();
                 assert!(output.status.success());
@@ -3090,7 +3112,9 @@ except RuntimeError:
             spec.exec,
             ["/usr/bin/python3", "-I", "-S", verifier::SUPERVISOR_PATH]
         );
-        let vsock = spec.vsock.as_ref().unwrap();
+        let [vsock] = spec.vsock.as_slice() else {
+            panic!("verifier spec carries exactly one vsock channel")
+        };
         assert_eq!(vsock.port, verifier::REPORT_PORT);
         assert!(!vsock.listen);
         let bytes = serde_json::to_string(&spec).unwrap();

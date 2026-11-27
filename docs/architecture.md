@@ -45,9 +45,8 @@ execution backend.
 - **Image/build plumbing** — `resolve_runner_image` / `default_runner_image`
   (src/docker.rs), used by libkrun (above), `doctor.rs`, `main.rs:~847`. This is
   kept and renamed `crate::oci`.
-- Also: `auth login` runs the agent's OAuth flow in a container via
-  `docker::run_interactive` / `check_ready_for` (src/agents/mod.rs:~394,412) —
-  needs porting to libkrun before docker-the-tool is fully gone.
+- `auth login` no longer touches it: it runs in a foreground libkrun microVM
+  (src/sandbox/libkrun/login.rs), and a build without libkrun refuses it.
 
 ### The backend seam `[verified 2026-06-20]`
 One backend = one impl of two traits in `src/sandbox/mod.rs`:
@@ -91,7 +90,6 @@ the vault MITM live (src/sandbox/libkrun/egress.rs).
 
 - **Daemonless OCI image pull** — replace `docker create/export` so libkrun
   doesn't need the docker daemon.
-- **auth-in-libkrun** — `auth login` runs in a docker container today.
 - **No-backend build** — `--no-default-features` currently compiles because the
   docker backend is the fallback; deleting it means resolving what the
   toolchain-free / in-sandbox-guest build does.

@@ -128,6 +128,47 @@ pub(super) fn env_exports(env: &[(String, String)]) -> Result<String> {
     Ok(out)
 }
 
+/// The in-guest `pillbox exec-host` line a sandbox boot script `exec`s. Every
+/// token is a shell-safe literal, so scripts join them with spaces; the CLI test
+/// below parses these exact argv, so a renamed flag fails here, not in a booted VM.
+pub(super) fn exec_host_cmd(vsock_port: u32, run_as_uid: Option<u32>) -> String {
+    let mut argv = vec![
+        "pillbox".to_string(),
+        "exec-host".into(),
+        "--vsock-port".into(),
+        vsock_port.to_string(),
+    ];
+    if let Some(uid) = run_as_uid {
+        argv.extend(["--run-as-uid".into(), uid.to_string()]);
+    }
+    argv.join(" ")
+}
+
+/// The in-guest `pillbox vsock-forward` relay line (server agents, login callback).
+pub(super) fn vsock_forward_cmd(vsock_port: u32, to_port: u16) -> String {
+    [
+        "pillbox",
+        "vsock-forward",
+        "--vsock-port",
+        &vsock_port.to_string(),
+        "--to-port",
+        &to_port.to_string(),
+    ]
+    .join(" ")
+}
+
+/// The in-guest `pillbox pty-host` line up to and including `--`; the caller
+/// appends the shell-quoted agent argv. `listen` is detach (guest listens).
+pub(super) fn pty_host_cmd(vsock_port: u32, listen: bool) -> String {
+    let port = vsock_port.to_string();
+    let mut argv = vec!["pillbox", "pty-host", "--vsock-port", &port];
+    if listen {
+        argv.push("--vsock-listen");
+    }
+    argv.push("--");
+    argv.join(" ")
+}
+
 /// What the VMM child process is spawned with — and therefore all the kernel
 /// cmdline ever carries beyond the bootstrap: the static ASCII base. The full
 /// guest env travels in the boot script's exports instead.
@@ -157,6 +198,48 @@ pub(super) fn grader_child_env() -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// The guest command lines the boot scripts emit parse as the pillbox CLI.
+    #[test]
+    fn guest_command_lines_parse_as_the_pillbox_cli() {
+        use clap::Parser as _;
+        let parse = |line: &str| {
+            crate::Cli::try_parse_from(line.split(' '))
+                .unwrap_or_else(|e| panic!("`{line}` does not parse: {e}"))
+                .command
+        };
+        for run_as in [None, Some(1000)] {
+            match parse(&exec_host_cmd(1026, run_as)) {
+                crate::Command::ExecHost {
+                    vsock_port,
+                    run_as_uid,
+                } => assert_eq!((vsock_port, run_as_uid), (1026, run_as)),
+                other => panic!("{other:?}"),
+            }
+        }
+        match parse(&vsock_forward_cmd(1025, 54545)) {
+            crate::Command::VsockForward {
+                vsock_port,
+                to_port,
+            } => assert_eq!((vsock_port, to_port), (1025, 54545)),
+            other => panic!("{other:?}"),
+        }
+        for listen in [false, true] {
+            let line = format!("{} claude auth login", pty_host_cmd(1024, listen));
+            match parse(&line) {
+                crate::Command::PtyHost {
+                    sock,
+                    vsock_port,
+                    vsock_listen,
+                    argv,
+                } => {
+                    assert_eq!((sock, vsock_port, vsock_listen), (None, Some(1024), listen));
+                    assert_eq!(argv, ["claude", "auth", "login"]);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     use super::*;
 
     #[cfg(not(target_os = "macos"))]

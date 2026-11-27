@@ -2,6 +2,7 @@
 //! trees only; neither a guest nor a cleanup path may write through to that seed.
 
 use std::ops::Deref;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -59,8 +60,18 @@ impl PrivateRootfs {
     }
 
     pub(super) fn remove_stopped(&self) -> Result<()> {
-        remove_at(&self.root, self.root.parent().unwrap().parent().unwrap())
+        remove_stopped_root(&self.root)
     }
+}
+
+/// Remove a private root this process forked (its `vm-*/rootfs` path, as a
+/// launch's handle records it) once its VMM is confirmed stopped.
+pub(super) fn remove_stopped_root(root: &Path) -> Result<()> {
+    let runtimes = root
+        .parent()
+        .and_then(Path::parent)
+        .context("private rootfs namespace missing")?;
+    remove_at(root, runtimes)
 }
 
 impl Deref for PrivateRootfs {
@@ -74,6 +85,13 @@ pub(super) fn remove_owned(root: &Path) -> Result<()> {
     let raw_home = PathBuf::from(
         std::env::var_os("HOME").context("could not resolve $HOME for rootfs cleanup")?,
     );
+    remove_owned_under(root, &raw_home)
+}
+
+/// [`remove_owned`] against an explicit host home — for the VMM child, whose `HOME`
+/// is the guest's. Only a root inside `raw_home`'s private VM namespace is removed.
+pub(super) fn remove_owned_under(root: &Path, raw_home: &Path) -> Result<()> {
+    let raw_home = raw_home.to_path_buf();
     let krun = super::rootfs_backing::RootfsBacking::krun_dir_for_home(&raw_home)?;
     let canonical_home = krun
         .parent()
@@ -142,34 +160,172 @@ fn remove_at(root: &Path, runtimes: &Path) -> Result<()> {
             "private rootfs owner must be a plain directory"
         ),
     }
-    // Image and guest directory modes survive cloning. Restore owner access only
-    // after shutdown, and never traverse a guest symlink while preparing deletion.
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("stat stopped rootfs directory {}", path.display()))?;
-        if !metadata.is_dir() {
-            continue;
-        }
-        std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+    // A live guest can rewrite this tree (an abandoned launch scrubs it from inside the
+    // still-running VMM), so removal never resolves a path: every step is fd-relative.
+    remove_tree_nofollow(directory)
+        .with_context(|| format!("remove private VM rootfs {}", directory.display()))
+}
+
+/// Remove `dir` and everything under it without following a symlink: each
+/// directory is opened `O_NOFOLLOW` relative to its parent's fd, owner access is
+/// restored on it by name with `AT_SYMLINK_NOFOLLOW`, and entries are unlinked
+/// relative to their directory's fd. An entry swapped for a symlink mid-walk is
+/// unlinked as a link, never traversed.
+fn remove_tree_nofollow(dir: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = CString::new(dir.as_os_str().as_bytes()).context("rootfs path has a NUL")?;
+    // SAFETY: open() of a valid NUL-terminated path.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-        .with_context(|| format!("restore stopped rootfs directory access {}", path.display()))?;
-        for entry in std::fs::read_dir(&path)
-            .with_context(|| format!("read stopped rootfs directory {}", path.display()))?
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open rootfs owner directory");
+    }
+    // SAFETY: `fd` was just opened and is owned here.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    empty_dir_at(&owned, 0)?;
+    drop(owned);
+    std::fs::remove_dir(dir).context("remove emptied rootfs owner directory")
+}
+
+/// Deepest directory nesting [`empty_dir_at`] descends (one open fd per level).
+const MAX_REMOVE_DEPTH: usize = 512;
+
+/// Unlink everything inside the directory open at `dir`.
+fn empty_dir_at(dir: &std::os::fd::OwnedFd, depth: usize) -> Result<()> {
+    ensure!(
+        depth < MAX_REMOVE_DEPTH,
+        "rootfs nests deeper than {MAX_REMOVE_DEPTH} directories"
+    );
+    for name in dir_entries(dir)? {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatat() on an owned dir fd and a NUL-terminated name.
+        if unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
         {
-            let entry = entry.context("read stopped rootfs entry")?;
-            if entry
-                .file_type()
-                .context("stat stopped rootfs entry")?
-                .is_dir()
-            {
-                pending.push(entry.path());
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(err).with_context(|| format!("stat rootfs entry {name:?}"));
+        }
+        let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        #[cfg(test)]
+        AFTER_STAT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&name)
+            }
+        });
+        if is_dir {
+            if st.st_mode & 0o700 != 0o700 {
+                let mode = (st.st_mode & 0o7777) | 0o700;
+                // SAFETY: fchmodat() by name relative to an owned dir fd; never follows a link.
+                if unsafe {
+                    libc::fchmodat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        mode,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    // Linux refuses a no-follow chmod of a link swapped in since the stat.
+                    // A guard, not an or-pattern: ENOTSUP == EOPNOTSUPP on Linux but not macOS.
+                    let swapped = matches!(
+                        err.raw_os_error(),
+                        Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP || e == libc::ENOENT
+                    );
+                    if !swapped {
+                        return Err(err).with_context(|| {
+                            format!("restore access to rootfs directory {name:?}")
+                        });
+                    }
+                }
+            }
+            // SAFETY: openat() relative to an owned dir fd; O_NOFOLLOW refuses a swapped-in link.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: `fd` was just opened and is owned here.
+                let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                empty_dir_at(&child, depth + 1)?;
+            }
+        }
+        let flag = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: unlinkat() by name relative to an owned dir fd.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flag) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // A name swapped between kinds mid-walk: retry as the other kind.
+            let retried = matches!(
+                err.raw_os_error(),
+                Some(libc::ENOTDIR) | Some(libc::EISDIR) | Some(libc::EPERM)
+            ) && unsafe {
+                libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flag ^ libc::AT_REMOVEDIR)
+            } == 0;
+            if !retried && err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err).with_context(|| format!("remove rootfs entry {name:?}"));
             }
         }
     }
-    std::fs::remove_dir_all(directory).context("remove stopped private VM rootfs")
+    Ok(())
+}
+
+#[cfg(test)]
+type StatHook = Box<dyn FnMut(&std::ffi::CStr)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs between an entry's stat and its chmod, as a racing guest would.
+    static AFTER_STAT: std::cell::RefCell<Option<StatHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The names in the directory open at `dir`, without `.` and `..`.
+fn dir_entries(dir: &std::os::fd::OwnedFd) -> Result<Vec<std::ffi::CString>> {
+    // SAFETY: dup() of an owned fd; fdopendir takes ownership of the duplicate.
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error()).context("dup rootfs directory fd");
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup) };
+        return Err(err).context("read rootfs directory");
+    }
+    // fdopendir shares the offset with `dir`'s open file description: start at the top.
+    unsafe { libc::rewinddir(stream) };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: readdir() on the stream opened above; the entry is copied before the next call.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: closes the stream (and the duplicate fd) opened above.
+    unsafe { libc::closedir(stream) };
+    Ok(names)
 }
 
 impl Drop for PrivateRootfs {
@@ -337,6 +493,44 @@ mod tests {
     }
 
     #[test]
+    fn removal_never_follows_a_link_a_live_guest_swaps_in_mid_walk() {
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = fixture.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), "outside file").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        let tree = fixture.path().join("vm-race");
+        let swap = tree.join("rootfs/swap");
+        fs::create_dir_all(&swap).unwrap();
+        fs::set_permissions(&swap, fs::Permissions::from_mode(0o000)).unwrap();
+        // The guest replaces the locked directory with a link to `outside` right after
+        // the walk saw it as a directory, before its access is restored.
+        let (link_to, at) = (outside.clone(), swap.clone());
+        AFTER_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |name| {
+                if name.to_bytes() == b"swap" && fs::symlink_metadata(&at).unwrap().is_dir() {
+                    fs::remove_dir(&at).unwrap();
+                    std::os::unix::fs::symlink(&link_to, &at).unwrap();
+                }
+            }))
+        });
+        let removed = remove_tree_nofollow(&tree);
+        AFTER_STAT.with(|hook| hook.borrow_mut().take());
+        removed.unwrap();
+        assert!(!tree.exists());
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o555,
+            "a swapped-in link was chmodded through"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "outside file"
+        );
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
     fn rootfs_fork_rejects_aliases_and_cleans_unspawned_roots() {
         let fixture = tempfile::tempdir().unwrap();
         let base = fixture.path().join("base");
@@ -376,7 +570,6 @@ mod tests {
     #[test]
     #[ignore = "requires signed libkrun binary and freshly exported offline runner rootfs"]
     fn live_concurrent_and_successor_vm_roots_are_isolated() {
-        use std::process::Command;
         use std::time::{Duration, Instant};
         let binary = std::env::var_os("PILLBOX_ISOLATION_BINARY").expect("signed binary path");
         let base =
@@ -403,6 +596,7 @@ mod tests {
         let a_owner = a.root.parent().unwrap().to_path_buf();
         let b_owner = b.root.parent().unwrap().to_path_buf();
         let run = move |mut root: PrivateRootfs, script: &str, spec_path: PathBuf| {
+            let owner = super::super::repository::SupervisedOwner::bind().unwrap();
             let spec = super::super::VmSpec {
                 offline: false,
                 rootfs: root.to_string_lossy().into_owned(),
@@ -417,20 +611,19 @@ mod tests {
                     "-c".into(),
                     format!("mkdir -p /probe; mount -t virtiofs probe /probe && {script}"),
                 ],
-                vsock: None,
+                vsock: Vec::new(),
                 egress: None,
-                ownership: None,
+                ownership: Some(owner.ownership()),
             };
-            let mut command = Command::new(&binary);
-            command
-                .arg("__krun-vmm")
-                .arg(&spec_path)
-                .env_clear()
-                .envs(super::super::boot::static_child_env());
+            fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+            let mut command = super::super::session::vmm_command_for(
+                Path::new(&binary),
+                &spec_path,
+                super::super::session::VmmTether::Supervised,
+            );
             root.preserve();
             let output =
-                super::super::repository::run_supervised_vmm(&mut command, spec, &spec_path, b"[]")
-                    .unwrap();
+                super::super::repository::run_supervised_vmm(&mut command, owner, b"[]").unwrap();
             root.remove_stopped().unwrap();
             assert!(
                 output.status.success(),

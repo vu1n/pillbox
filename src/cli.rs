@@ -66,18 +66,22 @@ pub(crate) enum BookmarkAction {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum SandboxAction {
-    /// Spawn a long-lived container with the workspace mounted, kept idle so
-    /// commands can be `exec`'d into it. Prints the sandbox id on stdout.
+    /// Spawn a long-lived microVM on a CoW, secret-scrubbed clone of the
+    /// workspace, kept idle so commands can be `exec`'d into it. Prints the
+    /// sandbox id on stdout.
     Spawn {
-        /// Runner image (default: the pillbox runner image).
-        #[arg(long, value_name = "IMAGE")]
+        /// Not supported: the sandbox boots this pillbox's runner image
+        /// (`[runner] image` in pillbox.toml). Passing it is a usage error.
+        #[arg(long, value_name = "IMAGE", hide = true)]
         image: Option<String>,
-        /// Provision for an agent harness (`claude` | `codex` | `opencode`):
-        /// mounts its auth and runs the container non-root so the agent
-        /// channel can drive it headlessly. Omit for a bare exec-only sandbox.
+        /// Provision for an agent harness (`claude` today: only an env-forked
+        /// agent with a stdout adapter qualifies, so the guest never holds a
+        /// real credential). Commands then run as uid 1000 so the agent channel
+        /// can drive it headlessly. Omit for a bare exec-only sandbox (commands
+        /// run as root).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
-        /// Host directory to mount as the workspace (default: cwd).
+        /// Host directory the sandbox's workspace clone is taken from (default: cwd).
         #[arg(long, value_name = "PATH")]
         workspace: Option<PathBuf>,
         /// Human label, surfaced in `sandbox list`.
@@ -110,7 +114,7 @@ pub(crate) enum SandboxAction {
         #[arg(trailing_var_arg = true, value_name = "ARGV")]
         argv: Vec<String>,
     },
-    /// Tear down a sandbox — kill the container and remove the record.
+    /// Tear down a sandbox — stop its VM, remove its clones, then its record.
     Destroy {
         /// Sandbox id (or unique prefix ≥ 4 chars).
         id: String,

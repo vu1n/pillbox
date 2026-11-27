@@ -167,19 +167,19 @@ fn spec(
             "-S".into(),
             format!("{GUEST_RUNTIME}/text-bridge.py"),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: RPC_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
+        }],
         // Only the provider host resolves.
-        egress: Some(EgressSpec {
-            allowlist: vec![host.into()],
-            log_path: None,
-            ca_dir: Some(ca_dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: None,
-        }),
+        egress: Some(EgressSpec::fence(
+            vec![host.into()],
+            None,
+            Some(ca_dir.to_string_lossy().into_owned()),
+            None,
+            None,
+        )),
         ownership: Some(repository::OwnershipSpec::bounded(owner, remaining_ms)),
     }
 }

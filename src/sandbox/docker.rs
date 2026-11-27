@@ -41,7 +41,8 @@ impl Drop for ContainerGuard {
 }
 
 impl SandboxBackend for DockerBackend {
-    /// The container family: full PTY drive/read + long-lived exec. No server
+    /// The container family: full PTY drive/read. No long-lived exec (the sandbox
+    /// verbs moved to the libkrun microVM; Docker is deprecated). No server
     /// mode (server agents are libkrun-only). No KVM-isolation features (real fence, in-sandbox grade,
     /// detached vault); drains §0 live, so no post-hoc ingest. See
     /// docs/substrate-plane.md.
@@ -52,7 +53,8 @@ impl SandboxBackend for DockerBackend {
             live_pty_tail: true,
             // Server agents (opencode, codex-serve) are libkrun-only.
             server_mode: false,
-            long_lived_exec: true,
+            // Docker is deprecated: the sandbox verbs run on the libkrun microVM only.
+            long_lived_exec: false,
             in_sandbox_grading: false,
             real_egress_fence: false,
             detached_vault: false,
@@ -219,7 +221,13 @@ impl SandboxBackend for DockerBackend {
             None
         };
 
-        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
+        let env_vars = resolve_run_env(
+            resolved,
+            &opts.env_bundles,
+            &opts.env_files,
+            &withs_resolved,
+            vault_session.as_mut(),
+        )?;
         startup.mark("env_prepare");
 
         // Bind `mcp` (rather than letting the expression be the

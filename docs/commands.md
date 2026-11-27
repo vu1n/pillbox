@@ -34,7 +34,7 @@ global pillbox regardless of where you are.
 | `pillbox secret rm NAME [--global]` | Delete a secret. |
 | `pillbox env load NAME PATH [--global]` | Parse `.env` file, store as bundle. |
 | `pillbox env list/show/rm` | Same shape as secrets. |
-| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. For `cursor`, browser login (`agent login`) is one path; API-key auth is also supported via a stored `CURSOR_API_KEY` (see Cursor auth below). |
+| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. The login microVM reaches only the vault providers' hosts plus the hosts that agent's login flows need (e.g. `github.com` for GitHub Copilot's device flow in opencode/pi/prime-agent); a provider on any other host (GitHub Enterprise, a custom OpenAI-compatible base URL) fails at DNS, and the login ends with `pillbox: the egress fence refused <host> …`. For `cursor`, browser login (`agent login`) is one path; API-key auth is also supported via a stored `CURSOR_API_KEY` (see Cursor auth below). |
 | `pillbox auth list/rm` | List/remove agent OAuth state. |
 | `pillbox vault ca/status [--json]` | Inspect the per-pillbox vault CA. |
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
@@ -74,19 +74,25 @@ global pillbox regardless of where you are.
 | `pillbox bookmark rm NAME` | Remove a bookmark; the underlying snapshot is untouched. |
 | `pillbox workspace rekey` | Rotate the rustic repo password. **Caveat:** rustic_core 0.11 has no public API to delete the prior key; both passwords keep working until upstream lands deletion. Treat the old password as compromised. |
 
-### Sandboxes — a long-lived exec target (Docker)
+### Sandboxes — a long-lived exec target (microVM)
 
 `pillbox run` launches one agent turn. The `sandbox` group instead spawns a
-**long-lived** sandbox you keep around and `exec`/`agent` into repeatedly — the
-PTY-free exec channel an orchestrator drives. Docker-backed today.
+**long-lived** libkrun microVM you keep around and `exec`/`agent` into
+repeatedly — the PTY-free exec channel an orchestrator drives. The VM works on
+its own CoW, secret-scrubbed clone of the workspace (never the host directory):
+its writes land in the clone, whose host path `sandbox list --json` reports as
+`workspace_clone`. Docker is deprecated: with `PILLBOX_BACKEND=docker` (or a
+build without libkrun) `spawn` is refused, and an old docker record can only be
+destroyed (its container is left for you to remove). See
+[sandboxes](features/sandboxes.md).
 
 | Command | What it does |
 |---|---|
-| `pillbox sandbox spawn [--image IMG] [--agent A] [--workspace PATH] [--label TEXT]` | Spawn an idle sandbox with the workspace mounted; prints the sandbox id. `--agent` provisions its auth + runs non-root so the agent channel can drive it; omit for a bare exec-only sandbox. |
-| `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free). Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. |
-| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only harnesses with a stdout adapter (`claude`, `cursor`, `pi`); server agents (`opencode`, `codex-serve`) have none and are a usage error. |
-| `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
-| `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
+| `pillbox sandbox spawn [--agent A] [--workspace PATH] [--label TEXT]` | Boot an idle sandbox VM on a clone of the workspace (default: cwd); returns once its exec channel answers and prints the sandbox id. `--agent` (`claude` today) provisions the agent's credentials env-forked, so the guest only ever holds stubs, and runs commands as uid 1000; an agent that isn't vault-capable or has no stdout adapter is a usage error before anything boots; omit for a bare exec-only sandbox (commands run as root). `--image` is a usage error: the VM boots this pillbox's runner image. |
+| `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free) in the guest workspace. Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL; a sandbox that refuses or can't be reached fails before `ExecStarted`. A command that can't start exits 127 (not found) or 126 (not executable, unusable cwd) with the reason on stderr. Each exec is its own connection, so execs may run concurrently. |
+| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only a sandbox spawned with an agent `spawn --agent` accepts (`claude`). Plain mode exits with the turn's outcome (the harness's non-zero exit, else `run_finished`'s exit code, else 1 when no `run_finished` arrived). `--json` exits 0 when `run_finished` already reports that outcome, as `exec --json` does with `ExecExit`, and with the outcome otherwise. |
+| `pillbox sandbox list [--json]` | List sandboxes in the current pillbox (`--json` adds `workspace_clone` for a microVM sandbox). |
+| `pillbox sandbox destroy ID` | Stop the sandbox VM, remove its rootfs and clones, then its record. A VM that can't be confirmed stopped keeps its record and files. A record pillbox can't drive (docker-backed, an unknown backend, or a libkrun handle that won't decode) is dropped with a stderr notice of what was left behind (for docker: `docker rm -f <container>`) and a line saying nothing was torn down, and exits 0; `exec` on one is a usage error. |
 
 ### Local VM filesystem isolation
 

@@ -56,33 +56,17 @@ impl Frame {
     /// Serialize and write the frame, then flush.
     pub(crate) fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         let (tag, payload) = self.to_wire();
-        let mut hdr = [0u8; 5];
-        hdr[0] = tag;
-        hdr[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        w.write_all(&hdr)?;
-        w.write_all(&payload)?;
-        w.flush()
+        write_frame(w, tag, &payload, MAX_FRAME_LEN)
     }
 
     /// Read one frame. `Ok(None)` is a clean EOF (peer closed between
     /// frames). A truncated frame or malformed fixed-width payload is an
     /// `InvalidData` error.
     pub(crate) fn decode(r: &mut impl Read) -> io::Result<Option<Frame>> {
-        let mut hdr = [0u8; 5];
-        match r.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        match read_frame(r, MAX_FRAME_LEN)? {
+            Some((tag, payload)) => Ok(Some(Frame::from_wire(tag, payload)?)),
+            None => Ok(None),
         }
-        let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-        if len > MAX_FRAME_LEN {
-            return Err(invalid(&format!(
-                "frame length {len} exceeds cap {MAX_FRAME_LEN}"
-            )));
-        }
-        let mut payload = vec![0u8; len];
-        r.read_exact(&mut payload)?;
-        Ok(Some(Frame::from_wire(hdr[0], payload)?))
     }
 
     fn to_wire(&self) -> (u8, Vec<u8>) {
@@ -153,6 +137,56 @@ fn parse_dims(payload: &[u8]) -> io::Result<(u16, u16)> {
     ))
 }
 
+/// Write one `[tag:u8][len:u32 BE][payload]` frame, then flush. A payload over
+/// `cap` is refused (`InvalidData`) so the peer's `read_frame` never sees it.
+pub(crate) fn write_frame(
+    w: &mut impl Write,
+    tag: u8,
+    payload: &[u8],
+    cap: usize,
+) -> io::Result<()> {
+    if payload.len() > cap {
+        return Err(invalid(&format!(
+            "frame length {} exceeds cap {cap}",
+            payload.len()
+        )));
+    }
+    let mut hdr = [0u8; 5];
+    hdr[0] = tag;
+    hdr[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    w.write_all(&hdr)?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+/// Read one raw frame as `(tag, payload)`. `Ok(None)` only for EOF before the
+/// first header byte; EOF inside the header or payload, or a length over `cap`
+/// (peer-controlled, so refused before allocating), is `InvalidData`. Tag meaning
+/// (and the unknown-tag policy) belongs to each protocol's frame enum.
+pub(crate) fn read_frame(r: &mut impl Read, cap: usize) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut hdr = [0u8; 5];
+    let mut got = 0;
+    while got < hdr.len() {
+        match r.read(&mut hdr[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(invalid("EOF inside a frame header")),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    if len > cap {
+        return Err(invalid(&format!("frame length {len} exceeds cap {cap}")));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => invalid("EOF inside a frame payload"),
+        _ => e,
+    })?;
+    Ok(Some((hdr[0], payload)))
+}
+
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
@@ -160,6 +194,32 @@ fn invalid(msg: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves a frame header, then fails the test if the payload is ever read.
+    struct HeaderOnly {
+        hdr: [u8; 5],
+        served: usize,
+    }
+    impl Read for HeaderOnly {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(self.served < 5, "read past the header of an over-cap frame");
+            let n = buf.len().min(5 - self.served);
+            buf[..n].copy_from_slice(&self.hdr[self.served..self.served + n]);
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_frame_refuses_a_declared_length_over_the_cap_before_reading_the_payload() {
+        let mut hdr = [7u8; 5];
+        hdr[1..].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut r = HeaderOnly { hdr, served: 0 };
+        let err = read_frame(&mut r, 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds cap 1024"), "{err}");
+        assert_eq!(r.served, 5);
+    }
 
     fn round_trip(f: Frame) {
         let mut buf = Vec::new();
@@ -230,6 +290,18 @@ mod tests {
         buf.extend_from_slice(&10u32.to_be_bytes()); // claims 10 bytes
         buf.extend_from_slice(b"only4"); // but supplies 5
         assert!(Frame::decode(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn eof_inside_a_header_is_invalid_data_not_a_clean_eof() {
+        for cut in 1..5 {
+            let mut buf = vec![T_DATA];
+            buf.extend_from_slice(&3u32.to_be_bytes());
+            buf.truncate(cut);
+            let err = Frame::decode(&mut buf.as_slice()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut at {cut}");
+        }
+        assert_eq!(Frame::decode(&mut [].as_slice()).unwrap(), None);
     }
 
     #[test]

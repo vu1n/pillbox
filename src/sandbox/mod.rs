@@ -15,6 +15,7 @@
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
 pub(crate) mod docker;
+pub(crate) mod exec_channel;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
@@ -33,6 +34,77 @@ use crate::events::transcripts::TailerHandle;
 use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
 use crate::session::{Backend, Session};
+
+/// A child that outlives its launch call: a detached VMM or §0 tailer. The
+/// launch may run inside a long-lived caller (dispatch, eval), where an exited
+/// child nobody waits on stays a zombie of that caller. Dropping it hands the
+/// child to a waiter thread; the explicit methods consume it instead.
+// A detached child is reaped when dropped, so a dead child never reads as alive to signal-0 probes.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) struct DetachedChild(Option<std::process::Child>);
+
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+impl DetachedChild {
+    pub(crate) fn spawn(cmd: &mut std::process::Command) -> std::io::Result<Self> {
+        Ok(Self(Some(cmd.spawn()?)))
+    }
+
+    /// Take over reaping a child spawned elsewhere.
+    pub(crate) fn adopt(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("a DetachedChild holds its child until consumed")
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.0.as_ref().map_or(0, std::process::Child::id)
+    }
+
+    /// The child's exit status if it has exited (and is then reaped), without blocking.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child().try_wait()
+    }
+
+    /// SIGKILL the child (a no-op if it already exited) and wait for it here.
+    pub(crate) fn kill_and_wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.0.take().expect("a DetachedChild holds its child");
+        let _ = child.kill();
+        child.wait()
+    }
+
+    /// Give up the reaper: the caller now owns waiting for the child.
+    pub(crate) fn into_child(mut self) -> std::process::Child {
+        self.0.take().expect("a DetachedChild holds its child")
+    }
+}
+
+impl Drop for DetachedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        // Already exited and reaped by a `try_wait`: nothing left to wait for.
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        #[cfg(test)]
+        tests::REAPERS_STARTED.with(|n| n.set(n.get() + 1));
+        let reaper = std::thread::Builder::new()
+            .name(format!("reap-{}", child.id()))
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        if let Err(error) = reaper {
+            eprintln!(
+                "pillbox: warning: could not start a reaper thread for a detached child: {error}"
+            );
+        }
+    }
+}
 
 /// What a backend can do — **declared, not chased**. The plane queries this to
 /// decide whether a verb is available on the current substrate, instead of
@@ -99,7 +171,9 @@ pub(crate) trait SandboxBackend {
         Err(self.capabilities().unsupported("execution execute"))
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
+    /// Launch one run and hand back what started (or finished). Backends never
+    /// print the outcome: the CLI renders it, and dispatch/eval read it typed.
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
 
     /// What this backend can do — queried before (or instead of) attempting a
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
@@ -110,6 +184,224 @@ pub(crate) trait SandboxBackend {
     /// active, rather than inferring it from a capability bit (which silently
     /// breaks the moment two backends share that capability).
     fn id(&self) -> &'static str;
+
+    /// Boot a long-lived exec target (`sandbox spawn`) and return its record,
+    /// already written to the registry. The caller then addresses it through
+    /// [`sandbox_target`]. Only a backend declaring `long_lived_exec` overrides
+    /// this; every other backend refuses with the plane's unsupported error.
+    fn spawn_sandbox(
+        &self,
+        _resolved: &Pillbox,
+        _req: &SandboxSpawn,
+    ) -> Result<crate::sandboxes::Sandbox> {
+        Err(self.capabilities().unsupported("sandbox spawn"))
+    }
+}
+
+/// What `sandbox spawn` asks a backend for: an optional agent harness to
+/// provision (its credentials env-forked, the guest user non-root), the host
+/// workspace to clone into the sandbox, and an optional `sandbox list` label.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxSpawn {
+    pub(crate) agent: Option<String>,
+    pub(crate) workspace: PathBuf,
+    pub(crate) label: Option<String>,
+}
+
+/// One live sandbox, addressed by its registry record (see [`sandbox_target`]) —
+/// what `sandbox exec`/`agent`/`destroy` drive without branching on the backend.
+pub(crate) trait SandboxTarget {
+    /// Open a channel for one command. Every refusal (a record pillbox can't
+    /// drive, a missing guest workspace, a VM that doesn't answer) happens here,
+    /// before anything is sent or reported as started.
+    fn open_exec(&self) -> Result<Box<dyn ExecChannel>>;
+
+    /// Run `argv` to completion in the sandbox's workspace, handing each output
+    /// chunk to `on_chunk(is_stderr, bytes)` as it arrives (stdin is empty).
+    /// Returns the command's exit code (128+signo when a signal killed it).
+    fn exec(
+        &self,
+        argv: &[String],
+        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32> {
+        self.open_exec()?.run(argv, on_chunk)
+    }
+
+    /// Stop the sandbox, release its artifacts, and delete its record.
+    fn destroy(&self, resolved: &Pillbox) -> Result<Destroyed>;
+}
+
+/// What [`SandboxTarget::destroy`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Destroyed {
+    /// The sandbox was stopped and its files removed, then its record.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only libkrun sandboxes run
+    TornDown,
+    /// Only the record was dropped: nothing it ran was torn down.
+    RecordDropped,
+}
+
+/// One opened exec channel ([`SandboxTarget::open_exec`]), good for one command.
+pub(crate) trait ExecChannel {
+    /// Run `argv` as [`SandboxTarget::exec`] describes.
+    fn run(
+        self: Box<Self>,
+        argv: &[String],
+        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32>;
+}
+
+/// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
+/// on `record.backend`. A record nothing here can drive — the deprecated Docker
+/// backend's, an unknown backend's, or a libkrun record whose handle won't decode —
+/// resolves to a [`RecordOnly`] target: exec is refused, destroy drops the record.
+pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
+    match record.backend.as_str() {
+        crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(RecordOnly {
+            record: record.clone(),
+            why: "is docker-backed, and docker is deprecated".into(),
+            left: format!(
+                "its container `{}` was left running; pillbox no longer drives docker, remove it \
+                 with `docker rm -f {}`",
+                record.backend_ref, record.backend_ref
+            ),
+        })),
+        #[cfg(feature = "libkrun")]
+        crate::sandboxes::BACKEND_LIBKRUN => {
+            libkrun::sandbox_vm::target(record).or_else(|e| -> Result<Box<dyn SandboxTarget>> {
+                Ok(Box::new(RecordOnly {
+                    record: record.clone(),
+                    why: format!("has a libkrun handle that can't be decoded ({e:#})"),
+                    left: "any VM or files it named were not torn down".into(),
+                }))
+            })
+        }
+        // Usage (exit 2), like `live_session` for a libkrun record on this build.
+        // Not dropped: its VM may be live, and only a libkrun build can tear it down.
+        #[cfg(not(feature = "libkrun"))]
+        crate::sandboxes::BACKEND_LIBKRUN => Err(PillboxError::usage(
+            "sandbox",
+            format!(
+                "sandbox `{}` is libkrun-backed, but this pillbox was built without libkrun support",
+                record.id
+            ),
+        )
+        .into()),
+        other => Ok(Box::new(RecordOnly {
+            record: record.clone(),
+            why: format!("has an unknown backend `{other}`"),
+            left: "nothing it ran was torn down".into(),
+        })),
+    }
+}
+
+/// A sandbox record pillbox can't drive (see [`sandbox_target`]). Exec is refused;
+/// destroy drops the record, says on stderr what it left behind, and succeeds.
+struct RecordOnly {
+    record: crate::sandboxes::Sandbox,
+    /// Why it can't be driven, completing "sandbox `id` …".
+    why: String,
+    /// What destroy leaves behind, and the manual cleanup if any.
+    left: String,
+}
+
+impl SandboxTarget for RecordOnly {
+    fn open_exec(&self) -> Result<Box<dyn ExecChannel>> {
+        Err(PillboxError::usage(
+            "sandbox exec",
+            format!(
+                "sandbox `{}` {}, so it can't be exec'd (destroy only drops the record)",
+                self.record.id, self.why
+            ),
+        )
+        .with_next(format!("pillbox sandbox destroy {}", self.record.id))
+        .into())
+    }
+
+    fn destroy(&self, resolved: &Pillbox) -> Result<Destroyed> {
+        crate::sandboxes::delete(resolved, &self.record.id)?;
+        eprintln!(
+            "pillbox: sandbox `{}` {}: dropped its record; {}",
+            self.record.id, self.why, self.left
+        );
+        Ok(Destroyed::RecordDropped)
+    }
+}
+
+/// What one [`SandboxBackend::run`] produced. A backend returns it and never
+/// prints it; `commands::run::render_started` is the CLI's rendering, and
+/// in-process callers (dispatch, eval) read the session from it directly.
+#[derive(Debug)]
+pub(crate) enum Started {
+    /// A foreground PTY run. The terminal was the whole report; there is no
+    /// persisted session to hand back.
+    Foreground,
+    /// A detached PTY session, left running in the background.
+    Detached(Session),
+    /// A server-mode agent, up and ready for `session send`. `run` does not
+    /// auto-send for server agents, so `pending_prompt` is the prompt `run` was
+    /// given (if any), for the caller to send.
+    // Only the libkrun backend runs server and structured agents.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    ServerReady {
+        session: Session,
+        pending_prompt: Option<String>,
+    },
+    /// A one-shot structured run that has finished. `events` counts the durable
+    /// events it wrote, including the terminal one; a non-zero `exit_code` is the
+    /// agent's failure, which the caller decides how to surface.
+    // Only the libkrun backend runs server and structured agents.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    StructuredFinished {
+        session: Session,
+        events: usize,
+        exit_code: i32,
+    },
+    /// A managed turn that has finished, with its result snapshot recorded.
+    ManagedFinished(Session),
+}
+
+impl Started {
+    /// The session this run persisted; `None` for a foreground run.
+    pub(crate) fn session(&self) -> Option<&Session> {
+        match self {
+            Started::Foreground => None,
+            Started::Detached(session)
+            | Started::ServerReady { session, .. }
+            | Started::StructuredFinished { session, .. }
+            | Started::ManagedFinished(session) => Some(session),
+        }
+    }
+
+    /// The session a caller can go on driving locally (`session send`,
+    /// `wait-idle`, score its workspace): a detached PTY session, a ready
+    /// server, or a structured run whose agent exited 0.
+    // A failed structured run, a foreground run and a managed run are not drivable local sessions.
+    pub(crate) fn into_live_session(self) -> Result<Session> {
+        match self {
+            Started::Detached(session) | Started::ServerReady { session, .. } => Ok(session),
+            Started::StructuredFinished {
+                session, exit_code, ..
+            } => {
+                if exit_code != 0 {
+                    anyhow::bail!(
+                        "{} structured run `{}` exited {exit_code}",
+                        session.agent_id,
+                        session.id
+                    );
+                }
+                Ok(session)
+            }
+            Started::Foreground => {
+                anyhow::bail!("started a foreground run, not a detached session")
+            }
+            Started::ManagedFinished(session) => anyhow::bail!(
+                "started a managed run (`{}`), not a local detached session",
+                session.id
+            ),
+        }
+    }
 }
 
 /// The live session — **the plane**. A running (foreground or detached) agent
@@ -150,6 +442,7 @@ pub(crate) trait LiveSession {
     fn ingest(&self, resolved: &Pillbox) -> Result<usize>;
 
     /// Tear down the backend (kill sandbox/VM) and release its artifacts.
+    // Rule: kill never prints to stdout (in-process callers keep `--json` pure); callers report.
     fn kill(&self, resolved: &Pillbox) -> Result<()>;
 }
 
@@ -257,14 +550,106 @@ mod tests {
     /// reads/writes `PILLBOX_BACKEND` in this process.
     static BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `select_backend` reports a stable id for the chosen backend, so the test
-    /// can assert which one was picked without naming a concrete type.
+    /// The stable `id()` of the backend `select_backend` picks.
     fn selected_backend_id() -> &'static str {
-        if select_backend().capabilities().long_lived_exec {
-            BACKEND_DOCKER // docker is the long-lived-exec family
-        } else {
-            "libkrun"
+        select_backend().id()
+    }
+
+    #[test]
+    fn only_a_live_or_cleanly_finished_run_is_a_live_session() {
+        let s = Session::test_fixture();
+        assert_eq!(
+            Started::Detached(s.clone()).into_live_session().unwrap().id,
+            s.id
+        );
+        let server = Started::ServerReady {
+            session: s.clone(),
+            pending_prompt: None,
+        };
+        assert_eq!(server.session().map(|x| x.id.as_str()), Some(s.id.as_str()));
+        assert_eq!(server.into_live_session().unwrap().id, s.id);
+        let finished = |exit_code| Started::StructuredFinished {
+            session: s.clone(),
+            events: 3,
+            exit_code,
+        };
+        assert_eq!(finished(0).into_live_session().unwrap().id, s.id);
+        let err = format!("{:#}", finished(2).into_live_session().unwrap_err());
+        assert!(err.contains("exited 2"), "{err}");
+        assert!(Started::Foreground.session().is_none());
+        let err = format!("{:#}", Started::Foreground.into_live_session().unwrap_err());
+        assert!(err.contains("foreground"), "{err}");
+        let managed = Started::ManagedFinished(s.clone());
+        assert!(managed.session().is_some());
+        let err = format!("{:#}", managed.into_live_session().unwrap_err());
+        assert!(err.contains("managed"), "{err}");
+    }
+
+    thread_local! {
+        /// Reaper threads `DetachedChild::drop` started on this test's thread.
+        pub(super) static REAPERS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn reapers_started() -> usize {
+        REAPERS_STARTED.with(std::cell::Cell::get)
+    }
+
+    /// Wait (bounded) until `pid` no longer answers signal-0: it exited AND was reaped.
+    fn assert_reaped(pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited detached child {pid} still answers signal-0 (zombie)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn dropping_a_detached_child_reaps_it() {
+        // One that may already have exited at drop, and one still running that exits later.
+        for (program, args) in [("true", &[][..]), ("sleep", &["0.2"][..])] {
+            let child =
+                DetachedChild::spawn(std::process::Command::new(program).args(args)).unwrap();
+            let pid = child.id() as i32;
+            drop(child);
+            assert_reaped(pid);
+        }
+        // A running child is handed to exactly one reaper thread.
+        let before = reapers_started();
+        let child = DetachedChild::spawn(std::process::Command::new("sleep").arg("0.2")).unwrap();
+        let pid = child.id() as i32;
+        drop(child);
+        assert_eq!(reapers_started(), before + 1);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn an_explicitly_stopped_detached_child_is_waited_once() {
+        let before = reapers_started();
+        let child = DetachedChild::spawn(std::process::Command::new("sleep").arg("30")).unwrap();
+        let pid = child.id() as i32;
+        let status = child.kill_and_wait().unwrap();
+        assert!(!status.success());
+        // Waited here, synchronously: no zombie, and no reaper thread waits it again.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        assert_eq!(reapers_started(), before);
+
+        // A child `try_wait` already reaped needs no reaper either.
+        let mut child = DetachedChild::spawn(&mut std::process::Command::new("true")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(child);
+        assert_eq!(reapers_started(), before);
+
+        // Handing the child over gives up the reaper; the new owner waits.
+        let child = DetachedChild::spawn(&mut std::process::Command::new("true")).unwrap();
+        child.into_child().wait().unwrap();
+        assert_eq!(reapers_started(), before);
     }
 
     #[test]
@@ -300,7 +685,7 @@ mod tests {
         let _guard = BackendEnvGuard;
         // `PILLBOX_BACKEND=managed` selects the managed tier on every build (it
         // needs no host capability). Asserted via the stable `id()` discriminant,
-        // since managed shares `long_lived_exec=false` with libkrun.
+        // not a capability bit (two backends can share one).
         std::env::set_var("PILLBOX_BACKEND", "managed");
         assert_eq!(select_backend().id(), BACKEND_MANAGED);
     }
@@ -316,6 +701,74 @@ mod tests {
         // with no host PTY — the honest profile the plane gates verbs on.
         assert!(live.caps().server_mode);
         assert!(!live.caps().pty_drive);
+    }
+
+    fn sandbox_record(backend: &str) -> crate::sandboxes::Sandbox {
+        crate::sandboxes::Sandbox {
+            id: "abcdef012345".into(),
+            backend: backend.into(),
+            backend_ref: "container-abc".into(),
+            image: "pillbox:latest".into(),
+            agent: None,
+            workspace: "/work/app".into(),
+            workspace_clone: None,
+            guest_workspace: None,
+            label: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            status: "ready".into(),
+        }
+    }
+
+    /// Records nothing here can drive: docker's, an unknown backend's, and (on a
+    /// libkrun build) a libkrun record whose "container-abc" ref isn't a handle.
+    fn undrivable_records() -> Vec<crate::sandboxes::Sandbox> {
+        let backends = [crate::sandboxes::BACKEND_DOCKER, "e2b"].into_iter();
+        #[cfg(feature = "libkrun")]
+        let backends = backends.chain([crate::sandboxes::BACKEND_LIBKRUN]);
+        backends.map(sandbox_record).collect()
+    }
+
+    #[test]
+    fn sandbox_target_refuses_exec_on_records_it_cannot_drive() {
+        for record in undrivable_records() {
+            let target = sandbox_target(&record).expect("resolves, so it can be destroyed");
+            let err = target
+                .exec(&["true".into()], &mut |_, _| Ok(()))
+                .unwrap_err();
+            assert!(err.to_string().contains("can't be exec'd"), "{err}");
+            assert!(err.downcast_ref::<PillboxError>().is_some());
+        }
+    }
+
+    #[test]
+    fn destroying_a_record_it_cannot_drive_drops_it_and_succeeds() {
+        crate::test_util::with_isolated_home("sandbox-record-only-destroy", || {
+            let g = crate::pillbox::global();
+            for record in undrivable_records() {
+                crate::sandboxes::write(&g, &record).unwrap();
+                let destroyed = sandbox_target(&record).unwrap().destroy(&g).unwrap();
+                assert_eq!(destroyed, Destroyed::RecordDropped);
+                assert!(
+                    crate::sandboxes::resolve(&g, &record.id).is_err(),
+                    "{} record survived destroy",
+                    record.backend
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn spawn_sandbox_defaults_to_unsupported() {
+        let req = SandboxSpawn {
+            agent: None,
+            workspace: PathBuf::from("/work/app"),
+            label: None,
+        };
+        let err = managed::ManagedBackend
+            .spawn_sandbox(&crate::pillbox::global(), &req)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox spawn"), "got: {err}");
     }
 
     #[test]

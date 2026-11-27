@@ -62,7 +62,10 @@ same pattern to the one surface still doing string-match dispatch: the **PTY + l
 ```rust
 // src/sandbox/mod.rs — backend = launch + capability profile; the session is the PLANE.
 trait SandboxBackend {
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
+    // Returns what started (Foreground / Detached / ServerReady /
+    // StructuredFinished / ManagedFinished) and never prints it; the CLI
+    // renders it (commands::run::render_started), dispatch/eval read it typed.
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
     fn capabilities(&self) -> Caps;
 }
 // The single backend-dispatch point: build the plane handle for an EXISTING
@@ -123,7 +126,7 @@ is gated once, and callers branch on `caps()`, not on the feature.
 | `send` (PTY drive) | ✅ | ⬜→**fill (Phase 4)** | ✅ |
 | live PTY tail (watch/subscribe/wait-idle) | ✅ | ⬜→**fill (Phase 4)** | ✅ |
 | server-mode (opencode/codex-serve) | ✅ (opencode) | ✅ | ✅ |
-| `sandbox spawn/exec/agent` | ✅ | ❌ | ✅ (CF sandboxes *are* this) |
+| `sandbox spawn/exec/agent/destroy` | ❌ (deprecated; an old record can only be destroyed) | ✅ (`exec-host` over vsock, [sandboxes](features/sandboxes.md)) | ✅ (CF sandboxes *are* this) |
 | `--vault` cred swap | ✅ proxy-only | ✅ in-child | ✅ (proxy/worker) |
 | **real egress fence** | ❌ (declare Unsupported) | ✅ | ❌ likely |
 | `--detach` + `--vault` | ❌ | ✅ | TBD |
@@ -145,7 +148,7 @@ libkrun PTY parity, CF) builds on it.
 - [ ] **Phase 2 — delete dispatch.** Replace the 8 match sites with `live_session(&session)?` + `caps()` checks, then remove the `Backend::parse` arms:
       `src/commands/session/mod.rs:88,239,576,701,769,993`;
       `src/commands/session/stream.rs:36,56`.
-      Move `sandbox spawn/exec/agent` (`src/commands/sandbox.rs:118`, hardcoded `BACKEND_DOCKER`) behind `caps().long_lived_exec`.
+      ~~Move `sandbox spawn/exec/agent` behind `caps().long_lived_exec`.~~ Done differently: `commands/sandbox.rs` spawns through `select_backend().spawn_sandbox` and drives a record through `sandbox_target`; libkrun is the only backend declaring `long_lived_exec`.
       Carry-overs the port must preserve: (1) the `detached_tailer_alive` guard now lives *inside* `LibkrunLiveSession::{event_source,ingest}`, so delete the command-layer copies (`stream.rs:39`, `session_ingest`) rather than double-guarding; (2) `session_subscribe`'s `$PILLBOX_EVENTS_WEBHOOK` exporter — attached today when the tailer `is_some()` (`stream.rs:97`) — must still be wired off `event_source()`'s returned `Option<TailerHandle>`; (3) server-send routing (the http-prompt path that runs *before* the backend match) is orthogonal to `LiveSession::send` (the PTY-drive verb) — a server session must keep going through `http()`, not `.send()`.
       *(End of spine: one plane, dispatch deleted, behavior unchanged.)*
 - [ ] **Phase 3 — flip default.** `select_backend()` defaults to libkrun (where available); docker recast in docs/`doctor` as the container-family compat backend, not the default. Rework `doctor` (it probes the Docker daemon + image, `src/doctor.rs:134`) so a libkrun-default host isn't told "Docker not running."

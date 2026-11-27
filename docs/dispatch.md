@@ -32,9 +32,11 @@ long-horizon variance (σ̂) into expected gain rather than a measurement enemy 
 which is why per-fork diversity (`--temperature`) matters: `k` identical
 deterministic workers all score the same and select-best buys nothing.
 
-Each worker is a `pillbox run --from-bookmark <name> --detach`, driven via the
-existing `session send` / `wait-idle` / `score` / `pull` verbs — `dispatch` is
-the loop that composes them, not a new sandbox path.
+Each worker is the run `pillbox run --from-bookmark <name> --detach` starts,
+driven through the same typed session calls the `session send` / `wait-idle` /
+`score` / `pull` verbs render — `dispatch` is the loop that composes them
+in-process, not a new sandbox path. It never re-executes the `pillbox` binary or
+parses CLI `--json`, so a change to those output shapes can't break it.
 
 ```sh
 pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
@@ -473,8 +475,9 @@ pillbox dispatch --from-bookmark seg-3 -k 4 --rubric grade.txt --agent opencode 
   --critic typesafe --critic-policy order -- "Implement the parser for segment 3."
 ```
 
-What the critic sees is the worker's **edits from its own §0 log** (`session log
-<id> --type tool_call`, completed `edit`/`write` calls) rendered with the task
+What the critic sees is the worker's **edits from its own §0 log** (its typed
+`tool_call` events — what `session log <id> --type tool_call` prints — completed
+`edit`/`write` calls) rendered with the task
 prompt — the same representation the offline calibration harness scores, so an
 offline Brier/ECE number is the right *starting estimate* for the live loop. It is
 not a guarantee: live dispatches are a different distribution, which is why
@@ -577,14 +580,20 @@ treats them as deferred, not forgotten:
 
 ## Relationship to other verbs
 
-`dispatch` composes existing primitives, it doesn't replace them:
+`dispatch` composes existing primitives, it doesn't replace them. It calls the
+in-process cores behind these verbs (in `src/commands/dispatch.rs`, the
+`SessionDriver`), not the CLI:
 
-- `run --from-bookmark --detach --json` — how each worker is forked.
-- `session wait-idle` — how the loop knows a worker's turn is done.
-- `session score --cmd|--rubric --json` — the **reward** channel each worker is
-  graded on (the Goodhart-safe, non-self-reported verdict; `session done
-  --status` is the agent's self-report and is *not* the gate).
-- `session pull` — how the winner's result workspace is rehydrated.
+- `run --from-bookmark --detach` (`run::start`) — how each worker is forked.
+- `session wait-idle` (`stream::wait_idle`) — how the loop knows a worker's turn
+  is done.
+- `session send` (`session::send`) — how a server-mode worker's turns and
+  retries are driven.
+- `session score --cmd|--rubric --in-sandbox` (`session::score`) — the **reward**
+  channel each worker is graded on (the Goodhart-safe, non-self-reported verdict;
+  `session done --status` is the agent's self-report and is *not* the gate).
+- `session pull` (`session::rehydrate_result`) — how the winner's result
+  workspace is rehydrated when no graded snapshot is held.
 
 The verdict reads worker **scores up**, not transcripts: the orchestrator
 consumes `dispatch --json` and pulls only the winner; per-worker trajectories

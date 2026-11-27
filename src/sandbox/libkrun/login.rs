@@ -1,0 +1,721 @@
+//! `pillbox auth login` on the libkrun microVM — a foreground VM whose guest runs
+//! the agent's login under the in-guest `pty-host`, with the agent's real auth home
+//! as its read-write creds share (no env-fork: the login writes the credential).
+//!
+//! Its egress is the one built by [`EgressSpec::for_login`], which opens the
+//! providers' OAuth token endpoints through the MITM; every run, session and
+//! sandbox launch builds [`EgressSpec::fence`], which keeps them rejected. A second vsock entry in
+//! [`VmSpec`](super::VmSpec)`.vsock` can relay an agent's loopback OAuth callback
+//! port. Shared launch helpers live in [`super::session`] (`pub(super)`).
+
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+
+use crate::agents::{AgentSpec, GUEST_HOME, GUEST_WORKSPACE};
+use crate::attach::pump;
+use crate::pillbox::Pillbox;
+
+use super::session::{
+    disk_preflight, guest_launch_preamble, provision_vault_ca, run_foreground_attached,
+    rust_tls_ca_env, CaLifetime, KillUnlessExited, OwnedPath, PendingVm, RemoveOnDrop, ATTACH_PORT,
+    FORWARD_PORT,
+};
+use super::{
+    boot, krun_cache_dir, materialize_rootfs, shell_quote, EgressSpec, Share, VmSpec, VsockAttach,
+};
+
+/// Where the guest mounts the login VM's boot-script share. A dedicated share, so
+/// nothing pillbox-internal is ever written into the user's real auth home.
+const GUEST_BOOT_DIR: &str = "/run/pillbox-boot";
+/// The guest workspace the shared preamble mounts and `cd`s into (an empty scratch dir).
+const GUEST_LOGIN_WORKSPACE: &str = "login";
+
+/// Boot a foreground microVM that runs `spec.login_argv`, pump the terminal until
+/// it exits, tear the VM down, and return the guest's exit code. The caller checks
+/// the credential sentinel and finalizes. `home` is `spec`'s real auth home.
+pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
+    disk_preflight()?;
+    // Shadowed so nothing below can reach the current (possibly untrusted) project.
+    let resolved = login_pillbox(spec, resolved);
+    let rootfs = materialize_rootfs(&resolved)?;
+    let ca = provision_vault_ca(&resolved, CaLifetime::Ephemeral)?;
+
+    // Private, empty, and removed with the VM: the boot-script share and the
+    // workspace the shared preamble mounts. The real auth home is never removed.
+    let scratch = |prefix: &str, what: &str| -> Result<OwnedPath> {
+        let dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .with_context(|| format!("create {what}"))?;
+        Ok(OwnedPath::new(dir.keep()))
+    };
+    let boot_dir = scratch("pillbox-login-boot-", "login boot dir")?;
+    let workspace = scratch("pillbox-login-ws-", "login scratch workspace")?;
+
+    let cache = krun_cache_dir()?;
+    std::fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
+    let id = uuid::Uuid::now_v7().simple().to_string();
+    let attach_sock = cache.join(format!("attach-{id}.sock"));
+    let forward_sock = cache.join(format!("login-fwd-{id}.sock"));
+    let _ = std::fs::remove_file(&forward_sock);
+    // libkrun binds the callback socket for the guest's listener; it goes on every path.
+    let _forward_sock = RemoveOnDrop(forward_sock.clone());
+
+    let oauth_port = spec.resolved_oauth_port();
+    let egress_log = super::egress_log_path();
+    let (vmspec, _script) = login_vm_spec(
+        spec,
+        oauth_port,
+        &ca.cert_pem,
+        &LoginPaths {
+            rootfs: &rootfs,
+            home,
+            boot_dir: &boot_dir,
+            workspace: &workspace,
+            attach_sock: &attach_sock,
+            forward_sock: &forward_sock,
+            ca_dir: &ca.dir,
+            egress_log: egress_log.clone(),
+        },
+    )?;
+    let mut vm = PendingVm::new(rootfs, workspace, boot_dir, &vmspec, attach_sock)?;
+
+    // The host side of the OAuth callback: bound before boot so a busy port fails
+    // the login before a VM exists. Stopped when dropped, on every path.
+    let _relay = match oauth_port {
+        Some(port) => Some(CallbackRelay::start(port, forward_sock.clone())?),
+        None => None,
+    };
+
+    eprintln!(
+        "pillbox: libkrun backend — launching `{}` login in a microVM",
+        spec.id
+    );
+    // The login VM must stay Foreground: a reparented VM's CommitGuard scrubs every
+    // share on an abandoned launch, and this VM's creds share is the user's real auth home.
+    // No swap pairs: the login holds no credential to swap, it mints one.
+    // A login that ends any way but the guest's exit kills its VM: nothing outlives it.
+    let outcome =
+        run_foreground_attached(&mut vm, &[], egress_log.as_deref(), &mut KillUnlessExited)?;
+    match outcome {
+        pump::Outcome::Exited(code) => Ok(code),
+        pump::Outcome::Detached | pump::Outcome::Disconnected => {
+            bail!("the login VM disconnected before `{}` exited", spec.id)
+        }
+    }
+}
+
+/// The pillbox a login VM's rootfs (runner image) and vault CA come from: the
+/// agent's auth pillbox, never the current project. The login VM holds the real
+/// credentials read-write, so a repo's `pillbox.toml` must not pick what runs there.
+fn login_pillbox(spec: &AgentSpec, resolved: &Pillbox) -> Pillbox {
+    spec.auth_pillbox(resolved)
+}
+
+/// Host paths a login VmSpec points at.
+struct LoginPaths<'a> {
+    rootfs: &'a Path,
+    home: &'a Path,
+    boot_dir: &'a Path,
+    workspace: &'a Path,
+    attach_sock: &'a Path,
+    forward_sock: &'a Path,
+    ca_dir: &'a Path,
+    egress_log: Option<String>,
+}
+
+/// Build the login VM: write its boot script into `paths.boot_dir` and return the
+/// VmSpec with the script. Pure apart from that write, so it is unit-tested.
+fn login_vm_spec(
+    spec: &AgentSpec,
+    oauth_port: Option<u16>,
+    ca_cert_pem: &str,
+    paths: &LoginPaths<'_>,
+) -> Result<(VmSpec, String)> {
+    let guest_workspace = format!("{GUEST_WORKSPACE}/{GUEST_LOGIN_WORKSPACE}");
+    let mut guest_env = boot::static_child_env();
+    guest_env.push(("NODE_EXTRA_CA_CERTS".into(), super::GUEST_CA_PATH.into()));
+    guest_env.extend(rust_tls_ca_env(spec));
+    let exports = boot::env_exports(&guest_env)?;
+    let preamble = guest_launch_preamble(ca_cert_pem, &guest_workspace);
+    let home_q = shell_quote(GUEST_HOME);
+    let forward = match oauth_port {
+        Some(port) => {
+            format!("{} & ", boot::vsock_forward_cmd(FORWARD_PORT, port))
+        }
+        None => String::new(),
+    };
+    let argv = spec
+        .login_argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "{exports}{preamble}; \
+         mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+         {forward}exec {pty_host} {argv}",
+        pty_host = boot::pty_host_cmd(ATTACH_PORT, false),
+    );
+    // The real auth home keeps its host ownership: only disposable clones are normalized.
+    let (boot_share, exec) = boot::boot_channel(
+        paths.boot_dir,
+        "boot",
+        GUEST_BOOT_DIR,
+        boot::MountedShareOwnership::PreserveHost,
+        &script,
+    )?;
+
+    let mut vsock = vec![VsockAttach {
+        port: ATTACH_PORT,
+        host_sock: paths.attach_sock.to_string_lossy().into_owned(),
+        listen: false,
+    }];
+    if oauth_port.is_some() {
+        vsock.push(VsockAttach {
+            port: FORWARD_PORT,
+            host_sock: paths.forward_sock.to_string_lossy().into_owned(),
+            listen: true,
+        });
+    }
+
+    let vmspec = VmSpec {
+        offline: false,
+        ownership: None,
+        rootfs: paths.rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            boot_share,
+            // The real auth home, read-write: the login writes the credential here.
+            Share {
+                tag: "creds".into(),
+                host_path: paths.home.to_string_lossy().into_owned(),
+            },
+            Share {
+                tag: "workspace".into(),
+                host_path: paths.workspace.to_string_lossy().into_owned(),
+            },
+        ],
+        exec,
+        vsock,
+        egress: Some(EgressSpec::for_login(
+            login_allowlist(spec),
+            paths.egress_log.clone(),
+            Some(paths.ca_dir.to_string_lossy().into_owned()),
+        )),
+    };
+    Ok((vmspec, script))
+}
+
+/// The login VM's fence: every vault provider's hosts (API + OAuth/token
+/// endpoints) plus the hosts this agent's login flow declares.
+fn login_allowlist(spec: &AgentSpec) -> Vec<String> {
+    let mut hosts: Vec<String> = crate::vault::providers::intercepted_hosts()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for host in spec.login_hosts {
+        if !hosts.iter().any(|h| h == host) {
+            hosts.push((*host).to_string());
+        }
+    }
+    hosts
+}
+
+/// Host loopback listener(s) on the agent's OAuth callback port, relaying each
+/// connection to the libkrun-bound socket of the guest's `vsock-forward`.
+struct CallbackRelay {
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl CallbackRelay {
+    fn start(port: u16, forward_sock: PathBuf) -> Result<Self> {
+        let v4 = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+            crate::errors::PillboxError::runtime(
+                "login",
+                format!("cannot listen on 127.0.0.1:{port} for the OAuth callback: {e}"),
+            )
+            .with_next("free that port (or set PILLBOX_<AGENT>_OAUTH_PORT), then retry")
+        })?;
+        let mut listeners = vec![v4];
+        // Browsers may try `localhost` as ::1 first; best effort, IPv4 is the contract.
+        if let Ok(v6) = TcpListener::bind(("::1", port)) {
+            listeners.push(v6);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for listener in listeners {
+            listener
+                .set_nonblocking(true)
+                .context("set OAuth relay listener nonblocking")?;
+            let stop = stop.clone();
+            let sock = forward_sock.clone();
+            threads.push(std::thread::spawn(move || {
+                accept_loop(&listener, &sock, &stop)
+            }));
+        }
+        Ok(Self { stop, threads })
+    }
+}
+
+impl Drop for CallbackRelay {
+    /// Stop accepting and release the port; in-flight relays finish on their own.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for t in std::mem::take(&mut self.threads) {
+            let _ = t.join();
+        }
+    }
+}
+
+fn accept_loop(listener: &TcpListener, forward_sock: &Path, stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((tcp, _)) => {
+                let sock = forward_sock.to_path_buf();
+                std::thread::spawn(move || relay_conn(tcp, &sock));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Copy one callback connection both ways until either side closes.
+fn relay_conn(tcp: TcpStream, forward_sock: &Path) {
+    // An accepted socket inherits the listener's O_NONBLOCK on macOS.
+    let _ = tcp.set_nonblocking(false);
+    let guest = match UnixStream::connect(forward_sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "pillbox: OAuth callback relay: connect {}: {e}",
+                forward_sock.display()
+            );
+            return;
+        }
+    };
+    let (Ok(mut tcp_rd), Ok(mut guest_wr)) = (tcp.try_clone(), guest.try_clone()) else {
+        return;
+    };
+    let up = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut tcp_rd, &mut guest_wr);
+        let _ = guest_wr.shutdown(Shutdown::Write);
+    });
+    let (mut guest_rd, mut tcp_wr) = (guest, tcp);
+    let _ = std::io::copy(&mut guest_rd, &mut tcp_wr);
+    let _ = tcp_wr.shutdown(Shutdown::Write);
+    let _ = up.join();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::{ALL, CLAUDE, CODEX};
+
+    fn build(spec: &AgentSpec, oauth_port: Option<u16>) -> (VmSpec, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let boot_dir = dir.path().join("boot");
+        std::fs::create_dir(&boot_dir).unwrap();
+        let home = dir.path().join("auth/claude");
+        std::fs::create_dir_all(&home).unwrap();
+        let (vmspec, script) = login_vm_spec(
+            spec,
+            oauth_port,
+            "PEM",
+            &LoginPaths {
+                rootfs: &dir.path().join("rootfs"),
+                home: &home,
+                boot_dir: &boot_dir,
+                workspace: &dir.path().join("ws"),
+                attach_sock: &dir.path().join("attach.sock"),
+                forward_sock: &dir.path().join("fwd.sock"),
+                ca_dir: &dir.path().join("ca"),
+                egress_log: None,
+            },
+        )
+        .unwrap();
+        (vmspec, script, dir)
+    }
+
+    #[test]
+    fn claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback() {
+        let (vm, script, dir) = build(&CLAUDE, Some(54545));
+        let egress = vm.egress.as_ref().unwrap();
+        assert!(egress.opens_token_endpoints());
+        assert!(egress.refresh.is_none());
+        assert!(egress.allowlist.iter().any(|h| h == "platform.claude.com"));
+        let creds = vm.shares.iter().find(|s| s.tag == "creds").unwrap();
+        assert_eq!(
+            creds.host_path,
+            dir.path().join("auth/claude").to_string_lossy()
+        );
+        let fwd = vm.vsock.iter().find(|v| v.port == FORWARD_PORT).unwrap();
+        assert!(fwd.listen);
+        assert!(vm.vsock.iter().any(|v| v.port == ATTACH_PORT && !v.listen));
+        assert!(script.contains(&format!(
+            "pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port 54545 &"
+        )));
+        assert!(script.contains(&format!("mount -t virtiofs creds '{GUEST_HOME}'")));
+        assert!(script.ends_with(&format!(
+            "exec pillbox pty-host --vsock-port {ATTACH_PORT} -- 'claude' 'auth' 'login' '--claudeai'"
+        )));
+        // The boot script lands in the boot share, never in the real auth home.
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("auth/claude"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn dropping_the_callback_relay_releases_the_oauth_port() {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let relay = super::CallbackRelay::start(port, PathBuf::from("/nonexistent.sock")).unwrap();
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "relay holds the port"
+        );
+        drop(relay);
+        TcpListener::bind(("127.0.0.1", port)).expect("an early return frees the port");
+    }
+
+    #[test]
+    fn the_callback_relay_carries_bytes_both_ways_and_closes_cleanly() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fwd.sock");
+        let guest = UnixListener::bind(&sock).unwrap();
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let relay = super::CallbackRelay::start(port, sock).unwrap();
+
+        // Stands in for the guest's vsock-forward: read the request, answer, hang up.
+        let guest_side = std::thread::spawn(move || {
+            let (mut conn, _) = guest.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = [0u8; 17];
+            conn.read_exact(&mut req).unwrap();
+            conn.write_all(b"HTTP/1.1 200 OK\r\n\r\nbye").unwrap();
+            req
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET /cb?code=abc ").unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap(); // EOF proves the relay closed cleanly
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nbye");
+        assert_eq!(&guest_side.join().unwrap(), b"GET /cb?code=abc ");
+        drop(relay);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_callback_relay_and_guest_forward_carry_a_callback_end_to_end() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let ephemeral = || {
+            TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        // The agent's callback server inside the guest.
+        let agent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let agent_port = agent.local_addr().unwrap().port();
+        let agent_side = std::thread::spawn(move || {
+            let (mut conn, _) = agent.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = [0u8; 17];
+            conn.read_exact(&mut req).unwrap();
+            conn.write_all(b"HTTP/1.1 200 OK\r\n\r\nbye").unwrap();
+            req // hang up: the close must travel back through both relays
+        });
+        // The forward socket: each accepted connection goes to the real guest forwarder.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fwd.sock");
+        let fwd = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (conn, _) = fwd.accept().unwrap();
+            crate::attach::host::forward_conn(conn, agent_port);
+        });
+        let port = ephemeral();
+        let relay = super::CallbackRelay::start(port, sock).unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET /cb?code=abc ").unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap();
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nbye");
+        assert_eq!(&agent_side.join().unwrap(), b"GET /cb?code=abc ");
+        drop(relay);
+    }
+
+    #[test]
+    fn login_without_an_oauth_port_has_no_callback_forward() {
+        assert_eq!(CODEX.oauth_port, None);
+        let (vm, script, _dir) = build(&CODEX, None);
+        assert!(vm.egress.as_ref().unwrap().opens_token_endpoints());
+        assert_eq!(vm.vsock.len(), 1);
+        assert_eq!(vm.vsock[0].port, ATTACH_PORT);
+        assert!(!script.contains("vsock-forward"));
+        // codex's Rust TLS trusts the login MITM only through SSL_CERT_FILE.
+        assert!(script.contains(&format!("SSL_CERT_FILE='{}'", super::super::GUEST_CA_PATH)));
+        let (_, claude_script, _dir) = build(&CLAUDE, None);
+        assert!(!claude_script.contains("SSL_CERT_FILE"));
+        assert!(vm
+            .egress
+            .as_ref()
+            .unwrap()
+            .allowlist
+            .iter()
+            .any(|h| h == "auth.openai.com"));
+    }
+
+    #[test]
+    fn a_project_runner_image_does_not_reach_the_login_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("repo");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("pillbox.toml"),
+            "name = \"evil\"\n[runner]\nimage = \"attacker/runner:latest\"\n",
+        )
+        .unwrap();
+        let project = Pillbox {
+            scope: crate::pillbox::Scope::Project {
+                key: "evil".into(),
+                source_dir: source,
+            },
+            state_dir: dir.path().join("state"),
+            meta: None,
+        };
+        // The fixture is live: the project itself resolves to the attacker's image.
+        if std::env::var(crate::docker::RUNNER_IMAGE_ENV).is_err() {
+            assert_eq!(
+                crate::docker::resolve_runner_image(&project).0,
+                "attacker/runner:latest"
+            );
+        }
+        for spec in ALL {
+            let login = login_pillbox(spec, &project);
+            assert!(matches!(login.scope, crate::pillbox::Scope::Global));
+            assert_ne!(
+                crate::docker::resolve_runner_image(&login).0,
+                "attacker/runner:latest",
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_claude_oauth_agent_reaches_claude_ai_at_login() {
+        for spec in ALL {
+            let claude_oauth = matches!(spec.auth_id, "claude" | "pi" | "prime-agent");
+            assert_eq!(
+                login_allowlist(spec).iter().any(|h| h == "claude.ai"),
+                claude_oauth || crate::vault::providers::intercepted_hosts().contains(&"claude.ai"),
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    /// Every agent's login flow, by the providers it can pick: the hosts each
+    /// flow's CLI contacts (vault hosts included). Adding an agent fails here until
+    /// its login flow is listed.
+    const LOGIN_FLOWS: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &["claude.ai", "platform.claude.com", "api.anthropic.com"],
+        ),
+        (
+            "claude-stream",
+            &["claude.ai", "platform.claude.com", "api.anthropic.com"],
+        ),
+        ("codex", &["auth.openai.com"]),
+        ("codex-serve", &["auth.openai.com"]),
+        (
+            "opencode",
+            &[
+                "models.dev",
+                "github.com",
+                "api.github.com",
+                "console.anthropic.com",
+                "api.anthropic.com",
+                "auth.openai.com",
+            ],
+        ),
+        (
+            "pi",
+            &[
+                "claude.ai",
+                "console.anthropic.com",
+                "github.com",
+                "api.github.com",
+                "auth.openai.com",
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+            ],
+        ),
+        (
+            "prime-agent",
+            &[
+                "claude.ai",
+                "console.anthropic.com",
+                "github.com",
+                "api.github.com",
+                "auth.openai.com",
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+            ],
+        ),
+        (
+            "cursor",
+            &[
+                "cursor.com",
+                "www.cursor.com",
+                "api2.cursor.sh",
+                "authenticator.cursor.sh",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn cursor_login_flow_covers_every_host_the_egress_table_labels_login() {
+        // The egress table's trailing comments say what each host is for; a cursor host it
+        // labels login/auth must be in cursor's login flow.
+        let src = include_str!("egress.rs");
+        let (_, flow) = LOGIN_FLOWS.iter().find(|(id, _)| *id == "cursor").unwrap();
+        let mut seen = 0;
+        for line in src.lines() {
+            let Some((code, note)) = line.split_once("//") else {
+                continue;
+            };
+            let host = code.trim().trim_end_matches(',').trim_matches('"');
+            if host.ends_with(".cursor.sh") || host.ends_with("cursor.com") {
+                let note = note.to_ascii_lowercase();
+                if note.contains("login") || note.contains("auth") {
+                    seen += 1;
+                    assert!(
+                        flow.contains(&host),
+                        "egress table says {host} is login: {note}"
+                    );
+                }
+            }
+        }
+        assert!(seen >= 2, "egress table labels cursor login hosts: {seen}");
+    }
+
+    #[test]
+    fn every_agent_login_fence_covers_its_login_flow_hosts() {
+        let ids: Vec<&str> = ALL.iter().map(|s| s.id).collect();
+        let listed: Vec<&str> = LOGIN_FLOWS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids, listed,
+            "every agent's login flow is listed, in ALL's order"
+        );
+        let vault = crate::vault::providers::intercepted_hosts();
+        for spec in ALL {
+            let (_, flow) = LOGIN_FLOWS.iter().find(|(id, _)| *id == spec.id).unwrap();
+            let (vm, _, _dir) = build(spec, spec.oauth_port);
+            let allow = &vm.egress.as_ref().unwrap().allowlist;
+            for host in *flow {
+                assert!(
+                    allow.iter().any(|h| h == host),
+                    "{}: login fence lacks {host}",
+                    spec.id
+                );
+            }
+            for host in spec.login_hosts {
+                // The fence matches exact names, so a declared host is a plain lowercase name.
+                assert!(
+                    !host.is_empty()
+                        && host.chars().all(|c| c.is_ascii_lowercase()
+                            || c.is_ascii_digit()
+                            || c == '.'
+                            || c == '-'),
+                    "{}: {host:?}",
+                    spec.id
+                );
+                assert!(
+                    !vault.contains(host),
+                    "{}: {host} is already a vault host",
+                    spec.id
+                );
+                assert!(
+                    flow.contains(host),
+                    "{}: {host} is declared but no flow needs it",
+                    spec.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_device_flow_resolves_github_com_at_login() {
+        for id in ["opencode", "pi", "prime-agent"] {
+            let spec = ALL.iter().find(|s| s.id == id).unwrap();
+            let (vm, _, _dir) = build(spec, spec.oauth_port);
+            let egress = vm.egress.as_ref().unwrap();
+            assert!(egress.opens_token_endpoints());
+            // Device code + token poll on github.com, then the Copilot token on api.github.com.
+            for host in ["github.com", "api.github.com"] {
+                assert!(egress.allowlist.iter().any(|h| h == host), "{id}: {host}");
+            }
+        }
+        assert!(!login_allowlist(&CODEX).iter().any(|h| h == "github.com"));
+    }
+
+    #[test]
+    fn login_hosts_never_reach_a_non_login_launch() {
+        let run = super::super::session::standard_allowlist(&[]);
+        let standard = super::super::egress::standard_egress_hosts();
+        for spec in ALL {
+            for host in spec.login_hosts {
+                if !standard.contains(host) {
+                    assert!(
+                        !run.iter().any(|h| h == host),
+                        "{}: login-only {host} is on the run fence",
+                        spec.id
+                    );
+                }
+            }
+        }
+        assert!(!run.iter().any(|h| h == "github.com"));
+        let fence = EgressSpec::fence(run, None, None, None, None);
+        assert!(!fence.opens_token_endpoints());
+    }
+}

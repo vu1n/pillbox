@@ -1,7 +1,7 @@
-//! Sandbox registry — durable handles for long-lived containers spawned
+//! Sandbox registry — durable handles for long-lived microVMs spawned
 //! via `pillbox sandbox spawn` and addressed later by `exec` / `destroy`.
 //!
-//! A *sandbox* is a running container with a workspace mounted, kept alive
+//! A *sandbox* is a running VM with a workspace clone mounted, kept alive
 //! so a consumer (orchestrator, Slack bot, hermes) can `exec` commands into
 //! it over the PTY-free contract. This is the passive addressing layer the
 //! `exec`/`destroy` verbs need — `sandbox_id → backend handle` — NOT an
@@ -26,25 +26,36 @@ const SANDBOXES_DIR: &str = "sandboxes";
 /// Backend label written into the record. String (not enum) on disk so a
 /// future binary that adds a backend can still read older records.
 pub(crate) const BACKEND_DOCKER: &str = "docker";
+/// A libkrun microVM sandbox; its `backend_ref` is the libkrun handle JSON.
+pub(crate) const BACKEND_LIBKRUN: &str = crate::session::BACKEND_LIBKRUN;
 
 /// On-disk shape. Forward-compatible: serde ignores unknown fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Sandbox {
     /// Short hex id (12 chars) — registry filename + the `exec`/`destroy` arg.
     pub(crate) id: String,
-    /// Backend kind — [`BACKEND_DOCKER`] today; `e2b` / `ssh` later.
+    /// Backend kind — [`BACKEND_LIBKRUN`], or [`BACKEND_DOCKER`] for a record the
+    /// deprecated Docker backend left.
     pub(crate) backend: String,
-    /// Opaque handle the backend uses to find the container again. For
-    /// docker: the container id. For e2b (future): the sandbox id.
+    /// Opaque handle the backend uses to find the sandbox again. For libkrun:
+    /// the handle JSON (sockets, spec, clones). For docker: the container id.
     pub(crate) backend_ref: String,
-    /// Runner image the container was started from.
+    /// Runner image the sandbox's rootfs was materialized from.
     pub(crate) image: String,
     /// Agent harness this sandbox is provisioned for (auth mounted, non-root),
     /// or `None` for a bare exec-only sandbox.
     #[serde(default)]
     pub(crate) agent: Option<String>,
-    /// Host path mounted as the workspace.
+    /// Host workspace the sandbox was spawned from (libkrun clones it; the
+    /// deprecated docker backend mounted it directly).
     pub(crate) workspace: String,
+    /// Host path of the sandbox's CoW, secret-scrubbed workspace clone (libkrun),
+    /// where its writes land; `None` for a docker record (it mounted `workspace`).
+    #[serde(default)]
+    pub(crate) workspace_clone: Option<String>,
+    /// Where the guest mounts that clone (libkrun): the cwd of every exec.
+    #[serde(default)]
+    pub(crate) guest_workspace: Option<String>,
     /// Optional human label, surfaced in `sandbox list`.
     #[serde(default)]
     pub(crate) label: Option<String>,
@@ -57,8 +68,17 @@ pub(crate) struct Sandbox {
 
 impl Sandbox {
     /// Mint a 12-hex-char id — see [`crate::registry::new_id`].
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn new_id() -> String {
         reg::new_id()
+    }
+
+    /// Where [`write`] persists sandbox `id`: `<pillbox>/sandboxes/<id>.toml`. A
+    /// reparented libkrun VMM's commit guard watches it — the VM self-destructs if
+    /// this file doesn't appear before its launcher dies.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) fn record_path(pb: &Pillbox, id: &str) -> std::path::PathBuf {
+        SandboxRegistry::path_read(pb, id)
     }
 }
 
@@ -85,6 +105,7 @@ impl IdRegistry for SandboxRegistry {
     }
 }
 
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn write(pb: &Pillbox, sandbox: &Sandbox) -> Result<()> {
     let body = toml::to_string(sandbox)
         .map_err(|e| PillboxError::config("sandbox write", e.to_string()))?;
@@ -121,10 +142,23 @@ mod tests {
             image: "pillbox:latest".into(),
             agent: None,
             workspace: "/work/app".into(),
+            workspace_clone: None,
+            guest_workspace: None,
             label: None,
             created_at: crate::session::now_rfc3339(),
             status: "ready".into(),
         }
+    }
+
+    #[test]
+    fn record_path_is_where_write_persists() {
+        with_isolated_home("sandbox-record-path", || {
+            let g = pillbox::global();
+            let s = make();
+            assert!(!Sandbox::record_path(&g, &s.id).exists());
+            write(&g, &s).unwrap();
+            assert!(Sandbox::record_path(&g, &s.id).exists());
+        });
     }
 
     #[test]

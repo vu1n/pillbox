@@ -45,7 +45,7 @@ mod synth;
 mod tailer;
 
 pub(crate) use local::{spawn_attach_tailer, spawn_session_observability, TailerHandle};
-pub(crate) use tailer::Tailer;
+pub(crate) use tailer::{Tailer, TranscriptSource};
 
 /// Which agent harness wrote the transcript. Drives which per-line
 /// parser [`drain_file`] uses; auto-detected from the file path,

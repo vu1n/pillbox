@@ -83,7 +83,9 @@ pub(super) fn replenish_listeners(listeners: &mut Vec<Listener>, sockets: &mut S
 }
 
 /// Drive every pooled listener: start a rustls session on a fresh connection,
-/// pump it, and reset the socket back to listening when it closes.
+/// pump it, and reset the socket back to listening when it closes. `login` is the
+/// `auth login` VM's egress flag: its connections' [`RequestGate`] lets OAuth token
+/// endpoint requests through instead of rejecting them.
 pub(super) fn drive_listeners(
     listeners: &mut [Listener],
     sockets: &mut SocketSet,
@@ -91,6 +93,7 @@ pub(super) fn drive_listeners(
     pins: &PinTable,
     swap_pairs: &[CredSwap],
     diag: &Diag,
+    login: bool,
 ) {
     for l in listeners.iter_mut() {
         let sock = sockets.get_mut::<tcp::Socket>(l.handle);
@@ -107,7 +110,7 @@ pub(super) fn drive_listeners(
                             // pairs bound to this host (destination-bound release).
                             // No plaintext is relayed before the gate, so this is safe.
                             swap: StubSwap::new(Vec::new()),
-                            request_gate: RequestGate::new(),
+                            request_gate: RequestGate::with_token_endpoints(login),
                             outbound: Vec::new(),
                             inbound: Vec::new(),
                             req_logged: false,
@@ -157,6 +160,9 @@ const MAX_PLAINTEXT_CHUNK_BYTES: usize = 4 * 1024;
 struct RequestGate {
     state: RequestState,
     upstream_allowed: bool,
+    /// True only on the `auth login` VM, which must reach the token endpoint to
+    /// mint the credential. Every other launch rejects token-endpoint requests.
+    token_endpoints_open: bool,
     /// The upstream's status line, accumulated while a WebSocket upgrade waits.
     status_line: Vec<u8>,
 }
@@ -180,10 +186,18 @@ enum RequestState {
 }
 
 impl RequestGate {
+    /// The gate every non-login connection gets: token endpoints are rejected.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_token_endpoints(false)
+    }
+
+    /// `open` is the VM's `EgressSpec.login`; false keeps token endpoints rejected.
+    fn with_token_endpoints(open: bool) -> Self {
         Self {
             state: RequestState::RequestLine(Vec::new()),
             upstream_allowed: false,
+            token_endpoints_open: open,
             status_line: Vec::new(),
         }
     }
@@ -226,7 +240,10 @@ impl RequestGate {
                         return self.reject();
                     };
                     let path = path.split('?').next().unwrap_or(path);
-                    if crate::vault::providers::is_oauth_token_endpoint(host, path) {
+                    // A token-endpoint request is rejected unless this is the login VM.
+                    if !self.token_endpoints_open
+                        && crate::vault::providers::is_oauth_token_endpoint(host, path)
+                    {
                         return self.reject();
                     }
                     released.extend_from_slice(buffer);
@@ -921,6 +938,34 @@ mod tests {
             assert!(matches!(gate.push(host, chunks[0]), Ok(None)));
             assert!(gate.push(host, chunks[1]).is_err());
             assert!(!gate.is_allowed());
+        }
+    }
+
+    #[test]
+    fn request_gate_opens_token_endpoints_only_for_login() {
+        let request = b"POST /v1/oauth/token HTTP/1.1\r\ncontent-length: 2\r\n\r\n{}";
+        for (host, req) in [
+            ("platform.claude.com", request.as_slice()),
+            (
+                "auth.openai.com",
+                b"POST /oauth/token HTTP/1.1\r\ncontent-length: 2\r\n\r\n{}".as_slice(),
+            ),
+        ] {
+            // login=false (every run/session/sandbox launch): rejected locally.
+            let mut gate = RequestGate::with_token_endpoints(false);
+            assert!(
+                gate.push(host, req).is_err(),
+                "{host}: rejected when login=false"
+            );
+            assert!(!gate.is_allowed());
+            // login=true (the auth login VM): released upstream unchanged.
+            let mut gate = RequestGate::with_token_endpoints(true);
+            assert_eq!(
+                gate.push(host, req).unwrap().unwrap(),
+                req,
+                "{host}: passed when login=true"
+            );
+            assert!(gate.is_allowed());
         }
     }
 

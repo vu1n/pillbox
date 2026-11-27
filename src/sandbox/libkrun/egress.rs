@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::udp;
@@ -30,6 +31,80 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 use super::vault::{CredSwap, Vault};
+use super::RefreshSpec;
+
+/// A VM's egress policy, handed to the VMM child in the spec file (non-secret).
+/// Built only through [`EgressSpec::fence`] (every run, session, sandbox, grader
+/// and bounded-execution launch) or [`EgressSpec::for_login`] (`auth login`).
+#[derive(Serialize, Deserialize)]
+pub(super) struct EgressSpec {
+    /// DNS-fence allowlist: only these hosts resolve; everything else NXDOMAINs.
+    pub(super) allowlist: Vec<String>,
+    /// Host-side diagnostics file (the guest console eats the child's stderr):
+    /// `PILLBOX_KRUN_EGRESS_LOG`, else one per run under `~/.pillbox/krun/egress/`
+    /// ([`super::egress_log_path`]). `None` falls back to stderr.
+    pub(super) log_path: Option<String>,
+    /// Host path of the vault CA dir. When set, the child loads the CA (key stays
+    /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
+    pub(super) ca_dir: Option<String>,
+    /// Opt-in local-model forward: relay `gateway:PORT` → host `127.0.0.1:PORT`
+    /// (e.g. ollama on 11434), so a guest agent reaches a model the host runs.
+    /// Deliberately punches the default-deny fence; set only when a local worker
+    /// is requested. `None` = no forward. See [`super::local_forward`].
+    #[serde(default)]
+    pub(super) local_forward_port: Option<u16>,
+    /// Broker JIT refresh: when set, the in-VMM MITM rotates the real OAuth token near
+    /// its expiry (the guest never refreshes — far-future stub expiry) and splices the
+    /// fresh token into the live swap, so a session outliving the token lifetime keeps
+    /// working. Non-secret (a path + agent id + the public access stub); the real token
+    /// is read host-side by the child. `None` = no JIT (non-vault / non-broker agent).
+    #[serde(default)]
+    pub(super) refresh: Option<RefreshSpec>,
+    // Private to this module: only `for_login` sets it, so no other launch can open token endpoints.
+    #[serde(default)]
+    login: bool,
+}
+
+impl EgressSpec {
+    /// The fence for every launch except `auth login`: the MITM rejects the
+    /// providers' OAuth token endpoints locally.
+    pub(super) fn fence(
+        allowlist: Vec<String>,
+        log_path: Option<String>,
+        ca_dir: Option<String>,
+        local_forward_port: Option<u16>,
+        refresh: Option<RefreshSpec>,
+    ) -> Self {
+        Self {
+            allowlist,
+            log_path,
+            ca_dir,
+            local_forward_port,
+            refresh,
+            login: false,
+        }
+    }
+
+    /// The `auth login` VM's fence: the one posture that lets the guest reach
+    /// the providers' OAuth token endpoints (the login mints the credential
+    /// there). No local forward and no refresh: the login holds no credential.
+    pub(super) fn for_login(
+        allowlist: Vec<String>,
+        log_path: Option<String>,
+        ca_dir: Option<String>,
+    ) -> Self {
+        Self {
+            login: true,
+            ..Self::fence(allowlist, log_path, ca_dir, None, None)
+        }
+    }
+
+    /// True only for [`EgressSpec::for_login`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn opens_token_endpoints(&self) -> bool {
+        self.login
+    }
+}
 
 /// Guest NIC MAC (handed to `krun_add_net_unixstream`) and the gateway MAC the
 /// stack answers as. The addressing is fixed per microVM — one stack, one guest.
@@ -166,19 +241,26 @@ pub(super) fn deny_sni_line(sni: &str, why: &str) -> String {
 }
 
 /// Run the egress stack on the host end of the passt socketpair until the process
-/// exits (the sibling `krun_start_enter` thread tears it down). `allowlist` is the
-/// DNS fence: only these hosts resolve; everything else is NXDOMAIN'd. When
-/// `ca_dir` is set, a TLS MITM ([`Vault`]) terminates the allowlisted hosts'
-/// connections at the gateway; otherwise the stack is DNS-fence only.
-pub(super) fn run(
-    fd: c_int,
-    allowlist: Vec<String>,
-    ca_dir: Option<String>,
-    mut swap_pairs: Vec<CredSwap>,
-    diag_path: Option<String>,
-    local_forward_port: Option<u16>,
-    refresh: Option<super::jit_refresh::RefreshCtx>,
-) {
+/// exits (the sibling `krun_start_enter` thread tears it down). `spec.allowlist` is
+/// the DNS fence: only these hosts resolve; everything else is NXDOMAIN'd. When
+/// `spec.ca_dir` is set, a TLS MITM ([`Vault`]) terminates the allowlisted hosts'
+/// connections at the gateway; otherwise the stack is DNS-fence only. A
+/// [`EgressSpec::for_login`] spec opens the providers' OAuth token endpoints
+/// through the MITM (see [`super::mitm::drive_listeners`]).
+pub(super) fn run(fd: c_int, spec: EgressSpec, mut swap_pairs: Vec<CredSwap>) {
+    let EgressSpec {
+        allowlist,
+        log_path: diag_path,
+        ca_dir,
+        local_forward_port,
+        refresh,
+        login,
+    } = spec;
+    let refresh = refresh.map(|r| super::jit_refresh::RefreshCtx {
+        creds_path: r.creds_path.into(),
+        auth_id: r.auth_id,
+        access_stub: r.access_stub.into_bytes(),
+    });
     let diag = Diag::open(diag_path);
     // Broker JIT refresh: when armed, rotate the real OAuth token near its expiry and
     // splice the fresh one into `swap_pairs` mid-session, so a session outliving the
@@ -242,9 +324,10 @@ pub(super) fn run(
         super::local_forward::replenish(&mut forwarders, &mut sockets, port);
     }
     diag.log(&format!(
-        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}); fence allowlist={allowlist:?}",
+        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}, token-endpoints :{}); fence allowlist={allowlist:?}",
         if vault.is_some() { "443" } else { "off" },
         local_forward_port.map_or_else(|| "off".to_string(), |p| p.to_string()),
+        if login { "open (auth login)" } else { "rejected" },
     ));
 
     loop {
@@ -270,6 +353,7 @@ pub(super) fn run(
                 &pins,
                 &swap_pairs,
                 &diag,
+                login,
             );
             super::mitm::replenish_listeners(&mut listeners, &mut sockets);
         }
@@ -527,6 +611,22 @@ fn interrupted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_login_constructor_opens_token_endpoints_and_the_spec_file_keeps_it() {
+        let hosts = || vec!["platform.claude.com".to_string()];
+        let fence = EgressSpec::fence(hosts(), None, None, Some(11434), None);
+        assert!(!fence.opens_token_endpoints());
+        let login = EgressSpec::for_login(hosts(), None, Some("/ca".into()));
+        assert!(login.opens_token_endpoints());
+        assert!(login.refresh.is_none() && login.local_forward_port.is_none());
+        // The VMM child reads the posture back from the spec file.
+        for (spec, open) in [(fence, false), (login, true)] {
+            let back: EgressSpec =
+                serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+            assert_eq!(back.opens_token_endpoints(), open);
+        }
+    }
 
     #[test]
     fn a_guest_cannot_grow_the_fence_log_past_its_cap() {

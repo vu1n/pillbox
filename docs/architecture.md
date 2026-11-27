@@ -45,9 +45,8 @@ execution backend.
 - **Image/build plumbing** — `resolve_runner_image` / `default_runner_image`
   (src/docker.rs), used by libkrun (above), `doctor.rs`, `main.rs:~847`. This is
   kept and renamed `crate::oci`.
-- Also: `auth login` runs the agent's OAuth flow in a container via
-  `docker::run_interactive` / `check_ready_for` (src/agents/mod.rs:~394,412) —
-  needs porting to libkrun before docker-the-tool is fully gone.
+- `auth login` no longer touches it: it runs in a foreground libkrun microVM
+  (src/sandbox/libkrun/login.rs), and a build without libkrun refuses it.
 
 ### The backend seam `[verified 2026-06-20]`
 One backend = one impl of two traits in `src/sandbox/mod.rs`:
@@ -57,9 +56,27 @@ capability-gated via `Caps`). The **only** two places that branch on backend are
 `select_backend()` and `live_session()`. Behavior also forks at ~38
 `#[cfg(feature = "libkrun")]` gates — collapsing those (libkrun-only) is the
 structural win when the docker backend is deleted.
+`run` returns a typed `Started` and prints nothing; `pillbox run`'s `--json`
+envelope and banners are rendered by `commands::run::render_started`
+(src/commands/run.rs) `[verified 2026-11-26]`.
 Docker runs PTY agents only: `run` refuses every server agent (`spec.server`,
 opencode/codex-serve) and structured agent, and `sandbox agent` drives only the
 stdout `HarnessAdapter` harnesses (src/agents/harness/).
+
+### Session verbs are in-process calls; the CLI is one client `[verified 2026-11-26]`
+`commands::run::start` (resolve agent + descriptor defaults, validate, `--memory`,
+`backend.run`) and the session cores in `src/commands/session/` — `send`,
+`stream::wait_idle`, `workspace_of`, `score`, `rehydrate_result` — return typed
+values and print nothing to stdout; in-process readers of a session's §0 log use
+`events::log::read_log`. The `pillbox run`/`session …` handlers render those
+values; the `--json` shapes (`session::started_json`, `session_info`,
+`score_verdict_json`) live only in that rendering, so in-process callers must not
+depend on them. `Started::into_live_session` is the one place that decides which
+run outcomes a caller can go on driving. Because `run::start` runs inside
+long-lived callers, every detached child it spawns (`__krun-vmm`,
+`__session-tailer`) is spawned as a `sandbox::DetachedChild`, whose `Drop` hands
+it to a waiter thread, so an exited child never lingers as a zombie that
+signal-0 liveness probes read as alive.
 
 ### libkrun launch shape `[verified 2026-06-20]`
 `krun_create_ctx` → `set_vm_config` → `set_root(dir)` (virtio-fs root, *not* a
@@ -73,7 +90,6 @@ the vault MITM live (src/sandbox/libkrun/egress.rs).
 
 - **Daemonless OCI image pull** — replace `docker create/export` so libkrun
   doesn't need the docker daemon.
-- **auth-in-libkrun** — `auth login` runs in a docker container today.
 - **No-backend build** — `--no-default-features` currently compiles because the
   docker backend is the fallback; deleting it means resolving what the
   toolchain-free / in-sandbox-guest build does.

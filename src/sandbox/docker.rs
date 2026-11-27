@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-use super::{Caps, SandboxBackend};
+use super::{Caps, SandboxBackend, Started};
 use crate::agents::{
     base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
     AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
@@ -41,7 +41,8 @@ impl Drop for ContainerGuard {
 }
 
 impl SandboxBackend for DockerBackend {
-    /// The container family: full PTY drive/read + long-lived exec. No server
+    /// The container family: full PTY drive/read. No long-lived exec (the sandbox
+    /// verbs moved to the libkrun microVM; Docker is deprecated). No server
     /// mode (server agents are libkrun-only). No KVM-isolation features (real fence, in-sandbox grade,
     /// detached vault); drains §0 live, so no post-hoc ingest. See
     /// docs/substrate-plane.md.
@@ -52,7 +53,8 @@ impl SandboxBackend for DockerBackend {
             live_pty_tail: true,
             // Server agents (opencode, codex-serve) are libkrun-only.
             server_mode: false,
-            long_lived_exec: true,
+            // Docker is deprecated: the sandbox verbs run on the libkrun microVM only.
+            long_lived_exec: false,
             in_sandbox_grading: false,
             real_egress_fence: false,
             detached_vault: false,
@@ -64,7 +66,7 @@ impl SandboxBackend for DockerBackend {
         BACKEND_DOCKER
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return Err(PillboxError::usage(
                 "run",
@@ -219,7 +221,13 @@ impl SandboxBackend for DockerBackend {
             None
         };
 
-        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
+        let env_vars = resolve_run_env(
+            resolved,
+            &opts.env_bundles,
+            &opts.env_files,
+            &withs_resolved,
+            vault_session.as_mut(),
+        )?;
         startup.mark("env_prepare");
 
         // Bind `mcp` (rather than letting the expression be the
@@ -342,17 +350,7 @@ impl SandboxBackend for DockerBackend {
                 &session.id,
                 Some(&session),
             );
-            if opts.json {
-                session::print_started_json(&session);
-            } else {
-                let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
-                println!(
-                    "pillbox: ✓ session `{}` started in background (container `{short}`).",
-                    session.id
-                );
-                println!("         pillbox session attach {}  # reattach", session.id);
-            }
-            return Ok(());
+            return Ok(Started::Detached(session));
         }
 
         // Foreground run: rm the container on every exit path — including an
@@ -421,7 +419,9 @@ impl SandboxBackend for DockerBackend {
         }
 
         match outcome? {
-            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
+            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => {
+                Ok(Started::Foreground)
+            }
             Outcome::Exited(code) => Err(PillboxError::runtime(
                 "run",
                 format!("{} exited with status {code}", spec.id),
@@ -525,7 +525,6 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
         Some(session),
     );
     session::delete(resolved, &session.id)?;
-    println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
 

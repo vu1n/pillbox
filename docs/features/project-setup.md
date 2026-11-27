@@ -12,6 +12,7 @@ paths:
   - "src/commands/env.rs"
   - "src/commands/auth.rs"
   - "src/agents/mod.rs"
+  - "src/sandbox/libkrun/login.rs"
 entry:
   - "src/pillbox.rs:discover_from"
   - "src/config.rs:resolve_run_config"
@@ -20,6 +21,17 @@ tests:
   - "tests/lifecycle.rs:discovery_walks_up_to_find_descriptor"
   - "tests/lifecycle.rs:secret_inheritance_global_to_project"
   - "src/config.rs:overlay_project_wins_global_fills_gaps"
+  - "src/sandbox/libkrun/login.rs:claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback"
+  - "src/sandbox/libkrun/login.rs:login_without_an_oauth_port_has_no_callback_forward"
+  - "src/sandbox/libkrun/login.rs:the_callback_relay_carries_bytes_both_ways_and_closes_cleanly"
+  - "src/sandbox/libkrun/login.rs:the_callback_relay_and_guest_forward_carry_a_callback_end_to_end"
+  - "src/sandbox/libkrun/login.rs:cursor_login_flow_covers_every_host_the_egress_table_labels_login"
+  - "src/sandbox/libkrun/login.rs:a_project_runner_image_does_not_reach_the_login_vm"
+  - "src/sandbox/libkrun/login.rs:every_claude_oauth_agent_reaches_claude_ai_at_login"
+  - "src/sandbox/libkrun/login.rs:every_agent_login_fence_covers_its_login_flow_hosts"
+  - "src/sandbox/libkrun/login.rs:copilot_device_flow_resolves_github_com_at_login"
+  - "src/sandbox/libkrun/login.rs:login_hosts_never_reach_a_non_login_launch"
+  - "src/sandbox/libkrun/egress.rs:only_the_login_constructor_opens_token_endpoints_and_the_spec_file_keeps_it"
 ---
 
 # Project bundles and configuration
@@ -40,8 +52,11 @@ Run `pillbox init`, then `pillbox new --name demo` in a disposable project. `pil
 
 `cargo test --no-default-features --test lifecycle` runs the real CLI in temporary homes and directories. Expect descriptor/state creation, nested discovery, explicit selection and secret inheritance assertions to pass. `cargo test --no-default-features config::tests` exercises default overlays and rejects malformed configuration without starting an agent.
 
+`auth login` needs a real HVF boot. On the Mac, stop Docker Desktop's daemon (the runner rootfs must already be cached under `~/.pillbox/krun/`) and run `pillbox auth login --agent claude`. A microVM boots and shows claude's login prompt; open the printed URL, finish in the browser (the callback reaches the guest through the relay), and expect `✓ claude authenticated` with `~/.pillbox/global/auth/claude/.claude/.credentials.json` written. `cargo test sandbox::libkrun::login` checks the login VM spec (token endpoints open, real home share, callback forward only with an OAuth port) without a boot.
+
 ## Gotchas
 
 - Discovery selects one project; defaults overlay global fields rather than merging every ancestor descriptor.
 - Unknown top-level config fields fail, while the workspace table is permissive.
-- `auth login` still has Docker image/container plumbing; this map does not claim the auth flow was ported to libkrun.
+- `auth login` runs in a foreground libkrun microVM, never Docker; a build without libkrun refuses it. The agent's real auth home (`~/.pillbox/global/auth/<agent>/`) is mounted read-write, without the env-fork or the ownership normalization runs apply to their clones, and the boot script lives in a separate scratch share, so nothing but the agent's own files lands there. Its rootfs (runner image) and vault CA come from the agent's auth (global) pillbox, never the current project, so a repo's `pillbox.toml` `[runner] image` can't choose what runs beside the real credentials. It is the only launch built with `EgressSpec::for_login`, which lets the guest reach the providers' OAuth token endpoints; the `login` field is private to `egress.rs`, so every other launch uses `EgressSpec::fence` and can't open them. The login VM stays foreground (`run_foreground_attached`): a reparented VM's commit guard scrubs every share, and this share is the real auth home. A login that ends any way but the agent's own exit (a dropped attach, a detach) kills its VM before reaping it (`KillUnlessExited`), so it can't hang. codex gets `SSL_CERT_FILE` pointed at the vault CA so its Rust TLS stack trusts the MITM. An agent with an OAuth callback port (claude 54545, pi/prime-agent 53692, override with `PILLBOX_<AGENT>_OAUTH_PORT`) gets a host listener on `127.0.0.1:<port>`, relayed over vsock to the guest's `vsock-forward`, so a busy port fails the login before boot.
+- The login VM's DNS fence is the vault providers' hosts plus the agent's `login_hosts` (`src/agents/mod.rs`), exact names only: claude `claude.ai`; opencode `models.dev` (its provider list) and `github.com` (Copilot device flow); pi and prime-agent `claude.ai`, `github.com` and Google's `oauth2.googleapis.com`, `www.googleapis.com`, `cloudcode-pa.googleapis.com` (Gemini CLI / Antigravity); cursor `cursor.com`, `www.cursor.com`, `api2.cursor.sh`, `authenticator.cursor.sh` (login poll; `LOGIN_FLOWS` is checked against the egress table's cursor login/auth labels); codex none (all on `auth.openai.com`). A login flow on any other host (GitHub Enterprise, a self-hosted or custom-base-URL provider) gets NXDOMAIN, and the login ends with the fence's refusal line naming the host. Adding an agent means listing its login flow in `LOGIN_FLOWS` in `login.rs`'s tests. These hosts are login-only: the run fence (`standard_allowlist`) does not carry them, so e.g. a Copilot or Gemini CLI model call from pi needs `--egress-allow` at run time.

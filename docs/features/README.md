@@ -25,6 +25,7 @@ not a claim that every live path was re-driven while writing this map.
 |---|---|
 | [Project setup](project-setup.md) | Bundle discovery, config defaults, secrets/env and agent auth |
 | [Local microVM](local-microvm.md) | Image/rootfs preparation, boot and control channels |
+| [Sandboxes](sandboxes.md) | Long-lived VMs an orchestrator spawns, execs and drives agent turns in |
 | [Vault and egress](vault-egress.md) | Host-owned credential refresh/substitution and outbound policy |
 | [Sessions](sessions.md) | Registry, sequenced events, artifacts, send/read and attachment |
 | [Workspace snapshots](workspace-snapshots.md) | Rustic stores, bookmarks, ingest and independent forks |

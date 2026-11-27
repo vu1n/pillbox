@@ -551,26 +551,37 @@ fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
 /// file. Pass a [`FollowReader`](crate::events::opencode::FollowReader) for a
 /// live session (tails appends) or a plain `File` for a post-hoc drain (reads to
 /// EOF). Blocks until the reader ends or `stop` is set (observed between lines).
-/// Non-JSON lines and unmapped methods are skipped, not errored, so a stray line
-/// can't wedge the drain. Returns the number of §0 events appended.
+/// Non-JSON lines, unmapped methods and lines past
+/// [`MAX_CAPTURE_LINE_BYTES`](crate::events::capture::MAX_CAPTURE_LINE_BYTES) are
+/// skipped, not errored, so a stray or hostile line can't wedge the drain or exhaust
+/// memory. Returns the number of §0 events appended.
 pub(crate) fn drain_ndjson<R: std::io::Read>(
     reader: R,
     session_id: &str,
     log: &mut SessionLog,
     stop: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<usize> {
-    use std::io::BufRead as _;
+    use crate::events::capture::{read_line_capped, CappedLine, MAX_CAPTURE_LINE_BYTES};
     use std::sync::atomic::Ordering;
 
     let mut mapper = CodexServeMapper::new();
     let mut total = 0;
-    let mut lines = std::io::BufReader::new(reader).lines();
+    let mut reader = std::io::BufReader::new(reader);
+    let mut raw = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let Some(line) = lines.next() else { break };
-        let line = line?;
+        // The guest writes this capture: a line past the cap is skipped, never buffered.
+        match read_line_capped(&mut reader, &mut raw, MAX_CAPTURE_LINE_BYTES)? {
+            CappedLine::Eof => break,
+            CappedLine::Oversized(n) => {
+                eprintln!("pillbox: warning: skipped a {n}-byte codex event line (cap {MAX_CAPTURE_LINE_BYTES})");
+                continue;
+            }
+            CappedLine::Line => {}
+        }
+        let line = String::from_utf8_lossy(&raw);
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1113,5 +1124,27 @@ mod tests {
         assert!(run(&[json!({"method":"mcpServer/startupStatus/updated","params":{}})]).is_empty());
         // A response (has `id`+`result`, no `method`) must not map to anything.
         assert!(run(&[json!({"id":7,"result":{"turn":{"id":"tu"}}})]).is_empty());
+    }
+
+    /// A guest line past the cap is skipped with a warning; the lines after it drain.
+    #[test]
+    fn drain_ndjson_skips_an_oversized_line() {
+        use crate::events::capture::MAX_CAPTURE_LINE_BYTES;
+        use std::io::Cursor;
+        use std::sync::atomic::AtomicBool;
+
+        crate::test_util::with_isolated_home("codex-serve-oversized", || {
+            let g = crate::pillbox::global();
+            let mut log = SessionLog::open(&g, "ses-cx").expect("open log");
+            let pad = "x".repeat(MAX_CAPTURE_LINE_BYTES);
+            let stream = [
+                format!(r#"{{"method":"thread/started","params":{{"pad":"{pad}","thread":{{"id":"th","status":"idle"}}}}}}"#),
+                r#"{"method":"thread/started","params":{"thread":{"id":"th","status":"idle"}}}"#.to_string(),
+            ]
+            .join("\n");
+            let stop = AtomicBool::new(false);
+            let n = drain_ndjson(Cursor::new(stream), "ses-cx", &mut log, &stop).expect("drain");
+            assert_eq!(n, 1, "only the in-cap thread/started maps (RunStarted)");
+        });
     }
 }

@@ -7,8 +7,8 @@
     "dev": "wrangler dev",
     "test": "node --test *.test.ts *.test.mjs",
     "deploy": "wrangler deploy",
-    "gen:contract": "json2ts -i contract.schema.json -o src/contract.generated.ts",
-    "check:contract": "npm run gen:contract && git diff --exit-code src/contract.generated.ts"
+    "gen:contract": "node scripts/gen-contract.mjs",
+    "check:contract": "node scripts/gen-contract.mjs --check"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

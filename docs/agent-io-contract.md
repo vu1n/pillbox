@@ -4,7 +4,10 @@ Status: draft (2026-05-26). Schema: [`proto/pillbox/v1/agent.proto`](../proto/pi
 
 > Extended by [session-event-log.md](./session-event-log.md), which folds this
 > `Event` vocabulary into a per-session durable log (adds a `sessionId`
-> partition key, `actor`, `causationId`, a `Payload::Unknown` fallback). Kept
+> partition key, `actor`, `causationId`, a `Payload::Unknown` fallback; of
+> those, `causationId` is still spec-only). The implemented contract is
+> `src/contract.rs`; the managed tier's TS types are generated from it
+> (`cloudflare-spike/contract-sync.md`). Kept
 > separate — this is the proto-level contract consumers codegen against. Note:
 > the "monotonic per pillbox" `seq` comment is **inaccurate** — `seq` is
 > per-emitter (resets per run/exec).
